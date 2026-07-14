@@ -1,0 +1,141 @@
+<svg viewBox="0 0 960 560" width="960" height="560" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="flowTitle flowDesc">
+  <title id="flowTitle">How Basiliskos works</title>
+  <desc id="flowDesc">The isolated Basiliskos Claude Code window talks to a local relay on 127.0.0.1:8317, which forwards requests to the selected backend account: Claude, Codex, or Grok.</desc>
+  <style>
+    .mono { font-family: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, 'Courier New', monospace; }
+    .sans { font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; }
+
+    @keyframes flow { to { stroke-dashoffset: -22; } }
+    .wire { stroke-dasharray: 5 17; animation: flow 1.1s linear infinite; }
+
+    @keyframes ping { 0% { r: 7; opacity: .7; } 100% { r: 26; opacity: 0; } }
+    .ping { animation: ping 2.4s ease-out infinite; }
+    .ping2 { animation-delay: -1.2s; }
+
+    @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+    .pulse { animation: blink 2.2s ease-in-out infinite; }
+
+    /* 12s cycle — one backend active per third */
+    @keyframes actA { 0%,30% { opacity: 1; } 36%,94% { opacity: 0; } 100% { opacity: 1; } }
+    @keyframes actB { 0%,30% { opacity: 0; } 36%,63% { opacity: 1; } 69%,100% { opacity: 0; } }
+    @keyframes actC { 0%,63% { opacity: 0; } 69%,94% { opacity: 1; } 100% { opacity: 0; } }
+    .onA { animation: actA 12s linear infinite; }
+    .onB { animation: actB 12s linear infinite; }
+    .onC { animation: actC 12s linear infinite; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .wire,.pulse { animation: none; }
+      .pkt { display: none; }
+      .ping, .ping2 { animation: none; opacity: 0; }
+      .onA { animation: none; opacity: 1; }
+      .onB, .onC { animation: none; opacity: 0; }
+    }
+  </style>
+
+  <defs>
+    <radialGradient id="bgGrad" cx="50%" cy="38%" r="80%">
+      <stop offset="0%" stop-color="#03202F"/>
+      <stop offset="60%" stop-color="#001623"/>
+      <stop offset="100%" stop-color="#000E1C"/>
+    </radialGradient>
+    <filter id="glowSoft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+
+  <rect width="960" height="560" fill="url(#bgGrad)"/>
+  <g stroke="#12435A" stroke-width="1" opacity=".12">
+    <path d="M0 140 H960 M0 280 H960 M0 420 H960"/>
+    <path d="M160 0 V560 M320 0 V560 M480 0 V560 M640 0 V560 M800 0 V560"/>
+  </g>
+  <g stroke="#EFE5D0" stroke-width="1.5" opacity=".3" fill="none">
+    <path d="M20 36 V20 H36"/>
+    <path d="M924 20 H940 V36"/>
+    <path d="M940 524 V540 H924"/>
+    <path d="M36 540 H20 V524"/>
+  </g>
+
+  <!-- window -> relay wire -->
+  <path d="M480 118 V196" stroke="#12435A" stroke-width="2"/>
+  <path class="wire" d="M480 118 V196" stroke="#7FDBCA" stroke-width="2" fill="none"/>
+  <circle class="pkt" r="3.5" fill="#EFE5D0">
+    <animateMotion dur="1.6s" repeatCount="indefinite" path="M480 118 V196"/>
+  </circle>
+
+  <!-- branch wires (idle) -->
+  <g stroke="#12435A" stroke-width="2" fill="none">
+    <path d="M480 292 V330 C480 362 190 366 190 414"/>
+    <path d="M480 292 V414"/>
+    <path d="M480 292 V330 C480 362 770 366 770 414"/>
+  </g>
+
+  <!-- branch wires (active, cycling) -->
+  <g fill="none" stroke-width="2.4">
+    <g class="onA">
+      <path class="wire" d="M480 292 V330 C480 362 190 366 190 414" stroke="#D56D21"/>
+      <circle class="pkt" r="3.5" fill="#FFD9B0">
+        <animateMotion dur="1.5s" repeatCount="indefinite" path="M480 292 V330 C480 362 190 366 190 414"/>
+      </circle>
+    </g>
+    <g class="onB">
+      <path class="wire" d="M480 292 V414" stroke="#3ED598"/>
+      <circle class="pkt" r="3.5" fill="#C9F7E4">
+        <animateMotion dur="1.5s" repeatCount="indefinite" path="M480 292 V414"/>
+      </circle>
+    </g>
+    <g class="onC">
+      <path class="wire" d="M480 292 V330 C480 362 770 366 770 414" stroke="#64B5FF"/>
+      <circle class="pkt" r="3.5" fill="#CFE6FF">
+        <animateMotion dur="1.5s" repeatCount="indefinite" path="M480 292 V330 C480 362 770 366 770 414"/>
+      </circle>
+    </g>
+  </g>
+
+  <!-- Claude window node -->
+  <g>
+    <rect x="250" y="42" width="460" height="76" rx="10" fill="#0B2A38" stroke="#2AA189" stroke-width="1.6"/>
+    <circle cx="278" cy="66" r="4" fill="#3ED598" class="pulse"/>
+    <text class="sans" x="294" y="72" font-size="19" font-weight="600" fill="#EFE5D0">Basiliskos Claude Code window</text>
+    <text class="mono" x="294" y="98" font-size="11.5" letter-spacing=".4" fill="#8A97A8">isolated profile — your normal Claude app is untouched</text>
+  </g>
+
+  <!-- relay node -->
+  <g>
+    <circle class="ping" cx="480" cy="244" r="7" fill="none" stroke="#7FDBCA" stroke-width="1.5"/>
+    <circle class="ping ping2" cx="480" cy="244" r="7" fill="none" stroke="#7FDBCA" stroke-width="1.5"/>
+    <rect x="300" y="208" width="360" height="72" rx="10" fill="#062330" stroke="#7FDBCA" stroke-width="1.6"/>
+    <text class="sans" x="480" y="238" font-size="19" font-weight="600" fill="#EFE5D0" text-anchor="middle">Basiliskos relay</text>
+    <text class="mono" x="480" y="264" font-size="11.5" letter-spacing=".5" fill="#7FDBCA" text-anchor="middle">127.0.0.1:8317 · loopback only · local key</text>
+  </g>
+
+  <!-- provider nodes -->
+  <g>
+    <rect x="80" y="414" width="220" height="86" rx="10" fill="#0B222E" stroke="#1E3A4A" stroke-width="1.2"/>
+    <rect class="onA" x="80" y="414" width="220" height="86" rx="10" fill="none" stroke="#D56D21" stroke-width="2" filter="url(#glowSoft)"/>
+    <rect class="onA" x="80" y="414" width="220" height="86" rx="10" fill="none" stroke="#D56D21" stroke-width="1.8"/>
+    <text class="sans" x="190" y="450" font-size="19" font-weight="600" fill="#EFE5D0" text-anchor="middle">Claude</text>
+    <text class="mono" x="190" y="478" font-size="12" letter-spacing="1" fill="#8A97A8" text-anchor="middle">OAuth account</text>
+
+    <rect x="370" y="414" width="220" height="86" rx="10" fill="#0B222E" stroke="#1E3A4A" stroke-width="1.2"/>
+    <rect class="onB" x="370" y="414" width="220" height="86" rx="10" fill="none" stroke="#3ED598" stroke-width="2" filter="url(#glowSoft)"/>
+    <rect class="onB" x="370" y="414" width="220" height="86" rx="10" fill="none" stroke="#3ED598" stroke-width="1.8"/>
+    <text class="sans" x="480" y="450" font-size="19" font-weight="600" fill="#EFE5D0" text-anchor="middle">Codex</text>
+    <text class="mono" x="480" y="478" font-size="12" letter-spacing="1" fill="#8A97A8" text-anchor="middle">GPT models · thinking</text>
+
+    <rect x="660" y="414" width="220" height="86" rx="10" fill="#0B222E" stroke="#1E3A4A" stroke-width="1.2"/>
+    <rect class="onC" x="660" y="414" width="220" height="86" rx="10" fill="none" stroke="#64B5FF" stroke-width="2" filter="url(#glowSoft)"/>
+    <rect class="onC" x="660" y="414" width="220" height="86" rx="10" fill="none" stroke="#64B5FF" stroke-width="1.8"/>
+    <text class="sans" x="770" y="450" font-size="19" font-weight="600" fill="#EFE5D0" text-anchor="middle">Grok</text>
+    <text class="mono" x="770" y="478" font-size="12" letter-spacing="1" fill="#8A97A8" text-anchor="middle">Grok models · thinking</text>
+  </g>
+
+  <!-- now serving -->
+  <g class="mono" font-size="13" letter-spacing="2">
+    <text x="700" y="248" fill="#5B6B7A">NOW SERVING</text>
+    <text class="onA" x="700" y="268" fill="#D56D21">▸ CLAUDE</text>
+    <text class="onB" x="700" y="268" fill="#3ED598">▸ CODEX</text>
+    <text class="onC" x="700" y="268" fill="#64B5FF">▸ GROK</text>
+  </g>
+
+  <text class="mono" x="480" y="536" font-size="11.5" letter-spacing="2" fill="#5B6B7A" text-anchor="middle">SWITCH ACCOUNTS ANY TIME · CHANGES APPLY ON THE NEXT REQUEST</text>
+</svg>

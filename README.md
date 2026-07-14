@@ -1,4 +1,6 @@
-# Basiliskos
+<p align="center">
+  <img src="docs/media/basiliskos-hero.svg" alt="Basiliskos — one isolated Claude Code window, three switchable backends: Claude, Codex, and Grok" width="100%">
+</p>
 
 Open a separate Basiliskos-owned Claude Code Windows app and switch the
 authorized account serving it: Claude, Codex, or Grok Build. Your normal Claude
@@ -18,16 +20,9 @@ limits, or automate approval pages.
 
 ## How it works
 
-```text
-Basiliskos's isolated Claude Code Windows app
-        |
-        v
-Basiliskos relay on 127.0.0.1:8317
-        |
-        +-- Claude OAuth account
-        +-- Codex OAuth account (selectable GPT model + thinking)
-        `-- Grok OAuth account (selectable Grok model + thinking)
-```
+<p align="center">
+  <img src="docs/media/basiliskos-flow.svg" alt="Basiliskos's isolated Claude Code Windows app talks to the Basiliskos relay on 127.0.0.1:8317, which forwards to the selected backend: a Claude OAuth account, a Codex OAuth account (selectable GPT model and thinking), or a Grok OAuth account (selectable Grok model and thinking)" width="760">
+</p>
 
 Basiliskos launches the installed Claude app with `CLAUDE_USER_DATA_DIR`
 pointed at `~/.hydra-gateway/claude-profile`. This gives Basiliskos a separate
