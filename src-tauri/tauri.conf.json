@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Basiliskos",
+  "version": "1.1.2",
+  "identifier": "com.threereadylab.hydragateway",
+  "build": {
+    "beforeDevCommand": "pnpm prepare:gateway && pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm prepare:gateway && pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Basiliskos",
+        "width": 920,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 560,
+        "visible": true,
+        "decorations": false,
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "publisher": "3Ready Prototyping Lab",
+    "resources": [
+      "resources/gateway/*"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "startMenuFolder": "3ReadyLab"
+      }
+    }
+  }
+}

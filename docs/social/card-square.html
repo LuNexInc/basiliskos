@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1080px; height: 1080px; overflow: hidden; }
+  body { font-family: Inter, "Segoe UI", system-ui, sans-serif; background: #0c0d10; color: #f2f4f8; }
+  .bg {
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(ellipse 700px 480px at 50% 20%, rgba(255,255,255,0.07) 0%, transparent 55%),
+      linear-gradient(180deg, #12141a 0%, #0a0b0e 100%);
+  }
+  .grid {
+    position: absolute; inset: 0; opacity: 0.04;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.6) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.6) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  .wrap {
+    position: relative; z-index: 2; height: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 56px 48px; text-align: center;
+  }
+  .logo {
+    width: 88px; height: 88px; margin-bottom: 22px;
+    filter: drop-shadow(0 12px 40px rgba(255,255,255,0.12));
+  }
+  h1 {
+    font-size: 64px; font-weight: 750; letter-spacing: -0.03em;
+    background: linear-gradient(100deg, #fff 25%, #c8d0dc 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .tagline { margin-top: 10px; font-size: 24px; color: #8b93a0; font-weight: 500; }
+  .sub {
+    margin-top: 16px; font-size: 18px; color: #6b7380; max-width: 720px; line-height: 1.4;
+  }
+  .window {
+    margin-top: 36px;
+    width: 780px; text-align: left;
+    background: #f3f4f6; border-radius: 12px;
+    border: 1px solid #2a2e36;
+    box-shadow: 0 32px 80px rgba(0,0,0,0.5);
+    overflow: hidden;
+  }
+  .titlebar {
+    height: 36px; background: #fff; border-bottom: 1px solid #dedfe3;
+    display: flex; align-items: center; gap: 7px; padding: 0 12px;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #d7d9de; }
+  .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
+  .titlebar span { margin-left: 6px; font-size: 11px; color: #6b7280; font-weight: 600; }
+  .header {
+    height: 56px; padding: 0 16px; background: #fff; border-bottom: 1px solid #dedfe3;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; color: #17191d; }
+  .brand img { width: 24px; height: 24px; }
+  .brand strong { font-size: 14px; display: block; }
+  .brand small { font-size: 10px; color: #6b7280; }
+  .btn {
+    height: 28px; padding: 0 10px; border-radius: 6px;
+    border: 1px solid #d7d9de; background: #17191d; color: #fff;
+    font-size: 11px; font-weight: 650; display: inline-flex; align-items: center;
+  }
+  .body { padding: 14px 16px 16px; }
+  .row {
+    background: #fff; border: 1px solid #dedfe3; border-radius: 8px;
+    padding: 10px 12px; display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+  }
+  .row.active { border-color: #94a3b8; }
+  .avatar {
+    width: 32px; height: 32px; border-radius: 7px; background: #eef0f3;
+    display: grid; place-items: center; font-size: 12px; font-weight: 700; color: #475569;
+  }
+  .info { flex: 1; }
+  .info strong { display: block; font-size: 12px; color: #17191d; }
+  .info span { font-size: 10px; color: #6b7280; }
+  .badge-a {
+    font-size: 9px; font-weight: 700; color: #166534;
+    background: #ecfdf3; border: 1px solid #86efac; padding: 2px 7px; border-radius: 999px;
+  }
+  .url { margin-top: 28px; font-size: 16px; color: #5c6470; }
+  .url strong { color: #8b93a0; }
+</style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="grid"></div>
+  <div class="wrap">
+    <img class="logo" src="hydra-icon.png" alt="Hydra" />
+    <h1>Hydra</h1>
+    <p class="tagline">Many Heads. One Command.</p>
+    <p class="sub">Local Grok CLI profile manager for Windows. Switch accounts you own — credentials stay on your machine.</p>
+    <div class="window">
+      <div class="titlebar">
+        <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
+        <span>Hydra</span>
+      </div>
+      <div class="header">
+        <div class="brand">
+          <img src="hydra-icon.png" alt="" />
+          <div>
+            <strong>Hydra</strong>
+            <small>Many Heads. One Command.</small>
+          </div>
+        </div>
+        <div class="btn">Import</div>
+      </div>
+      <div class="body">
+        <div class="row active">
+          <div class="avatar">W</div>
+          <div class="info"><strong>Work</strong><span>work@studio.example</span></div>
+          <span class="badge-a">Active</span>
+        </div>
+        <div class="row">
+          <div class="avatar">P</div>
+          <div class="info"><strong>Personal</strong><span>me@mail.example</span></div>
+        </div>
+        <div class="row">
+          <div class="avatar">C</div>
+          <div class="info"><strong>Client Sandbox</strong><span>sandbox@client.example</span></div>
+        </div>
+      </div>
+    </div>
+    <p class="url">github.com/Charles-3Ready/<strong>hydra</strong></p>
+  </div>
+</body>
+</html>
