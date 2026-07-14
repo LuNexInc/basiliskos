@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpStream, ToSocketAddrs},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{mpsc, Mutex, OnceLock},
@@ -155,6 +155,8 @@ const XAI_MODELS: &[ModelSpec] = &[
 static GATEWAY_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 static CLAUDE_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 static FRONT_PROXY: OnceLock<Mutex<Option<FrontProxy>>> = OnceLock::new();
+#[cfg(target_os = "windows")]
+static GATEWAY_JOB: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
 
 struct FrontProxy {
     shutdown: mpsc::Sender<()>,
@@ -171,6 +173,11 @@ fn claude_child() -> &'static Mutex<Option<Child>> {
 
 fn front_proxy() -> &'static Mutex<Option<FrontProxy>> {
     FRONT_PROXY.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_os = "windows")]
+fn gateway_job() -> &'static Mutex<Option<usize>> {
+    GATEWAY_JOB.get_or_init(|| Mutex::new(None))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,6 +250,21 @@ struct RouteSelection {
     thinking: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ClaudeWindowIcon {
+    Black,
+    System,
+}
+
+fn default_claude_window_icon() -> ClaudeWindowIcon {
+    ClaudeWindowIcon::Black
+}
+
+fn should_apply_claude_window_icon(icon: ClaudeWindowIcon) -> bool {
+    matches!(icon, ClaudeWindowIcon::Black)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ControllerState {
     api_key: String,
@@ -253,6 +275,10 @@ struct ControllerState {
     active_account: Option<String>,
     #[serde(default = "default_routes")]
     routes: BTreeMap<String, RouteSelection>,
+    /// Basiliskos-owned preference: recolor the isolated Claude window/tray icons.
+    /// Never written into Claude's own profile. Default black (distinct from stock Claude).
+    #[serde(default = "default_claude_window_icon")]
+    claude_window_icon: ClaudeWindowIcon,
 }
 
 fn model_specs(provider: &str) -> &'static [ModelSpec] {
@@ -346,11 +372,10 @@ fn routed_model(state: &ControllerState, provider: &str) -> String {
 }
 
 fn route_label(state: &ControllerState, provider: Option<&str>) -> String {
-    let model = provider
+    provider
         .filter(|provider| SUPPORTED_PROVIDERS.contains(provider))
         .map(|provider| provider_route(state, provider).selected_model_label)
-        .unwrap_or_else(|| "Choose a route".into());
-    model
+        .unwrap_or_else(|| "Choose a route".into())
 }
 
 fn provider_label(provider: &str) -> &'static str {
@@ -437,6 +462,7 @@ fn load_state() -> Result<ControllerState, String> {
         previous_claude_applied_id: None,
         active_account: None,
         routes: default_routes(),
+        claude_window_icon: default_claude_window_icon(),
     };
     save_state(&state)?;
     Ok(state)
@@ -562,6 +588,9 @@ debug: false
 logging-to-file: true
 logs-max-total-size-mb: 20
 request-log: false
+streaming:
+  keepalive-seconds: 15
+  bootstrap-retries: 1
 plugins:
   enabled: false
 "#,
@@ -579,8 +608,8 @@ fn prepare_config() -> Result<ControllerState, String> {
     Ok(state)
 }
 
-fn health_check(api_key: &str) -> bool {
-    let address = ("127.0.0.1", GATEWAY_PORT)
+fn endpoint_health_check(port: u16, path: &str, api_key: &str, marker: &str) -> bool {
+    let address = ("127.0.0.1", port)
         .to_socket_addrs()
         .ok()
         .and_then(|mut addresses| addresses.next());
@@ -590,7 +619,7 @@ fn health_check(api_key: &str) -> bool {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let request = format!(
-        "GET /hydra/health HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: {api_key}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: {api_key}\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
@@ -598,6 +627,100 @@ fn health_check(api_key: &str) -> bool {
     let mut response = String::new();
     stream.read_to_string(&mut response).is_ok()
         && (response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"))
+        && response.contains(marker)
+}
+
+fn backend_health_check(api_key: &str) -> bool {
+    endpoint_health_check(BACKEND_PORT, "/v1/models", api_key, "\"data\"")
+}
+
+fn health_check(api_key: &str) -> bool {
+    endpoint_health_check(GATEWAY_PORT, "/hydra/health", api_key, "\"backend\":true")
+        && backend_health_check(api_key)
+}
+
+fn port_is_available(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .replace('/', "\\")
+        .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"))
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_stale_managed_backends(expected_executable: &Path) -> Result<usize, String> {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                TH32CS_SNAPPROCESS,
+            },
+            Threading::{
+                OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+            },
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "Could not inspect stale Basiliskos backends: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut terminated = 0;
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                0,
+                entry.th32ProcessID,
+            )
+        };
+        if !process.is_null() {
+            let mut buffer = vec![0_u16; 32_768];
+            let mut length = buffer.len() as u32;
+            let queried =
+                unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) }
+                    != 0;
+            if queried {
+                let actual = PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize]));
+                if same_windows_path(&actual, expected_executable) {
+                    if unsafe { TerminateProcess(process, 0) } == 0 {
+                        let error = std::io::Error::last_os_error();
+                        unsafe { CloseHandle(process) };
+                        unsafe { CloseHandle(snapshot) };
+                        return Err(format!(
+                            "Could not terminate stale Basiliskos backend {}: {error}",
+                            entry.th32ProcessID
+                        ));
+                    }
+                    let _ = unsafe { WaitForSingleObject(process, 3_000) };
+                    terminated += 1;
+                }
+            }
+            unsafe { CloseHandle(process) };
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    Ok(terminated)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminate_stale_managed_backends(_expected_executable: &Path) -> Result<usize, String> {
+    Ok(0)
 }
 
 fn rewrite_claude_request(
@@ -674,7 +797,11 @@ fn proxy_error(message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     response
 }
 
-fn handle_front_proxy_request(mut request: tiny_http::Request, client: &reqwest::blocking::Client) {
+fn handle_front_proxy_request(
+    mut request: tiny_http::Request,
+    client: &reqwest::blocking::Client,
+    api_key: &str,
+) {
     let request_url = request.url().to_string();
     let request_path = request_url
         .split('?')
@@ -696,9 +823,20 @@ fn handle_front_proxy_request(mut request: tiny_http::Request, client: &reqwest:
     }
 
     if request_path == "/hydra/health" {
+        let backend_ready = backend_health_check(api_key);
         let mut response = Response::from_string(
-            serde_json::json!({"hydra": true, "version": env!("CARGO_PKG_VERSION")}).to_string(),
-        );
+            serde_json::json!({
+                "hydra": true,
+                "backend": backend_ready,
+                "version": env!("CARGO_PKG_VERSION")
+            })
+            .to_string(),
+        )
+        .with_status_code(if backend_ready {
+            StatusCode(200)
+        } else {
+            StatusCode(503)
+        });
         if let Ok(header) = Header::from_bytes("content-type", "application/json") {
             response.add_header(header);
         }
@@ -755,7 +893,7 @@ fn handle_front_proxy_request(mut request: tiny_http::Request, client: &reqwest:
     let _ = request.respond(response);
 }
 
-fn start_front_proxy() -> Result<(), String> {
+fn start_front_proxy(api_key: String) -> Result<(), String> {
     let server = Server::http(("127.0.0.1", GATEWAY_PORT))
         .map_err(|error| format!("Could not start Basiliskos compatibility proxy: {error}"))?;
     let client = reqwest::blocking::Client::builder()
@@ -768,7 +906,16 @@ fn start_front_proxy() -> Result<(), String> {
             break;
         }
         match server.recv_timeout(Duration::from_millis(150)) {
-            Ok(Some(request)) => handle_front_proxy_request(request, &client),
+            Ok(Some(request)) => {
+                // Claude can issue token-count and message requests concurrently, and a
+                // streamed response can stay open for many minutes. Never let one stream
+                // block health checks or every other request behind it.
+                let request_client = client.clone();
+                let request_api_key = api_key.clone();
+                thread::spawn(move || {
+                    handle_front_proxy_request(request, &request_client, &request_api_key)
+                });
+            }
             Ok(None) => {}
             Err(_) => break,
         }
@@ -792,6 +939,79 @@ fn hidden(command: &mut Command) {
 #[cfg(not(target_os = "windows"))]
 fn hidden(_command: &mut Command) {}
 
+#[cfg(target_os = "windows")]
+fn assign_gateway_to_kill_on_close_job(child: &Child) -> Result<(), String> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+    };
+
+    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+    if job.is_null() {
+        return Err(format!(
+            "Could not create the Basiliskos backend job: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { CloseHandle(job) };
+        return Err(format!(
+            "Could not configure the Basiliskos backend job: {error}"
+        ));
+    }
+    let process_handle = child.as_raw_handle() as HANDLE;
+    if unsafe { AssignProcessToJobObject(job, process_handle) } == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { CloseHandle(job) };
+        return Err(format!(
+            "Could not secure the Basiliskos backend process: {error}"
+        ));
+    }
+    let mut guard = gateway_job()
+        .lock()
+        .map_err(|_| "Basiliskos backend job state is locked")?;
+    if let Some(previous) = guard.replace(job as usize) {
+        unsafe { CloseHandle(previous as HANDLE) };
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn assign_gateway_to_kill_on_close_job(_child: &Child) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn close_gateway_job() {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    if let Ok(mut guard) = gateway_job().lock() {
+        if let Some(job) = guard.take() {
+            // KILL_ON_JOB_CLOSE is the crash/forced-exit backstop. During a normal
+            // shutdown the child has already been asked to exit before this handle closes.
+            unsafe { CloseHandle(job as HANDLE) };
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn close_gateway_job() {}
+
 pub fn stop_gateway_internal() {
     stop_hydra_claude_internal();
     if let Ok(mut guard) = front_proxy().lock() {
@@ -806,6 +1026,7 @@ pub fn stop_gateway_internal() {
             let _ = child.wait();
         }
     }
+    close_gateway_job();
 }
 
 fn stop_hydra_claude_internal() {
@@ -845,10 +1066,33 @@ fn gateway_running() -> bool {
 pub fn start_gateway(app: AppHandle) -> Result<GatewaySnapshot, String> {
     let state = prepare_config()?;
     if health_check(&state.api_key) {
-        return gateway_snapshot();
+        let owns_front_proxy = front_proxy()
+            .lock()
+            .map_err(|_| "Basiliskos proxy state is locked")?
+            .is_some();
+        if owns_front_proxy {
+            return gateway_snapshot();
+        }
+        return Err(
+            "Another Basiliskos instance already owns the local relay. Use that window or close it before reopening Basiliskos."
+                .into(),
+        );
     }
     stop_gateway_internal();
     let executable = prepare_runtime(&app)?;
+    terminate_stale_managed_backends(&executable)?;
+    if !port_is_available(GATEWAY_PORT) {
+        return Err(
+            "Basiliskos port 8317 is occupied by another process. Close the other instance before starting the relay."
+                .into(),
+        );
+    }
+    if !port_is_available(BACKEND_PORT) {
+        return Err(
+            "Basiliskos backend port 8318 is occupied by a stale or unrelated process. Close it before starting the relay; Basiliskos will no longer reuse an unowned backend."
+                .into(),
+        );
+    }
     let log_dir = gateway_dir()?.join("controller-logs");
     fs::create_dir_all(&log_dir)
         .map_err(|error| format!("Could not create {}: {error}", log_dir.display()))?;
@@ -863,13 +1107,18 @@ pub fn start_gateway(app: AppHandle) -> Result<GatewaySnapshot, String> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     hidden(&mut command);
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|error| format!("Could not start Basiliskos: {error}"))?;
+    if let Err(error) = assign_gateway_to_kill_on_close_job(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     *gateway_child()
         .lock()
         .map_err(|_| "Gateway state is locked")? = Some(child);
-    if let Err(error) = start_front_proxy() {
+    if let Err(error) = start_front_proxy(state.api_key.clone()) {
         stop_gateway_internal();
         return Err(error);
     }
@@ -1676,12 +1925,510 @@ fn installed_claude_exe() -> Result<PathBuf, String> {
     Ok(executable)
 }
 
+#[derive(Clone, Copy)]
+enum ClaudeIconKind {
+    WindowBlack,
+    TrayInverted,
+}
+
+fn claude_icon_file_name(kind: ClaudeIconKind) -> &'static str {
+    match kind {
+        ClaudeIconKind::WindowBlack => "claude-window-black.ico",
+        ClaudeIconKind::TrayInverted => "claude-tray-inverted.ico",
+    }
+}
+
+fn claude_icon_path(app: &AppHandle, kind: ClaudeIconKind) -> Result<PathBuf, String> {
+    let file_name = claude_icon_file_name(kind);
+    let mut candidates = Vec::new();
+    if let Ok(resource) = app.path().resource_dir() {
+        candidates.push(resource.join("resources/icons").join(file_name));
+        candidates.push(resource.join("icons").join(file_name));
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/icons")
+            .join(file_name),
+    );
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| format!("Bundled Claude icon missing: {file_name}"))
+}
+
+#[cfg(target_os = "windows")]
+const CLAUDE_BASILISKOS_AUMID: &str = "com.threereadylab.basiliskos.claude";
+
+#[cfg(target_os = "windows")]
+fn load_hicons(path: &Path) -> Result<(isize, isize), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{LoadImageW, IMAGE_ICON, LR_LOADFROMFILE};
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // Do not use LR_SHARED — Windows may cache a stale icon from a previous ICO path.
+    unsafe {
+        let small = LoadImageW(
+            std::ptr::null_mut(),
+            wide.as_ptr(),
+            IMAGE_ICON,
+            16,
+            16,
+            LR_LOADFROMFILE,
+        );
+        let big = LoadImageW(
+            std::ptr::null_mut(),
+            wide.as_ptr(),
+            IMAGE_ICON,
+            32,
+            32,
+            LR_LOADFROMFILE,
+        );
+        if small.is_null() || big.is_null() {
+            return Err(format!("Could not load icon {}", path.display()));
+        }
+        Ok((small as isize, big as isize))
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+struct ClaudeHwndInfo {
+    hwnd: isize,
+    visible: bool,
+    class_name: String,
+}
+
+#[cfg(target_os = "windows")]
+fn enum_claude_hwnds_for_pid(pid: u32) -> Vec<ClaudeHwndInfo> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, TRUE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindow, GetWindowThreadProcessId, IsWindowVisible, GW_OWNER,
+    };
+
+    struct EnumData {
+        pid: u32,
+        windows: Vec<ClaudeHwndInfo>,
+    }
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> windows_sys::core::BOOL {
+        let data = &mut *(lparam as *mut EnumData);
+        let mut window_pid = 0_u32;
+        GetWindowThreadProcessId(hwnd, &mut window_pid);
+        if window_pid == data.pid && GetWindow(hwnd, GW_OWNER).is_null() {
+            let mut class_buf = [0_u16; 256];
+            let class_len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32);
+            let class_name = if class_len > 0 {
+                String::from_utf16_lossy(&class_buf[..class_len as usize])
+            } else {
+                String::new()
+            };
+            data.windows.push(ClaudeHwndInfo {
+                hwnd: hwnd as isize,
+                visible: IsWindowVisible(hwnd) != 0,
+                class_name,
+            });
+        }
+        TRUE
+    }
+
+    let mut data = EnumData {
+        pid,
+        windows: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(callback), &mut data as *mut EnumData as LPARAM);
+    }
+    data.windows
+}
+
+#[cfg(target_os = "windows")]
+fn apply_icons_to_hwnd(hwnd: isize, small: isize, big: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageW, SetClassLongPtrW, SetWindowPos, GCLP_HICON, GCLP_HICONSM, ICON_BIG,
+        ICON_SMALL, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_SETICON,
+    };
+
+    unsafe {
+        let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        let _ = SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small);
+        let _ = SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big);
+        let _ = SetClassLongPtrW(hwnd, GCLP_HICONSM, small);
+        let _ = SetClassLongPtrW(hwnd, GCLP_HICON, big);
+        let _ = SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// Best-effort AUMID + relaunch icon via raw shell32 COM.
+#[cfg(target_os = "windows")]
+fn apply_basiliskos_aumid(hwnd: isize, window_ico: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+    #[repr(C)]
+    struct PropertyKey {
+        fmtid: Guid,
+        pid: u32,
+    }
+    #[repr(C)]
+    struct PropVariant {
+        vt: u16,
+        r1: u16,
+        r2: u16,
+        r3: u16,
+        data: usize,
+    }
+
+    type HRESULT = i32;
+    type Hwnd = *mut core::ffi::c_void;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetPropertyStoreForWindow(
+            hwnd: Hwnd,
+            riid: *const Guid,
+            ppv: *mut *mut core::ffi::c_void,
+        ) -> HRESULT;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pvreserved: *mut core::ffi::c_void, dwcoinit: u32) -> HRESULT;
+        fn CoUninitialize();
+    }
+
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const VT_LPWSTR: u16 = 31;
+    const FMTID: Guid = Guid {
+        data1: 0x9F4C2855,
+        data2: 0x9F79,
+        data3: 0x4B39,
+        data4: [0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3],
+    };
+    const IID_IPROPERTY_STORE: Guid = Guid {
+        data1: 0x886D8EEB,
+        data2: 0x8CF2,
+        data3: 0x4446,
+        data4: [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99],
+    };
+    const PKEY_AUMID: PropertyKey = PropertyKey {
+        fmtid: FMTID,
+        pid: 5,
+    };
+    const PKEY_RELAUNCH_NAME: PropertyKey = PropertyKey {
+        fmtid: FMTID,
+        pid: 4,
+    };
+    const PKEY_RELAUNCH_ICON: PropertyKey = PropertyKey {
+        fmtid: FMTID,
+        pid: 8,
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+        let mut store: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = SHGetPropertyStoreForWindow(hwnd as Hwnd, &IID_IPROPERTY_STORE, &mut store);
+        if hr < 0 || store.is_null() {
+            CoUninitialize();
+            return;
+        }
+
+        // IPropertyStore vtable: 0 QI, 1 AddRef, 2 Release, 3 GetCount, 4 GetAt, 5 GetValue, 6 SetValue, 7 Commit
+        let vtbl = *(store as *const *const usize);
+        type SetValueFn = unsafe extern "system" fn(
+            this: *mut core::ffi::c_void,
+            key: *const PropertyKey,
+            value: *const PropVariant,
+        ) -> HRESULT;
+        type CommitFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> HRESULT;
+        type ReleaseFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> u32;
+        let set_value: SetValueFn = std::mem::transmute(*vtbl.add(6));
+        let commit: CommitFn = std::mem::transmute(*vtbl.add(7));
+        let release: ReleaseFn = std::mem::transmute(*vtbl.add(2));
+
+        let set_string = |key: &PropertyKey, value: &str| {
+            let mut wide: Vec<u16> = std::ffi::OsStr::new(value)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let pv = PropVariant {
+                vt: VT_LPWSTR,
+                r1: 0,
+                r2: 0,
+                r3: 0,
+                data: wide.as_mut_ptr() as usize,
+            };
+            let hr = set_value(store, key, &pv);
+            drop(wide);
+            hr
+        };
+
+        let ico = window_ico.to_string_lossy();
+        let _ = set_string(&PKEY_AUMID, CLAUDE_BASILISKOS_AUMID);
+        let _ = set_string(&PKEY_RELAUNCH_NAME, "Basiliskos Claude");
+        let _ = set_string(&PKEY_RELAUNCH_ICON, ico.as_ref());
+        let _ = commit(store);
+        let _ = release(store);
+        CoUninitialize();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn log_icon_line(message: &str) {
+    if let Ok(profile) = isolated_claude_profile_dir() {
+        let log_dir = profile.join("Basiliskos Logs");
+        let _ = fs::create_dir_all(&log_dir);
+        let path = log_dir.join("icon-apply.log");
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{}", message);
+        }
+    }
+}
+
+/// Reliable distinction for Store Electron: rename the window and set a taskbar
+/// overlay badge. Full package-icon replacement is often ignored by MSIX/Electron.
+#[cfg(target_os = "windows")]
+fn apply_window_title(hwnd: isize, title: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(title)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = SetWindowTextW(hwnd as windows_sys::Win32::Foundation::HWND, wide.as_ptr());
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_taskbar_overlay(hwnd: isize, small_icon: isize) {
+    #[repr(C)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    type HRESULT = i32;
+    type Hwnd = *mut core::ffi::c_void;
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pvreserved: *mut core::ffi::c_void, dwcoinit: u32) -> HRESULT;
+        fn CoUninitialize();
+        fn CoCreateInstance(
+            rclsid: *const Guid,
+            punkouter: *mut core::ffi::c_void,
+            dwclscontext: u32,
+            riid: *const Guid,
+            ppv: *mut *mut core::ffi::c_void,
+        ) -> HRESULT;
+    }
+
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const CLSCTX_INPROC_SERVER: u32 = 0x1;
+    // CLSID_TaskbarList
+    const CLSID_TASKBAR_LIST: Guid = Guid {
+        data1: 0x56FDF344,
+        data2: 0xFD6D,
+        data3: 0x11D0,
+        data4: [0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90],
+    };
+    // IID_ITaskbarList3
+    const IID_ITASKBAR_LIST3: Guid = Guid {
+        data1: 0xEA1AFB91,
+        data2: 0x9E28,
+        data3: 0x4B86,
+        data4: [0x90, 0xE9, 0x9E, 0x9F, 0x8A, 0x5E, 0xEF, 0xAF],
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+        let mut obj: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_TASKBAR_LIST,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_ITASKBAR_LIST3,
+            &mut obj,
+        );
+        if hr < 0 || obj.is_null() {
+            CoUninitialize();
+            return;
+        }
+        // ITaskbarList3 vtable: HrInit=3, SetOverlayIcon=18
+        let vtbl = *(obj as *const *const usize);
+        type HrInitFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> HRESULT;
+        type SetOverlayIconFn = unsafe extern "system" fn(
+            this: *mut core::ffi::c_void,
+            hwnd: Hwnd,
+            hicon: isize,
+            description: *const u16,
+        ) -> HRESULT;
+        type ReleaseFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> u32;
+        let hr_init: HrInitFn = std::mem::transmute(*vtbl.add(3));
+        let set_overlay: SetOverlayIconFn = std::mem::transmute(*vtbl.add(18));
+        let release: ReleaseFn = std::mem::transmute(*vtbl.add(2));
+        let _ = hr_init(obj);
+        let desc: Vec<u16> = "Basiliskos\0".encode_utf16().collect();
+        let _ = set_overlay(obj, hwnd as Hwnd, small_icon, desc.as_ptr());
+        let _ = release(obj);
+        CoUninitialize();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_claude_window_icons(pid: u32, window_ico: &Path) -> usize {
+    let Ok((small, big)) = load_hicons(window_ico) else {
+        log_icon_line(&format!("load window ico failed: {}", window_ico.display()));
+        return 0;
+    };
+    let hwnds = enum_claude_hwnds_for_pid(pid);
+    let mut applied = 0_usize;
+    for info in &hwnds {
+        // Keep the Electron tray host on the inverted tray icon path, not window black.
+        if info.class_name.contains("NotifyIcon") {
+            continue;
+        }
+        apply_icons_to_hwnd(info.hwnd, small, big);
+        if info.visible {
+            apply_basiliskos_aumid(info.hwnd, window_ico);
+            apply_window_title(info.hwnd, "Basiliskos Claude");
+            apply_taskbar_overlay(info.hwnd, small);
+        }
+        applied += 1;
+    }
+    if applied > 0 {
+        log_icon_line(&format!(
+            "window icons/title/overlay applied pid={pid} count={applied} ico={}",
+            window_ico.display()
+        ));
+    }
+    applied
+}
+
+/// Best-effort tray recolor: target Electron_NotifyIconHostWindow for our PID.
+/// Shell_NotifyIcon is private to the registering app — class-icon overwrite is the
+/// least-harmful external approach and may still leave stock tray imagery.
+#[cfg(target_os = "windows")]
+fn try_apply_tray_icon_for_pid(pid: u32, tray_ico: &Path) -> bool {
+    let Ok((small, big)) = load_hicons(tray_ico) else {
+        log_icon_line(&format!("load tray ico failed: {}", tray_ico.display()));
+        return false;
+    };
+    let hwnds = enum_claude_hwnds_for_pid(pid);
+    let mut applied = false;
+    for info in hwnds {
+        if info.class_name.contains("NotifyIcon")
+            || (!info.visible && info.class_name.contains("Chrome_WidgetWin_0"))
+        {
+            apply_icons_to_hwnd(info.hwnd, small, big);
+            applied = true;
+        }
+    }
+    if applied {
+        log_icon_line(&format!(
+            "tray host icons applied pid={pid} ico={}",
+            tray_ico.display()
+        ));
+    }
+    applied
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_claude_icon_reapply(pid: u32, window_ico: PathBuf, tray_ico: PathBuf) {
+    thread::spawn(move || {
+        log_icon_line(&format!(
+            "icon reapply start pid={pid} window={} tray={}",
+            window_ico.display(),
+            tray_ico.display()
+        ));
+        let mut consecutive_hits = 0_u8;
+        // Long reassert: Electron resets title/icons after paint and on focus.
+        for attempt in 0..60_u8 {
+            if attempt > 0 {
+                thread::sleep(Duration::from_millis(500));
+            }
+            // Stop if the process is gone.
+            if !process_alive(pid) {
+                log_icon_line(&format!("icon reapply stop pid={pid} process exited"));
+                return;
+            }
+            let touched = apply_claude_window_icons(pid, &window_ico);
+            if !tray_ico.as_os_str().is_empty() && tray_ico.is_file() {
+                let _ = try_apply_tray_icon_for_pid(pid, &tray_ico);
+            }
+            if touched > 0 {
+                consecutive_hits = consecutive_hits.saturating_add(1);
+            }
+        }
+        log_icon_line(&format!("icon reapply end pid={pid} hits={consecutive_hits}"));
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    unsafe {
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        );
+        if handle.is_null() {
+            return false;
+        }
+        let status = WaitForSingleObject(handle, 0);
+        let _ = CloseHandle(handle);
+        status == WAIT_TIMEOUT
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn maybe_apply_claude_icons(app: &AppHandle, pid: u32, state: &ControllerState) {
+    if !should_apply_claude_window_icon(state.claude_window_icon) {
+        log_icon_line("icon reapply skipped (claude_window_icon=system)");
+        return;
+    }
+    let Ok(window_ico) = claude_icon_path(app, ClaudeIconKind::WindowBlack) else {
+        log_icon_line("window ico path missing");
+        return;
+    };
+    let tray_ico = claude_icon_path(app, ClaudeIconKind::TrayInverted).unwrap_or_default();
+    spawn_claude_icon_reapply(pid, window_ico, tray_ico);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn maybe_apply_claude_icons(_app: &AppHandle, _pid: u32, _state: &ControllerState) {}
+
 #[tauri::command]
 pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
     #[cfg(target_os = "windows")]
     {
         if !gateway_running() {
-            start_gateway(app)?;
+            start_gateway(app.clone())?;
         }
         let mut state = prepare_config()?;
         restore_legacy_shared_config_if_needed(&mut state)?;
@@ -1696,6 +2443,11 @@ pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
         fs::create_dir_all(&log_dir)
             .map_err(|error| format!("Could not create {}: {error}", log_dir.display()))?;
         if hydra_claude_running() {
+            if let Ok(guard) = claude_child().lock() {
+                if let Some(child) = guard.as_ref() {
+                    maybe_apply_claude_icons(&app, child.id(), &state);
+                }
+            }
             return gateway_snapshot();
         }
         let stdout = fs::File::create(log_dir.join("launcher.stdout.log"))
@@ -1712,9 +2464,11 @@ pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
         let child = command.spawn().map_err(|error| {
             format!("Could not open the isolated Basiliskos Claude window: {error}")
         })?;
+        let pid = child.id();
         *claude_child()
             .lock()
             .map_err(|_| "Basiliskos Claude process state is locked")? = Some(child);
+        maybe_apply_claude_icons(&app, pid, &state);
         std::thread::sleep(Duration::from_millis(900));
         if !hydra_claude_running() {
             return Err(
@@ -1722,7 +2476,7 @@ pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
                     .into(),
             );
         }
-        return gateway_snapshot();
+        gateway_snapshot()
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -1809,11 +2563,14 @@ mod tests {
             previous_claude_applied_id: None,
             active_account: Some("xai-test.json".into()),
             routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
         };
         let config = render_config(&auth, &state);
         assert!(config.contains("host: \"127.0.0.1\""));
         assert!(config.contains("port: 8318"));
         assert!(config.contains("disable-control-panel: true"));
+        assert!(config.contains("streaming:\n  keepalive-seconds: 15"));
+        assert!(config.contains("bootstrap-retries: 1"));
         let _ = fs::remove_dir_all(auth);
     }
 
@@ -1829,6 +2586,7 @@ mod tests {
             previous_claude_applied_id: None,
             active_account: None,
             routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
         };
         write_isolated_claude_config(&profile, &state).unwrap();
         assert_eq!(
@@ -1915,6 +2673,7 @@ mod tests {
             previous_claude_applied_id: None,
             active_account: None,
             routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
         };
         write_isolated_claude_config(&profile, &state).unwrap();
 
@@ -2029,6 +2788,7 @@ mod tests {
             previous_claude_applied_id: None,
             active_account: None,
             routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
         };
 
         let error = write_isolated_claude_config(&profile, &state).unwrap_err();
@@ -2048,6 +2808,7 @@ mod tests {
             previous_claude_applied_id: None,
             active_account: Some("xai-test.json".into()),
             routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
         };
         state.routes.insert(
             "xai".into(),
@@ -2076,6 +2837,65 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap()
             .contains("You are a routed coding assistant"));
+    }
+
+    #[test]
+    fn endpoint_health_requires_success_and_expected_body_marker() {
+        fn serve_once(response: &'static str) -> u16 {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.starts_with("GET /ready HTTP/1.1"));
+                assert!(request.contains("x-api-key: test-key"));
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            port
+        }
+
+        let healthy = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"backend\":true}",
+        );
+        assert!(endpoint_health_check(
+            healthy,
+            "/ready",
+            "test-key",
+            "\"backend\":true"
+        ));
+
+        let degraded = serve_once(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"backend\":false}",
+        );
+        assert!(!endpoint_health_check(
+            degraded,
+            "/ready",
+            "test-key",
+            "\"backend\":true"
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn gateway_job_kills_backend_when_owner_handle_closes() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping 127.0.0.1 -n 30 > nul"])
+            .spawn()
+            .unwrap();
+        assign_gateway_to_kill_on_close_job(&child).unwrap();
+        close_gateway_job();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("backend process survived the KILL_ON_JOB_CLOSE job handle");
     }
 
     #[test]
@@ -2176,6 +2996,50 @@ mod tests {
         assert_eq!(normalized_route(&state, "codex").model, "gpt-5.5");
         assert_eq!(normalized_route(&state, "xai").model, "grok-build-0.1");
         assert_eq!(normalized_route(&state, "xai").thinking, "auto");
+        assert_eq!(state.claude_window_icon, ClaudeWindowIcon::Black);
+    }
+
+    #[test]
+    fn old_controller_state_defaults_claude_window_icon_to_black() {
+        let state: ControllerState = serde_json::from_str(
+            r#"{"api_key":"secret","claude_config_id":"id","active_account":null}"#,
+        )
+        .unwrap();
+        assert_eq!(state.claude_window_icon, ClaudeWindowIcon::Black);
+        assert!(should_apply_claude_window_icon(state.claude_window_icon));
+    }
+
+    #[test]
+    fn claude_window_icon_round_trips_in_controller_state() {
+        for (raw, expected) in [
+            ("black", ClaudeWindowIcon::Black),
+            ("system", ClaudeWindowIcon::System),
+        ] {
+            let json = format!(
+                r#"{{"api_key":"secret","claude_config_id":"id","active_account":null,"claude_window_icon":"{raw}"}}"#
+            );
+            let state: ControllerState = serde_json::from_str(&json).unwrap();
+            assert_eq!(state.claude_window_icon, expected);
+            let encoded = serde_json::to_value(&state).unwrap();
+            assert_eq!(
+                encoded.get("claude_window_icon").and_then(|v| v.as_str()),
+                Some(raw)
+            );
+        }
+        assert!(!should_apply_claude_window_icon(ClaudeWindowIcon::System));
+    }
+
+    #[test]
+    fn bundled_claude_icon_assets_exist_in_dev_tree() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/icons");
+        assert!(
+            root.join("claude-window-black.ico").is_file(),
+            "missing claude-window-black.ico"
+        );
+        assert!(
+            root.join("claude-tray-inverted.ico").is_file(),
+            "missing claude-tray-inverted.ico"
+        );
     }
 
     #[test]
@@ -2188,6 +3052,7 @@ mod tests {
             previous_claude_applied_id: None,
             active_account: Some("xai-test.json".into()),
             routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
         };
         state.routes.insert(
             "xai".into(),
@@ -2217,6 +3082,7 @@ mod tests {
             previous_claude_applied_id: None,
             active_account: None,
             routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
         };
         state.routes.insert(
             "xai".into(),
