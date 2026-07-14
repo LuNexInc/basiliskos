@@ -7,9 +7,15 @@ privately to the repository owner instead of opening a public issue.
 
 ## Credential handling
 
-Hydra stores profile credentials under the current user's home directory.
-Never attach `auth.json`, `profiles.json`, exported credentials, access tokens,
-or refresh tokens to an issue.
+Basiliskos stores controller state and provider credentials under
+`%USERPROFILE%\.hydra-gateway`. Never attach `auth` directory contents,
+access tokens, refresh tokens, or local API keys to an issue.
 
-Revoked or expired credentials must be replaced through the official
-`grok login` flow.
+Replace expired credentials through each provider's official browser OAuth
+flow from the Basiliskos UI (Claude, Codex, or Grok).
+
+## Scope
+
+Basiliskos is a local loopback controller. It does not patch Claude Desktop,
+bypass provider limits, or automate OAuth approval pages. Use it only with
+accounts you own or are authorized to access.
