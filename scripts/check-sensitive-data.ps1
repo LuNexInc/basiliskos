@@ -94,7 +94,7 @@ foreach ($relative in $tracked) {
     if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
         continue
     }
-    $file = Get-Item -LiteralPath $fullPath
+    $file = Get-Item -LiteralPath $fullPath -Force
     if ($file.Length -gt 5MB) {
         continue
     }
