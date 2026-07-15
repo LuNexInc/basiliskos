@@ -11,12 +11,9 @@ $sentinelDir = Join-Path $env:USERPROFILE '.hydra-gateway'
 $sentinel = Join-Path $sentinelDir 'installer-ci-sentinel.txt'
 $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\3ReadyLab\Basiliskos.lnk'
 
-function Invoke-Installer([string]$Path, [switch]$ExpectFailure) {
+function Invoke-Installer([string]$Path) {
     $process = Start-Process -FilePath $Path -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
-    if ($ExpectFailure) {
-        if ($process.ExitCode -eq 0) { throw 'A downgrade unexpectedly succeeded.' }
-    }
-    elseif ($process.ExitCode -ne 0) {
+    if ($process.ExitCode -ne 0) {
         throw "$([IO.Path]::GetFileName($Path)) failed with exit code $($process.ExitCode)."
     }
 }
@@ -70,9 +67,15 @@ if ($beforeRepair -ne $afterRepair) { throw 'Repair changed the installed execut
 
 $uninstallKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Basiliskos'
 $installedVersion = (Get-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion).DisplayVersion
+$futureVersion = '999.0.0'
 try {
-    Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value '999.0.0'
-    Invoke-Installer $CurrentInstaller -ExpectFailure
+    Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value $futureVersion
+    Invoke-Installer $CurrentInstaller
+    $versionAfterRejectedDowngrade =
+        (Get-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion).DisplayVersion
+    if ($versionAfterRejectedDowngrade -ne $futureVersion) {
+        throw "The installer overwrote a newer registered version with $versionAfterRejectedDowngrade."
+    }
 }
 finally {
     Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value $installedVersion
