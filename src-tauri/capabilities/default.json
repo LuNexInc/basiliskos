@@ -5,13 +5,19 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "core:window:default",
     "core:window:allow-hide",
     "core:window:allow-minimize",
     "core:window:allow-show",
     "core:window:allow-start-dragging",
     "core:window:allow-toggle-maximize",
-    "opener:default",
-    "dialog:allow-open"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://claude.ai/*" },
+        { "url": "https://auth.openai.com/*" },
+        { "url": "https://accounts.x.ai/*" },
+        { "url": "https://auth.x.ai/*" }
+      ]
+    }
   ]
 }

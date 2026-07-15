@@ -1,0 +1,134 @@
+name: Windows release gate
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: basiliskos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 55
+    env:
+      BASILISKOS_SIGN_CERT_BASE64: ${{ secrets.BASILISKOS_SIGN_CERT_BASE64 }}
+      BASILISKOS_SIGN_CERT_PASSWORD: ${{ secrets.BASILISKOS_SIGN_CERT_PASSWORD }}
+      BASILISKOS_REQUIRE_SIGNING: '0'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.30.1
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          cache-workspaces: src-tauri
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run required release checks
+        run: pnpm test:all
+
+      - name: Build and optionally Authenticode-sign NSIS
+        run: pnpm bundle
+
+      - name: Generate hashes, signatures, and license evidence
+        shell: pwsh
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:BASILISKOS_SIGN_CERT_BASE64)) {
+            ./scripts/generate-release-evidence.ps1 -ArtifactRoot ./src-tauri/target/release -OutputDirectory ./release-evidence -RequireSigning
+          } else {
+            ./scripts/generate-release-evidence.ps1 -ArtifactRoot ./src-tauri/target/release -OutputDirectory ./release-evidence
+          }
+
+      - name: Publish signing status summary
+        shell: pwsh
+        run: |
+          $artifacts = Get-Content ./release-evidence/artifacts.json -Raw | ConvertFrom-Json
+          $unsigned = @($artifacts | Where-Object { $_.authenticode -ne 'Valid' })
+          "## Windows signing status" | Add-Content $env:GITHUB_STEP_SUMMARY
+          if ($unsigned.Count -gt 0) {
+            "⚠️ This build is intentionally unsigned. Windows will show Unknown publisher." | Add-Content $env:GITHUB_STEP_SUMMARY
+          } else {
+            "All Basiliskos application and installer artifacts have valid Authenticode signatures." | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+          $artifacts | ForEach-Object {
+            "- ``$($_.name)``: $($_.authenticode), SHA-256 ``$($_.sha256)``" | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: release-evidence/basiliskos.spdx.json
+          upload-artifact: false
+
+      - name: Upload gated Windows artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: basiliskos-windows-gated
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            src-tauri/target/release/hydra-gateway.exe
+            src-tauri/target/release/bundle/nsis/*.exe
+            release-evidence/*
+
+      - name: Attest tagged release artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: |
+            src-tauri/target/release/hydra-gateway.exe
+            src-tauri/target/release/bundle/nsis/*.exe
+
+  installer-lifecycle:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Download current gated artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: basiliskos-windows-gated
+          path: current
+
+      - name: Download the public 1.1.5 upgrade fixture
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download v1.1.5 -R LuNex-Inc/basiliskos --pattern '*_x64-setup.exe' --dir previous
+
+      - name: Test clean install, upgrade, repair, rollback, and uninstall
+        shell: pwsh
+        run: |
+          $current = Get-ChildItem ./current -Filter '*_x64-setup.exe' -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          $previous = Get-ChildItem ./previous -Filter '*_x64-setup.exe' -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          ./scripts/test-installer-lifecycle.ps1 -CurrentInstaller $current -PreviousInstaller $previous

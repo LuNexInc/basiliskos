@@ -1,4 +1,6 @@
+use bytes::Bytes;
 use chrono::Utc;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -9,7 +11,7 @@ use std::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{mpsc, Mutex, OnceLock},
+    sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -17,10 +19,25 @@ use tauri::{AppHandle, Manager};
 use tiny_http::{Header, Response, Server, StatusCode};
 use uuid::Uuid;
 
-const GATEWAY_VERSION: &str = "7.2.72";
-const GATEWAY_EXE_SHA256: &str = "4ab5e372f8cea947af9a07820f962a07e42aeafb56508f73fd9ab129533e88bc";
+use crate::diagnostics::{self, DiagnosticEvent, ErrorCode};
+
+use crate::persistence::{
+    durable_write, load_json_with_recovery, recover_pending_transactions, run_transaction,
+    secure_create_dir_all, secure_existing_path, FileMutation,
+};
+
+const GATEWAY_VERSION: &str = "7.2.77";
+const GATEWAY_EXE_SHA256: &str = "0f2b23b5b533c92c2ce86bb37e2bb7bd7472b81b3f63bf8cc19950aca0a0cc2c";
 const GATEWAY_PORT: u16 = 8317;
 const BACKEND_PORT: u16 = 8318;
+const MAX_RELAY_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RELAY_HEADER_BYTES: usize = 64 * 1024;
+const MAX_RELAY_HEADERS: usize = 64;
+const RELAY_WORKERS: usize = 8;
+const RELAY_QUEUE_CAPACITY: usize = 32;
+const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const BASILISKOS_CONFIG_NAME: &str = "Basiliskos";
 const SUPPORTED_PROVIDERS: [&str; 3] = ["claude", "codex", "xai"];
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -152,32 +169,105 @@ const XAI_MODELS: &[ModelSpec] = &[
     },
 ];
 
-static GATEWAY_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
-static CLAUDE_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
-static FRONT_PROXY: OnceLock<Mutex<Option<FrontProxy>>> = OnceLock::new();
-#[cfg(target_os = "windows")]
-static GATEWAY_JOB: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+#[derive(Default)]
+struct WorkerTracker {
+    active: Mutex<usize>,
+    changed: Condvar,
+}
 
 struct FrontProxy {
     shutdown: mpsc::Sender<()>,
-    thread: thread::JoinHandle<()>,
+    listener: thread::JoinHandle<()>,
+    workers: Vec<thread::JoinHandle<()>>,
+    tracker: Arc<WorkerTracker>,
+    async_runtime: Arc<tokio::runtime::Runtime>,
 }
 
-fn gateway_child() -> &'static Mutex<Option<Child>> {
-    GATEWAY_CHILD.get_or_init(|| Mutex::new(None))
+impl FrontProxy {
+    fn shutdown(self) {
+        let _ = self.shutdown.send(());
+        let _ = self.listener.join();
+        let deadline = Instant::now() + RELAY_DRAIN_TIMEOUT;
+        if let Ok(mut active) = self.tracker.active.lock() {
+            while *active > 0 && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self.tracker.changed.wait_timeout(active, remaining) {
+                    Ok((next, _)) => active = next,
+                    Err(_) => return,
+                }
+            }
+            if *active == 0 {
+                drop(active);
+                for worker in self.workers {
+                    let _ = worker.join();
+                }
+                return;
+            }
+        }
+        // A client or upstream may still be inside a bounded read timeout. Dropping a
+        // JoinHandle detaches it; the client timeout guarantees eventual cleanup while
+        // keeping application shutdown bounded.
+        drop(self.workers);
+        drop(self.async_runtime);
+    }
 }
 
-fn claude_child() -> &'static Mutex<Option<Child>> {
-    CLAUDE_CHILD.get_or_init(|| Mutex::new(None))
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum GatewayPhase {
+    #[default]
+    Stopped,
+    Starting,
+    Running,
+    Degraded,
+    Stopping,
 }
 
-fn front_proxy() -> &'static Mutex<Option<FrontProxy>> {
-    FRONT_PROXY.get_or_init(|| Mutex::new(None))
+#[derive(Default)]
+struct ControllerRuntime {
+    phase: GatewayPhase,
+    gateway_child: Option<Child>,
+    claude_child: Option<Child>,
+    #[cfg(target_os = "windows")]
+    claude_job: Option<usize>,
+    claude_root_pid: Option<u32>,
+    claude_executable: Option<PathBuf>,
+    claude_profile: Option<PathBuf>,
+    front_proxy: Option<FrontProxy>,
+    backend_exit_reason: Option<String>,
+    backend_restart_attempts: u32,
+    backend_next_restart: Option<Instant>,
+    last_known_good_models: BTreeMap<String, String>,
+    login_claim: Option<String>,
+    login: Option<LoginRuntime>,
+    last_login: Option<ProviderLoginStatus>,
+    #[cfg(target_os = "windows")]
+    gateway_job: Option<usize>,
 }
 
-#[cfg(target_os = "windows")]
-fn gateway_job() -> &'static Mutex<Option<usize>> {
-    GATEWAY_JOB.get_or_init(|| Mutex::new(None))
+#[derive(Default)]
+struct ControllerManager {
+    runtime: Mutex<ControllerRuntime>,
+    mutations: Mutex<()>,
+}
+
+static CONTROLLER: OnceLock<ControllerManager> = OnceLock::new();
+
+fn controller() -> &'static ControllerManager {
+    CONTROLLER.get_or_init(ControllerManager::default)
+}
+
+fn runtime_lock() -> Result<MutexGuard<'static, ControllerRuntime>, String> {
+    controller()
+        .runtime
+        .lock()
+        .map_err(|_| "Basiliskos controller runtime state is locked".into())
+}
+
+fn mutation_lock() -> Result<MutexGuard<'static, ()>, String> {
+    controller()
+        .mutations
+        .lock()
+        .map_err(|_| "Basiliskos controller mutation state is locked".into())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,6 +291,24 @@ pub struct GatewaySnapshot {
     pub accounts: Vec<GatewayAccount>,
     pub active_account: Option<String>,
     pub routes: Vec<ProviderRoute>,
+    pub controller: ComponentStatus,
+    pub relay: ComponentStatus,
+    pub backend: ComponentStatus,
+    pub credentials: ComponentStatus,
+    pub route: ComponentStatus,
+    pub oauth: ComponentStatus,
+    pub claude: ComponentStatus,
+    pub backend_exit_reason: Option<String>,
+    pub active_requests: usize,
+    pub diagnostics: Vec<DiagnosticEvent>,
+    pub login: Option<ProviderLoginStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentStatus {
+    pub state: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -224,8 +332,28 @@ pub struct ProviderRoute {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderLoginLaunch {
+    pub session_id: String,
     pub authorization_url: String,
     pub user_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderLoginStatus {
+    pub session_id: String,
+    pub provider: String,
+    pub state: String,
+    pub started_at: String,
+    pub result_file_name: Option<String>,
+    pub detail: String,
+}
+
+struct LoginRuntime {
+    status: ProviderLoginStatus,
+    child: Arc<Mutex<Child>>,
+    staging_dir: PathBuf,
+    #[cfg(target_os = "windows")]
+    job: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -428,29 +556,68 @@ fn runtime_exe_path() -> Result<PathBuf, String> {
     Ok(gateway_dir()?.join("bin").join("cli-proxy-api.exe"))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+fn secure_files_in(directory: &Path, extension: &str) -> Result<(), String> {
+    if !directory.is_dir() {
+        return Ok(());
     }
-    let temp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    fs::write(&temp, bytes)
-        .map_err(|error| format!("Could not write {}: {error}", temp.display()))?;
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| format!("Could not replace {}: {error}", path.display()))?;
+    for entry in fs::read_dir(directory)
+        .map_err(|error| format!("Could not inspect {}: {error}", directory.display()))?
+    {
+        let path = entry
+            .map_err(|error| format!("Could not inspect a private file: {error}"))?
+            .path();
+        if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some(extension) {
+            secure_existing_path(&path)?;
+        }
     }
-    fs::rename(&temp, path)
-        .map_err(|error| format!("Could not finalize {}: {error}", path.display()))
+    Ok(())
+}
+
+pub fn initialize_controller_storage() -> Result<(), String> {
+    let _mutation = mutation_lock()?;
+    let root = root_dir()?;
+    let gateway = gateway_dir()?;
+    let auth = auth_dir()?;
+    let controller_logs = gateway.join("controller-logs");
+    let claude_profile = isolated_claude_profile_dir()?;
+    let claude_logs = claude_profile.join("Basiliskos Logs");
+    for directory in [
+        &root,
+        &gateway,
+        &auth,
+        &controller_logs,
+        &claude_profile,
+        &claude_logs,
+    ] {
+        secure_create_dir_all(directory)?;
+    }
+    recover_pending_transactions(&root)?;
+    let state_file = controller_path()?;
+    let labels_file = account_labels_path()?;
+    let config_file = config_path()?;
+    for file in [&state_file, &labels_file, &config_file] {
+        secure_existing_path(file)?;
+    }
+    for json_file in [&state_file, &labels_file] {
+        if let Ok(bytes) = fs::read(json_file) {
+            if serde_json::from_slice::<Value>(&bytes).is_ok() {
+                durable_write(json_file, &bytes)?;
+            }
+        }
+    }
+    if let Ok(bytes) = fs::read(&config_file) {
+        durable_write(&config_file, &bytes)?;
+    }
+    secure_files_in(&auth, "json")?;
+    secure_files_in(&controller_logs, "log")?;
+    secure_files_in(&claude_logs, "log")?;
+    Ok(())
 }
 
 fn load_state() -> Result<ControllerState, String> {
     let path = controller_path()?;
-    if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-        return serde_json::from_str(&raw)
-            .map_err(|error| format!("Basiliskos controller state is invalid: {error}"));
+    if path.exists() || crate::persistence::backup_path(&path)?.exists() {
+        return load_json_with_recovery(&path, "Basiliskos controller state");
     }
     let state = ControllerState {
         api_key: format!(
@@ -471,24 +638,21 @@ fn load_state() -> Result<ControllerState, String> {
 fn save_state(state: &ControllerState) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| format!("Could not serialize controller state: {error}"))?;
-    atomic_write(&controller_path()?, &bytes)
+    durable_write(&controller_path()?, &bytes)
 }
 
 fn load_account_labels() -> Result<BTreeMap<String, String>, String> {
     let path = account_labels_path()?;
-    if !path.exists() {
+    if !path.exists() && !crate::persistence::backup_path(&path)?.exists() {
         return Ok(BTreeMap::new());
     }
-    let raw = fs::read_to_string(&path)
-        .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-    serde_json::from_str(&raw)
-        .map_err(|error| format!("Basiliskos profile names are invalid: {error}"))
+    load_json_with_recovery(&path, "Basiliskos profile names")
 }
 
 fn save_account_labels(labels: &BTreeMap<String, String>) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(labels)
         .map_err(|error| format!("Could not serialize profile names: {error}"))?;
-    atomic_write(&account_labels_path()?, &bytes)
+    durable_write(&account_labels_path()?, &bytes)
 }
 
 fn normalized_account_label(name: &str) -> Result<String, String> {
@@ -550,11 +714,9 @@ fn prepare_runtime(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(destination);
     }
     let source = verified_source_exe(app)?;
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
-    }
-    fs::copy(&source, &destination)
+    let bytes = fs::read(&source)
+        .map_err(|error| format!("Could not read the bundled gateway runtime: {error}"))?;
+    durable_write(&destination, &bytes)
         .map_err(|error| format!("Could not install the gateway runtime: {error}"))?;
     if sha256_file(&destination)? != GATEWAY_EXE_SHA256 {
         return Err("The installed gateway runtime failed its integrity check.".into());
@@ -588,9 +750,15 @@ debug: false
 logging-to-file: true
 logs-max-total-size-mb: 20
 request-log: false
+usage-statistics-enabled: false
+passthrough-headers: false
+request-retry: 0
+max-retry-credentials: 1
+nonstream-keepalive-interval: 0
+disable-claude-cloak-mode: true
 streaming:
   keepalive-seconds: 15
-  bootstrap-retries: 1
+  bootstrap-retries: 0
 plugins:
   enabled: false
 "#,
@@ -602,9 +770,8 @@ plugins:
 fn prepare_config() -> Result<ControllerState, String> {
     let state = load_state()?;
     let auth = auth_dir()?;
-    fs::create_dir_all(&auth)
-        .map_err(|error| format!("Could not create {}: {error}", auth.display()))?;
-    atomic_write(&config_path()?, render_config(&auth, &state).as_bytes())?;
+    secure_create_dir_all(&auth)?;
+    durable_write(&config_path()?, render_config(&auth, &state).as_bytes())?;
     Ok(state)
 }
 
@@ -632,6 +799,93 @@ fn endpoint_health_check(port: u16, path: &str, api_key: &str, marker: &str) -> 
 
 fn backend_health_check(api_key: &str) -> bool {
     endpoint_health_check(BACKEND_PORT, "/v1/models", api_key, "\"data\"")
+}
+
+fn backend_model_ids(api_key: &str) -> Result<Vec<String>, String> {
+    let address = ("127.0.0.1", BACKEND_PORT)
+        .to_socket_addrs()
+        .map_err(|_| "Backend address is unavailable")?
+        .next()
+        .ok_or("Backend address is unavailable")?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(500))
+        .map_err(|_| "Backend model catalog is unavailable")?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|_| "Backend model catalog timeout could not be configured")?;
+    let request = format!(
+        "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: {api_key}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| "Backend model catalog request failed")?;
+    let mut bytes = Vec::new();
+    stream
+        .take(2 * 1024 * 1024)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Backend model catalog response failed")?;
+    let split = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or("Backend model catalog response is malformed")?;
+    let value: Value = serde_json::from_slice(&bytes[split + 4..])
+        .map_err(|_| "Backend model catalog JSON is malformed")?;
+    Ok(value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect())
+}
+
+fn validated_route_for_request(
+    state: &ControllerState,
+    provider: &str,
+    correlation_id: &str,
+) -> RouteSelection {
+    let selected = normalized_route(state, provider);
+    let Ok(models) = backend_model_ids(&state.api_key) else {
+        return selected;
+    };
+    if models.is_empty() || models.iter().any(|model| model == &selected.model) {
+        if let Ok(mut runtime) = runtime_lock() {
+            runtime
+                .last_known_good_models
+                .insert(provider.to_owned(), selected.model.clone());
+        }
+        return selected;
+    }
+    let fallback = runtime_lock()
+        .ok()
+        .and_then(|runtime| runtime.last_known_good_models.get(provider).cloned())
+        .filter(|model| models.contains(model))
+        .or_else(|| {
+            model_specs(provider)
+                .iter()
+                .find(|spec| models.iter().any(|model| model == spec.id))
+                .map(|spec| spec.id.to_owned())
+        });
+    let Some(model) = fallback else {
+        return selected;
+    };
+    diagnostics::record(
+        ErrorCode::ModelFallback,
+        "warning",
+        "The selected model is unavailable for this credential; the last known good model is being used.",
+        Some(correlation_id),
+        None,
+        Some(provider),
+    );
+    let thinking = model_specs(provider)
+        .iter()
+        .find(|spec| spec.id == model)
+        .filter(|spec| {
+            selected.thinking == "auto"
+                || spec.thinking_levels.contains(&selected.thinking.as_str())
+        })
+        .map(|_| selected.thinking)
+        .unwrap_or_else(|| "auto".into());
+    RouteSelection { model, thinking }
 }
 
 fn health_check(api_key: &str) -> bool {
@@ -783,15 +1037,278 @@ fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
-fn proxy_error(message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+fn secure_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+fn request_is_authorized(request: &tiny_http::Request, api_key: &str) -> bool {
+    request.headers().iter().any(|header| {
+        let name = header.field.as_str().as_str();
+        let value = header.value.as_str().trim();
+        (name.eq_ignore_ascii_case("x-api-key") && secure_eq(value, api_key))
+            || (name.eq_ignore_ascii_case("authorization")
+                && value
+                    .strip_prefix("Bearer ")
+                    .is_some_and(|token| secure_eq(token, api_key)))
+    })
+}
+
+fn request_headers_within_budget(request: &tiny_http::Request) -> bool {
+    request.headers().len() <= MAX_RELAY_HEADERS
+        && request.headers().iter().fold(0_usize, |total, header| {
+            total
+                .saturating_add(header.field.as_str().as_str().len())
+                .saturating_add(header.value.as_str().len())
+        }) <= MAX_RELAY_HEADER_BYTES
+}
+
+fn proxy_error(
+    code: ErrorCode,
+    status: u16,
+    message: &str,
+    correlation_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
     let body = serde_json::json!({
         "type": "error",
-        "error": {"type": "api_error", "message": message}
+        "error": {
+            "type": code.as_str(),
+            "message": message,
+            "correlation_id": correlation_id
+        }
     })
     .to_string()
     .into_bytes();
-    let mut response = Response::from_data(body).with_status_code(StatusCode(502));
+    let mut response = Response::from_data(body).with_status_code(StatusCode(status));
     if let Ok(header) = Header::from_bytes("content-type", "application/json") {
+        response.add_header(header);
+    }
+    if let Ok(header) = Header::from_bytes("x-basiliskos-correlation-id", correlation_id) {
+        response.add_header(header);
+    }
+    if let Ok(header) = Header::from_bytes("x-basiliskos-error-code", code.as_str()) {
+        response.add_header(header);
+    }
+    response
+}
+
+fn respond_proxy_error(
+    request: tiny_http::Request,
+    code: ErrorCode,
+    status: u16,
+    message: &'static str,
+    correlation_id: &str,
+) {
+    diagnostics::record(
+        code,
+        if status >= 500 { "error" } else { "warning" },
+        message,
+        Some(correlation_id),
+        Some(status),
+        None,
+    );
+    let _ = request.respond(proxy_error(code, status, message, correlation_id));
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamFailure {
+    MidstreamIdle,
+    UpstreamEnded,
+}
+
+struct TrackedUpstream {
+    receiver: tokio::sync::mpsc::Receiver<Result<Bytes, StreamFailure>>,
+    current: Option<Bytes>,
+    offset: usize,
+    correlation_id: String,
+    provider: Option<String>,
+}
+
+impl Read for TrackedUpstream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(current) = self.current.as_ref() {
+                let remaining = &current[self.offset..];
+                if !remaining.is_empty() {
+                    let count = remaining.len().min(buffer.len());
+                    buffer[..count].copy_from_slice(&remaining[..count]);
+                    self.offset += count;
+                    if self.offset == current.len() {
+                        self.current = None;
+                        self.offset = 0;
+                    }
+                    return Ok(count);
+                }
+            }
+            match self.receiver.blocking_recv() {
+                Some(Ok(bytes)) if !bytes.is_empty() => self.current = Some(bytes),
+                Some(Ok(_)) => continue,
+                Some(Err(failure)) => {
+                    let (code, message, kind) = match failure {
+                        StreamFailure::MidstreamIdle => (
+                            ErrorCode::MidstreamIdleTimeout,
+                            "The upstream stream exceeded its idle time budget.",
+                            std::io::ErrorKind::TimedOut,
+                        ),
+                        StreamFailure::UpstreamEnded => (
+                            ErrorCode::BackendConnectFailed,
+                            "The upstream stream ended unexpectedly.",
+                            std::io::ErrorKind::ConnectionAborted,
+                        ),
+                    };
+                    diagnostics::record(
+                        code,
+                        "error",
+                        message,
+                        Some(&self.correlation_id),
+                        None,
+                        self.provider.as_deref(),
+                    );
+                    return Err(std::io::Error::new(kind, code.as_str()));
+                }
+                None => return Ok(0),
+            }
+        }
+    }
+}
+
+struct UpstreamMeta {
+    status: u16,
+    headers: Vec<(String, Vec<u8>)>,
+    body: tokio::sync::mpsc::Receiver<Result<Bytes, StreamFailure>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FirstResponseFailure {
+    Timeout,
+    Connect,
+}
+
+fn begin_upstream_request(
+    runtime: &tokio::runtime::Handle,
+    client: reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> Result<UpstreamMeta, FirstResponseFailure> {
+    begin_upstream_request_with_timeouts(
+        runtime,
+        client,
+        method,
+        url,
+        headers,
+        body,
+        FIRST_RESPONSE_TIMEOUT,
+        STREAM_IDLE_TIMEOUT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn begin_upstream_request_with_timeouts(
+    runtime: &tokio::runtime::Handle,
+    client: reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    first_response_timeout: Duration,
+    stream_idle_timeout: Duration,
+) -> Result<UpstreamMeta, FirstResponseFailure> {
+    let (meta_tx, meta_rx) = mpsc::sync_channel(1);
+    runtime.spawn(async move {
+        let mut builder = client.request(method, url);
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        let response =
+            match tokio::time::timeout(first_response_timeout, builder.body(body).send()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => {
+                    let _ = meta_tx.send(Err(FirstResponseFailure::Connect));
+                    return;
+                }
+                Err(_) => {
+                    let _ = meta_tx.send(Err(FirstResponseFailure::Timeout));
+                    return;
+                }
+            };
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(8);
+        if meta_tx
+            .send(Ok(UpstreamMeta {
+                status,
+                headers,
+                body: body_rx,
+            }))
+            .is_err()
+        {
+            return;
+        }
+        let mut stream = response.bytes_stream();
+        loop {
+            match tokio::time::timeout(stream_idle_timeout, stream.next()).await {
+                Ok(Some(Ok(bytes))) => {
+                    if body_tx.send(Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Some(Err(_))) => {
+                    let _ = body_tx.send(Err(StreamFailure::UpstreamEnded)).await;
+                    return;
+                }
+                Ok(None) => return,
+                Err(_) => {
+                    let _ = body_tx.send(Err(StreamFailure::MidstreamIdle)).await;
+                    return;
+                }
+            }
+        }
+    });
+    meta_rx
+        .recv_timeout(first_response_timeout.saturating_add(Duration::from_secs(1)))
+        .unwrap_or(Err(FirstResponseFailure::Timeout))
+}
+
+fn classify_upstream_status(status: u16) -> Option<ErrorCode> {
+    match status {
+        401 | 403 => Some(ErrorCode::ProviderAuthFailed),
+        429 => Some(ErrorCode::ProviderRateLimited),
+        500..=599 => Some(ErrorCode::UpstreamServerError),
+        _ => None,
+    }
+}
+
+fn health_response(api_key: &str, correlation_id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let backend_ready = backend_health_check(api_key);
+    let mut response = Response::from_string(
+        serde_json::json!({
+            "hydra": true,
+            "backend": backend_ready,
+            "version": env!("CARGO_PKG_VERSION"),
+            "correlation_id": correlation_id
+        })
+        .to_string(),
+    )
+    .with_status_code(if backend_ready {
+        StatusCode(200)
+    } else {
+        StatusCode(503)
+    });
+    if let Ok(header) = Header::from_bytes("content-type", "application/json") {
+        response.add_header(header);
+    }
+    if let Ok(header) = Header::from_bytes("x-basiliskos-correlation-id", correlation_id) {
         response.add_header(header);
     }
     response
@@ -799,8 +1316,10 @@ fn proxy_error(message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 
 fn handle_front_proxy_request(
     mut request: tiny_http::Request,
-    client: &reqwest::blocking::Client,
-    api_key: &str,
+    client: &reqwest::Client,
+    async_runtime: &tokio::runtime::Handle,
+    _api_key: &str,
+    correlation_id: &str,
 ) {
     let request_url = request.url().to_string();
     let request_path = request_url
@@ -810,123 +1329,320 @@ fn handle_front_proxy_request(
     let method = match reqwest::Method::from_bytes(request.method().as_str().as_bytes()) {
         Ok(method) => method,
         Err(error) => {
-            let _ = request.respond(proxy_error(&format!("Unsupported request method: {error}")));
+            let _ = error;
+            respond_proxy_error(
+                request,
+                ErrorCode::RequestInvalid,
+                400,
+                "The request method is not supported.",
+                correlation_id,
+            );
             return;
         }
     };
+    if request
+        .body_length()
+        .is_some_and(|length| length > MAX_RELAY_BODY_BYTES)
+    {
+        respond_proxy_error(
+            request,
+            ErrorCode::RequestBodyTooLarge,
+            413,
+            "The request body exceeds the 8 MiB Basiliskos limit.",
+            correlation_id,
+        );
+        return;
+    }
     let mut body = Vec::new();
-    if let Err(error) = request.as_reader().read_to_end(&mut body) {
-        let _ = request.respond(proxy_error(&format!(
-            "Could not read request body: {error}"
-        )));
+    let read_result = request
+        .as_reader()
+        .take((MAX_RELAY_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut body);
+    if read_result.is_err() {
+        respond_proxy_error(
+            request,
+            ErrorCode::RequestInvalid,
+            400,
+            "The request body could not be read.",
+            correlation_id,
+        );
+        return;
+    }
+    if body.len() > MAX_RELAY_BODY_BYTES {
+        respond_proxy_error(
+            request,
+            ErrorCode::RequestBodyTooLarge,
+            413,
+            "The request body exceeds the 8 MiB Basiliskos limit.",
+            correlation_id,
+        );
         return;
     }
 
-    if request_path == "/hydra/health" {
-        let backend_ready = backend_health_check(api_key);
-        let mut response = Response::from_string(
-            serde_json::json!({
-                "hydra": true,
-                "backend": backend_ready,
-                "version": env!("CARGO_PKG_VERSION")
-            })
-            .to_string(),
-        )
-        .with_status_code(if backend_ready {
-            StatusCode(200)
-        } else {
-            StatusCode(503)
-        });
-        if let Ok(header) = Header::from_bytes("content-type", "application/json") {
-            response.add_header(header);
-        }
-        let _ = request.respond(response);
-        return;
-    }
-
+    let mut provider_for_event = None;
     if request_path == "/v1/messages" || request_path == "/v1/messages/count_tokens" {
         let rewrite_result = (|| -> Result<(), String> {
-            let state = load_state()?;
+            let _mutation = mutation_lock()?;
+            let mut state = load_state()?;
             let provider = active_provider_from_auth(&auth_dir()?, &state)
                 .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
+            provider_for_event = Some(provider.clone());
+            let validated = validated_route_for_request(&state, &provider, correlation_id);
+            state.routes.insert(provider.clone(), validated);
             let mut json: Value = serde_json::from_slice(&body)
-                .map_err(|error| format!("Claude request body is invalid JSON: {error}"))?;
+                .map_err(|_| "Claude request body is invalid JSON".to_string())?;
             rewrite_claude_request(&mut json, &state, &provider, request_path == "/v1/messages")?;
             body = serde_json::to_vec(&json).map_err(|error| error.to_string())?;
             Ok(())
         })();
-        if let Err(error) = rewrite_result {
-            let _ = request.respond(proxy_error(&error));
+        if rewrite_result.is_err() {
+            respond_proxy_error(
+                request,
+                ErrorCode::RequestInvalid,
+                400,
+                "The protected Claude request is invalid or no active account is selected.",
+                correlation_id,
+            );
             return;
         }
     }
 
     let upstream_url = format!("http://127.0.0.1:{BACKEND_PORT}{request_url}");
-    let mut builder = client.request(method, upstream_url);
+    let mut upstream_headers = Vec::new();
     for header in request.headers() {
         let name = header.field.as_str().as_str();
         if !is_hop_by_hop_header(name) {
-            builder = builder.header(name, header.value.as_str());
+            upstream_headers.push((name.to_owned(), header.value.as_str().to_owned()));
         }
     }
-    let upstream = match builder.body(body).send() {
+    let upstream = match begin_upstream_request(
+        async_runtime,
+        client.clone(),
+        method,
+        upstream_url,
+        upstream_headers,
+        body,
+    ) {
         Ok(response) => response,
         Err(error) => {
-            let _ = request.respond(proxy_error(&format!(
-                "Gateway backend unavailable: {error}"
-            )));
+            let code = if matches!(error, FirstResponseFailure::Timeout) {
+                ErrorCode::FirstByteTimeout
+            } else {
+                ErrorCode::BackendConnectFailed
+            };
+            diagnostics::record(
+                code,
+                "error",
+                if matches!(error, FirstResponseFailure::Timeout) {
+                    "The upstream did not produce response headers within the time budget."
+                } else {
+                    "The Basiliskos backend is unavailable."
+                },
+                Some(correlation_id),
+                Some(504),
+                provider_for_event.as_deref(),
+            );
+            let _ = request.respond(proxy_error(
+                code,
+                if matches!(error, FirstResponseFailure::Timeout) { 504 } else { 502 },
+                if matches!(error, FirstResponseFailure::Timeout) {
+                    "The upstream timed out before its first response. Retry this request."
+                } else {
+                    "The local backend is unavailable. Basiliskos will retry it for future requests."
+                },
+                correlation_id,
+            ));
             return;
         }
     };
-    let status = StatusCode(upstream.status().as_u16());
-    let headers = upstream
-        .headers()
-        .iter()
+    let upstream_status = upstream.status;
+    let classified = classify_upstream_status(upstream_status);
+    if let Some(code) = classified {
+        diagnostics::record(
+            code,
+            if upstream_status >= 500 {
+                "error"
+            } else {
+                "warning"
+            },
+            match code {
+                ErrorCode::ProviderAuthFailed => "The provider rejected the selected credential.",
+                ErrorCode::ProviderRateLimited => {
+                    "The provider rate-limited the selected credential."
+                }
+                _ => "The provider returned a server error.",
+            },
+            Some(correlation_id),
+            Some(upstream_status),
+            provider_for_event.as_deref(),
+        );
+    }
+    let status = StatusCode(upstream_status);
+    let mut headers: Vec<Header> = upstream
+        .headers
+        .into_iter()
         .filter_map(|(name, value)| {
-            if is_hop_by_hop_header(name.as_str()) {
+            if is_hop_by_hop_header(&name) {
                 return None;
             }
-            Header::from_bytes(name.as_str(), value.as_bytes()).ok()
+            Header::from_bytes(name.as_bytes(), value).ok()
         })
         .collect();
-    let response = Response::new(status, headers, upstream, None, None);
-    let _ = request.respond(response);
+    if let Ok(header) = Header::from_bytes("x-basiliskos-correlation-id", correlation_id) {
+        headers.push(header);
+    }
+    if let Some(code) = classified {
+        if let Ok(header) = Header::from_bytes("x-basiliskos-error-code", code.as_str()) {
+            headers.push(header);
+        }
+    }
+    let response = Response::new(
+        status,
+        headers,
+        TrackedUpstream {
+            receiver: upstream.body,
+            current: None,
+            offset: 0,
+            correlation_id: correlation_id.to_owned(),
+            provider: provider_for_event,
+        },
+        None,
+        None,
+    );
+    if request.respond(response).is_err() {
+        diagnostics::record(
+            ErrorCode::ClientCancelled,
+            "info",
+            "The client disconnected before the response completed.",
+            Some(correlation_id),
+            None,
+            None,
+        );
+    }
 }
 
-fn start_front_proxy(api_key: String) -> Result<(), String> {
+fn start_front_proxy(app: AppHandle, api_key: String) -> Result<FrontProxy, String> {
     let server = Server::http(("127.0.0.1", GATEWAY_PORT))
         .map_err(|error| format!("Could not start Basiliskos compatibility proxy: {error}"))?;
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(RELAY_WORKERS)
         .build()
         .map_err(|error| format!("Could not create Basiliskos proxy client: {error}"))?;
+    let async_runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_io()
+            .enable_time()
+            .thread_name("basiliskos-relay-io")
+            .build()
+            .map_err(|error| format!("Could not create Basiliskos I/O runtime: {error}"))?,
+    );
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
-    let proxy_thread = thread::spawn(move || loop {
+    let (request_tx, request_rx) =
+        mpsc::sync_channel::<(tiny_http::Request, String)>(RELAY_QUEUE_CAPACITY);
+    let shared_rx = Arc::new(Mutex::new(request_rx));
+    let tracker = Arc::new(WorkerTracker::default());
+    let mut workers = Vec::with_capacity(RELAY_WORKERS);
+    for _ in 0..RELAY_WORKERS {
+        let worker_rx = Arc::clone(&shared_rx);
+        let worker_tracker = Arc::clone(&tracker);
+        let worker_client = client.clone();
+        let worker_runtime = Arc::clone(&async_runtime);
+        let worker_api_key = api_key.clone();
+        workers.push(thread::spawn(move || loop {
+            let next = worker_rx
+                .lock()
+                .ok()
+                .and_then(|receiver| receiver.recv().ok());
+            let Some((request, correlation_id)) = next else {
+                break;
+            };
+            if let Ok(mut active) = worker_tracker.active.lock() {
+                *active += 1;
+            }
+            handle_front_proxy_request(
+                request,
+                &worker_client,
+                worker_runtime.handle(),
+                &worker_api_key,
+                &correlation_id,
+            );
+            if let Ok(mut active) = worker_tracker.active.lock() {
+                *active = active.saturating_sub(1);
+                worker_tracker.changed.notify_all();
+            }
+        }));
+    }
+    let listener_api_key = api_key;
+    let listener = thread::spawn(move || loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
         }
         match server.recv_timeout(Duration::from_millis(150)) {
             Ok(Some(request)) => {
-                // Claude can issue token-count and message requests concurrently, and a
-                // streamed response can stay open for many minutes. Never let one stream
-                // block health checks or every other request behind it.
-                let request_client = client.clone();
-                let request_api_key = api_key.clone();
-                thread::spawn(move || {
-                    handle_front_proxy_request(request, &request_client, &request_api_key)
-                });
+                let correlation_id = Uuid::new_v4().simple().to_string();
+                if !request_headers_within_budget(&request) {
+                    respond_proxy_error(
+                        request,
+                        ErrorCode::RequestHeadersTooLarge,
+                        431,
+                        "The request headers exceed the Basiliskos limit.",
+                        &correlation_id,
+                    );
+                    continue;
+                }
+                // Authentication happens on the listener before the body is read,
+                // parsed, rewritten, or queued to a worker.
+                if !request_is_authorized(&request, &listener_api_key) {
+                    respond_proxy_error(
+                        request,
+                        ErrorCode::RequestUnauthorized,
+                        401,
+                        "A valid local Basiliskos API key is required.",
+                        &correlation_id,
+                    );
+                    continue;
+                }
+                if request.url().split('?').next() == Some("/hydra/health") {
+                    let _ = request.respond(health_response(&listener_api_key, &correlation_id));
+                    continue;
+                }
+                match request_tx.try_send((request, correlation_id)) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full((request, correlation_id))) => {
+                        respond_proxy_error(
+                            request,
+                            ErrorCode::RelayBusy,
+                            503,
+                            "The Basiliskos relay is at capacity. Retry with backoff.",
+                            &correlation_id,
+                        );
+                    }
+                    Err(mpsc::TrySendError::Disconnected((request, correlation_id))) => {
+                        respond_proxy_error(
+                            request,
+                            ErrorCode::RelayShuttingDown,
+                            503,
+                            "The Basiliskos relay is shutting down.",
+                            &correlation_id,
+                        );
+                        break;
+                    }
+                }
             }
-            Ok(None) => {}
+            Ok(None) => supervise_backend(&app),
             Err(_) => break,
         }
     });
-    *front_proxy()
-        .lock()
-        .map_err(|_| "Basiliskos proxy state is locked")? = Some(FrontProxy {
+    Ok(FrontProxy {
         shutdown: shutdown_tx,
-        thread: proxy_thread,
-    });
-    Ok(())
+        listener,
+        workers,
+        tracker,
+        async_runtime,
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -940,7 +1656,7 @@ fn hidden(command: &mut Command) {
 fn hidden(_command: &mut Command) {}
 
 #[cfg(target_os = "windows")]
-fn assign_gateway_to_kill_on_close_job(child: &Child) -> Result<(), String> {
+fn assign_gateway_to_kill_on_close_job(child: &Child) -> Result<Option<usize>, String> {
     use std::{mem::size_of, os::windows::io::AsRawHandle, ptr};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE},
@@ -983,72 +1699,355 @@ fn assign_gateway_to_kill_on_close_job(child: &Child) -> Result<(), String> {
             "Could not secure the Basiliskos backend process: {error}"
         ));
     }
-    let mut guard = gateway_job()
-        .lock()
-        .map_err(|_| "Basiliskos backend job state is locked")?;
-    if let Some(previous) = guard.replace(job as usize) {
-        unsafe { CloseHandle(previous as HANDLE) };
-    }
-    Ok(())
+    Ok(Some(job as usize))
 }
 
 #[cfg(not(target_os = "windows"))]
-fn assign_gateway_to_kill_on_close_job(_child: &Child) -> Result<(), String> {
-    Ok(())
+fn assign_gateway_to_kill_on_close_job(_child: &Child) -> Result<Option<usize>, String> {
+    Ok(None)
 }
 
 #[cfg(target_os = "windows")]
-fn close_gateway_job() {
+fn close_gateway_job(job: Option<usize>) {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    if let Ok(mut guard) = gateway_job().lock() {
-        if let Some(job) = guard.take() {
-            // KILL_ON_JOB_CLOSE is the crash/forced-exit backstop. During a normal
-            // shutdown the child has already been asked to exit before this handle closes.
-            unsafe { CloseHandle(job as HANDLE) };
-        }
+    if let Some(job) = job {
+        // KILL_ON_JOB_CLOSE is the crash/forced-exit backstop. During a normal
+        // shutdown the child has already been asked to exit before this handle closes.
+        unsafe { CloseHandle(job as HANDLE) };
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn close_gateway_job() {}
+fn close_gateway_job(_job: Option<usize>) {}
 
-pub fn stop_gateway_internal() {
-    stop_hydra_claude_internal();
-    if let Ok(mut guard) = front_proxy().lock() {
-        if let Some(proxy) = guard.take() {
-            let _ = proxy.shutdown.send(());
-            let _ = proxy.thread.join();
-        }
+#[cfg(target_os = "windows")]
+fn job_has_active_processes(job: usize) -> bool {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        },
+    };
+    let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    unsafe {
+        QueryInformationJobObject(
+            job as HANDLE,
+            JobObjectBasicAccountingInformation,
+            (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        ) != 0
+            && info.ActiveProcesses > 0
     }
-    if let Ok(mut guard) = gateway_child().lock() {
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-    close_gateway_job();
 }
 
-fn stop_hydra_claude_internal() {
-    if let Ok(mut guard) = claude_child().lock() {
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+#[cfg(target_os = "windows")]
+fn terminate_owned_job(job: usize) {
+    use windows_sys::Win32::{Foundation::HANDLE, System::JobObjects::TerminateJobObject};
+    unsafe {
+        let _ = TerminateJobObject(job as HANDLE, 1);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn request_graceful_window_close(pid: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+    for window in enum_claude_hwnds_for_pid(pid) {
+        unsafe {
+            let _ = PostMessageW(
+                window.hwnd as windows_sys::Win32::Foundation::HWND,
+                WM_CLOSE,
+                0,
+                0,
+            );
         }
+    }
+}
+
+fn spawn_backend_process(
+    app: &AppHandle,
+    append_logs: bool,
+) -> Result<(Child, Option<usize>), String> {
+    let executable = prepare_runtime(app)?;
+    let log_dir = gateway_dir()?.join("controller-logs");
+    secure_create_dir_all(&log_dir)?;
+    let stdout_path = log_dir.join("gateway.stdout.log");
+    let stderr_path = log_dir.join("gateway.stderr.log");
+    let open_log = |path: &Path| {
+        let mut options = fs::OpenOptions::new();
+        options.create(true).write(true);
+        if append_logs {
+            options.append(true);
+        } else {
+            options.truncate(true);
+        }
+        options
+            .open(path)
+            .map_err(|error| format!("Could not open a Basiliskos backend log: {error}"))
+    };
+    let stdout = open_log(&stdout_path)?;
+    let stderr = open_log(&stderr_path)?;
+    let mut command = Command::new(executable);
+    command
+        .args(["-config", &config_path()?.to_string_lossy(), "-local-model"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    hidden(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start the Basiliskos backend: {error}"))?;
+    let job = assign_gateway_to_kill_on_close_job(&child).inspect_err(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+    })?;
+    Ok((child, job))
+}
+
+fn supervise_backend(app: &AppHandle) {
+    let Ok(_mutation) = controller().mutations.try_lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let mut exited_job = None;
+    let mut should_restart = false;
+    {
+        let Ok(mut runtime) = runtime_lock() else {
+            return;
+        };
+        if !matches!(
+            runtime.phase,
+            GatewayPhase::Running | GatewayPhase::Degraded
+        ) {
+            return;
+        }
+        if let Some(child) = runtime.gateway_child.as_mut() {
+            match child.try_wait() {
+                Ok(None) => {
+                    if runtime.phase == GatewayPhase::Degraded {
+                        if let Ok(state) = load_state() {
+                            if backend_health_check(&state.api_key) {
+                                runtime.phase = GatewayPhase::Running;
+                                runtime.backend_exit_reason = None;
+                                runtime.backend_restart_attempts = 0;
+                                runtime.backend_next_restart = None;
+                            }
+                        }
+                    }
+                    return;
+                }
+                Ok(Some(status)) => {
+                    runtime.gateway_child = None;
+                    #[cfg(target_os = "windows")]
+                    {
+                        exited_job = runtime.gateway_job.take();
+                    }
+                    runtime.phase = GatewayPhase::Degraded;
+                    runtime.backend_restart_attempts =
+                        runtime.backend_restart_attempts.saturating_add(1);
+                    let delay = 2_u64
+                        .saturating_pow(runtime.backend_restart_attempts.min(4))
+                        .min(30);
+                    runtime.backend_next_restart = Some(now + Duration::from_secs(delay));
+                    runtime.backend_exit_reason = Some(format!(
+                        "Backend exited with {status}; retry scheduled in {delay}s"
+                    ));
+                    diagnostics::record(
+                        ErrorCode::BackendExited,
+                        "error",
+                        "The managed backend exited; a bounded restart is scheduled for future requests.",
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                Err(_) => {
+                    runtime.gateway_child = None;
+                    runtime.phase = GatewayPhase::Degraded;
+                    runtime.backend_restart_attempts =
+                        runtime.backend_restart_attempts.saturating_add(1);
+                    runtime.backend_next_restart = Some(now + Duration::from_secs(2));
+                    runtime.backend_exit_reason =
+                        Some("Backend process state could not be read; retry scheduled".into());
+                }
+            }
+        }
+        if runtime.gateway_child.is_none()
+            && runtime
+                .backend_next_restart
+                .is_none_or(|restart_at| restart_at <= now)
+        {
+            should_restart = true;
+        }
+    }
+    close_gateway_job(exited_job);
+    if !should_restart {
+        return;
+    }
+    let _ = prepare_config();
+    match spawn_backend_process(app, true) {
+        Ok((child, job)) => {
+            if let Ok(mut runtime) = runtime_lock() {
+                if runtime.phase == GatewayPhase::Degraded && runtime.gateway_child.is_none() {
+                    runtime.gateway_child = Some(child);
+                    #[cfg(target_os = "windows")]
+                    {
+                        runtime.gateway_job = job;
+                    }
+                    runtime.backend_next_restart = None;
+                    runtime.backend_exit_reason = Some("Backend restart is warming up".into());
+                } else {
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    close_gateway_job(job);
+                }
+            }
+        }
+        Err(_) => {
+            diagnostics::record(
+                ErrorCode::BackendRestartFailed,
+                "error",
+                "A managed backend restart failed; the next attempt will use bounded backoff.",
+                None,
+                None,
+                None,
+            );
+            if let Ok(mut runtime) = runtime_lock() {
+                runtime.backend_restart_attempts =
+                    runtime.backend_restart_attempts.saturating_add(1);
+                let delay = 2_u64
+                    .saturating_pow(runtime.backend_restart_attempts.min(4))
+                    .min(30);
+                runtime.backend_next_restart = Some(Instant::now() + Duration::from_secs(delay));
+                runtime.backend_exit_reason = Some(format!(
+                    "Backend restart failed; retry scheduled in {delay}s"
+                ));
+            }
+        }
+    }
+}
+
+fn stop_hydra_claude_runtime() {
+    let (child, job, pid, executable, profile) = match runtime_lock() {
+        Ok(mut runtime) => {
+            let child = runtime.claude_child.take();
+            #[cfg(target_os = "windows")]
+            let job = runtime.claude_job.take();
+            #[cfg(not(target_os = "windows"))]
+            let job = None;
+            (
+                child,
+                job,
+                runtime.claude_root_pid.take(),
+                runtime.claude_executable.take(),
+                runtime.claude_profile.take(),
+            )
+        }
+        Err(_) => return,
+    };
+    #[cfg(target_os = "windows")]
+    {
+        if let (Some(pid), Some(executable), Some(profile)) = (pid, executable, profile) {
+            // Only the PID created from the verified Store executable with the isolated
+            // profile is asked to close. The job object below is the ownership boundary
+            // for any descendants; the user's normal Claude process is never enumerated
+            // by name or terminated.
+            if executable.is_file() && profile == isolated_claude_profile_dir().unwrap_or_default()
+            {
+                request_graceful_window_close(pid);
+            }
+        }
+        if let Some(job) = job {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while job_has_active_processes(job) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(100));
+            }
+            if job_has_active_processes(job) {
+                terminate_owned_job(job);
+            }
+            close_gateway_job(Some(job));
+        }
+    }
+    if let Some(mut child) = child {
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
+fn stop_gateway_runtime() {
+    stop_hydra_claude_runtime();
+    let (proxy, child, job) = match runtime_lock() {
+        Ok(mut runtime) => {
+            runtime.phase = GatewayPhase::Stopping;
+            let proxy = runtime.front_proxy.take();
+            let child = runtime.gateway_child.take();
+            #[cfg(target_os = "windows")]
+            let job = runtime.gateway_job.take();
+            #[cfg(not(target_os = "windows"))]
+            let job = None;
+            (proxy, child, job)
+        }
+        Err(_) => return,
+    };
+    if let Some(proxy) = proxy {
+        proxy.shutdown();
+    }
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    close_gateway_job(job);
+    if let Ok(mut runtime) = runtime_lock() {
+        runtime.phase = GatewayPhase::Stopped;
+        runtime.backend_exit_reason = None;
+        runtime.backend_restart_attempts = 0;
+        runtime.backend_next_restart = None;
+    }
+}
+
+pub fn stop_gateway_internal() {
+    if let Ok(_mutation) = mutation_lock() {
+        cancel_login_runtime();
+        stop_gateway_runtime();
     }
 }
 
 fn hydra_claude_running() -> bool {
-    let Ok(mut guard) = claude_child().lock() else {
+    let Ok(mut runtime) = runtime_lock() else {
         return false;
     };
-    let Some(child) = guard.as_mut() else {
+    #[cfg(target_os = "windows")]
+    if let Some(job) = runtime.claude_job {
+        if job_has_active_processes(job) {
+            return true;
+        }
+        close_gateway_job(runtime.claude_job.take());
+        runtime.claude_child.take().map(|mut child| child.wait());
+        runtime.claude_root_pid = None;
+        runtime.claude_executable = None;
+        runtime.claude_profile = None;
+        diagnostics::record(
+            ErrorCode::ClaudeExited,
+            "info",
+            "The isolated Basiliskos Claude process tree exited.",
+            None,
+            None,
+            None,
+        );
+        return false;
+    }
+    let Some(child) = runtime.claude_child.as_mut() else {
         return false;
     };
     match child.try_wait() {
         Ok(None) => true,
         Ok(Some(_)) | Err(_) => {
-            *guard = None;
+            runtime.claude_child = None;
             false
         }
     }
@@ -1064,21 +2063,29 @@ fn gateway_running() -> bool {
 
 #[tauri::command]
 pub fn start_gateway(app: AppHandle) -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
+    start_gateway_locked(app)
+}
+
+fn start_gateway_locked(app: AppHandle) -> Result<GatewaySnapshot, String> {
     let state = prepare_config()?;
     if health_check(&state.api_key) {
-        let owns_front_proxy = front_proxy()
-            .lock()
-            .map_err(|_| "Basiliskos proxy state is locked")?
-            .is_some();
+        let runtime = runtime_lock()?;
+        let owns_front_proxy = runtime.front_proxy.is_some()
+            && matches!(
+                runtime.phase,
+                GatewayPhase::Starting | GatewayPhase::Running
+            );
+        drop(runtime);
         if owns_front_proxy {
-            return gateway_snapshot();
+            return gateway_snapshot_locked();
         }
         return Err(
             "Another Basiliskos instance already owns the local relay. Use that window or close it before reopening Basiliskos."
                 .into(),
         );
     }
-    stop_gateway_internal();
+    stop_gateway_runtime();
     let executable = prepare_runtime(&app)?;
     terminate_stale_managed_backends(&executable)?;
     if !port_is_available(GATEWAY_PORT) {
@@ -1093,50 +2100,55 @@ pub fn start_gateway(app: AppHandle) -> Result<GatewaySnapshot, String> {
                 .into(),
         );
     }
-    let log_dir = gateway_dir()?.join("controller-logs");
-    fs::create_dir_all(&log_dir)
-        .map_err(|error| format!("Could not create {}: {error}", log_dir.display()))?;
-    let stdout = fs::File::create(log_dir.join("gateway.stdout.log"))
-        .map_err(|error| format!("Could not create gateway log: {error}"))?;
-    let stderr = fs::File::create(log_dir.join("gateway.stderr.log"))
-        .map_err(|error| format!("Could not create gateway log: {error}"))?;
-    let mut command = Command::new(executable);
-    command
-        .args(["-config", &config_path()?.to_string_lossy(), "-local-model"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    hidden(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Could not start Basiliskos: {error}"))?;
-    if let Err(error) = assign_gateway_to_kill_on_close_job(&child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    *gateway_child()
-        .lock()
-        .map_err(|_| "Gateway state is locked")? = Some(child);
-    if let Err(error) = start_front_proxy(state.api_key.clone()) {
-        stop_gateway_internal();
-        return Err(error);
+    let (mut child, job) = spawn_backend_process(&app, false).inspect_err(|_| {
+        diagnostics::record(
+            ErrorCode::BackendRestartFailed,
+            "error",
+            "The managed backend could not be started.",
+            None,
+            None,
+            None,
+        );
+    })?;
+    let proxy = match start_front_proxy(app.clone(), state.api_key.clone()) {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            close_gateway_job(job);
+            return Err(error);
+        }
+    };
+    {
+        let mut runtime = runtime_lock()?;
+        runtime.phase = GatewayPhase::Starting;
+        runtime.backend_exit_reason = None;
+        runtime.backend_restart_attempts = 0;
+        runtime.backend_next_restart = None;
+        runtime.gateway_child = Some(child);
+        runtime.front_proxy = Some(proxy);
+        #[cfg(target_os = "windows")]
+        {
+            runtime.gateway_job = job;
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if health_check(&state.api_key) {
-            return gateway_snapshot();
+            runtime_lock()?.phase = GatewayPhase::Running;
+            return gateway_snapshot_locked();
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    stop_gateway_internal();
+    stop_gateway_runtime();
     Err("Basiliskos did not become ready. Check ~/.hydra-gateway/gateway/controller-logs.".into())
 }
 
 #[tauri::command]
 pub fn stop_gateway() -> Result<GatewaySnapshot, String> {
-    stop_gateway_internal();
-    gateway_snapshot()
+    let _mutation = mutation_lock()?;
+    stop_gateway_runtime();
+    gateway_snapshot_locked()
 }
 
 fn nested_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -1174,8 +2186,7 @@ fn account_provider(value: &Value, file_name: &str) -> Option<String> {
 fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, String> {
     let directory = auth_dir()?;
     let labels = load_account_labels()?;
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+    secure_create_dir_all(&directory)?;
     let mut accounts = Vec::new();
     for entry in fs::read_dir(&directory)
         .map_err(|error| format!("Could not read {}: {error}", directory.display()))?
@@ -1237,20 +2248,150 @@ fn isolated_claude_profile_dir() -> Result<PathBuf, String> {
 
 #[tauri::command]
 pub fn gateway_snapshot() -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
+    gateway_snapshot_locked()
+}
+
+#[tauri::command]
+pub fn open_diagnostics_folder(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let folder = gateway_dir()?.join("controller-logs");
+    secure_create_dir_all(&folder)?;
+    let verified_root = fs::canonicalize(gateway_dir()?)
+        .map_err(|error| format!("Could not verify the Basiliskos data directory: {error}"))?;
+    let verified_folder = fs::canonicalize(&folder)
+        .map_err(|error| format!("Could not verify the diagnostics directory: {error}"))?;
+    verified_folder
+        .strip_prefix(verified_root)
+        .map_err(|_| "Refusing to open a diagnostics directory outside Basiliskos")?;
+    app.opener()
+        .open_path(verified_folder.to_string_lossy(), None::<&str>)
+        .map_err(|error| format!("Could not open the diagnostics directory: {error}"))
+}
+
+fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
     let mut state = load_state()?;
     restore_legacy_shared_config_if_needed(&mut state)?;
+    let accounts = list_accounts_inner(&state)?;
     let routes = SUPPORTED_PROVIDERS
         .iter()
         .map(|provider| provider_route(&state, provider))
-        .collect();
+        .collect::<Vec<_>>();
+    let running = gateway_running();
+    let claude_running = hydra_claude_running();
+    let (phase, relay_present, backend_exit_reason, active_requests, login) = {
+        let runtime = runtime_lock()?;
+        let active_requests = runtime
+            .front_proxy
+            .as_ref()
+            .and_then(|proxy| proxy.tracker.active.lock().ok().map(|active| *active))
+            .unwrap_or_default();
+        (
+            runtime.phase,
+            runtime.front_proxy.is_some(),
+            runtime.backend_exit_reason.clone(),
+            active_requests,
+            runtime
+                .login
+                .as_ref()
+                .map(|login| login.status.clone())
+                .or_else(|| runtime.last_login.clone()),
+        )
+    };
+    let phase_name = match phase {
+        GatewayPhase::Stopped => "stopped",
+        GatewayPhase::Starting => "starting",
+        GatewayPhase::Running => "running",
+        GatewayPhase::Degraded => "degraded",
+        GatewayPhase::Stopping => "stopping",
+    };
+    let active = accounts.iter().find(|account| account.active);
+    let active_label = active.map(|account| account.label.clone());
+    let active_provider = active.map(|account| account.provider.clone());
+    let route_detail = active_provider
+        .as_deref()
+        .and_then(|provider| routes.iter().find(|route| route.provider == provider))
+        .map(|route| route.selected_model_label.clone())
+        .unwrap_or_else(|| "No route until an account is selected".into());
     Ok(GatewaySnapshot {
-        running: gateway_running(),
+        running,
         base_url: format!("http://127.0.0.1:{GATEWAY_PORT}"),
         version: GATEWAY_VERSION.into(),
-        claude_running: hydra_claude_running(),
-        accounts: list_accounts_inner(&state)?,
+        claude_running,
+        accounts,
         active_account: state.active_account,
         routes,
+        controller: ComponentStatus {
+            state: phase_name.into(),
+            detail: format!("Controller is {phase_name}"),
+        },
+        relay: ComponentStatus {
+            state: if relay_present { "running" } else { "stopped" }.into(),
+            detail: if relay_present {
+                format!("Relay online with {active_requests} active request(s)")
+            } else {
+                "Relay is not listening".into()
+            },
+        },
+        backend: ComponentStatus {
+            state: if running {
+                "healthy"
+            } else if relay_present {
+                "degraded"
+            } else {
+                "stopped"
+            }
+            .into(),
+            detail: if running {
+                format!("CLIProxyAPI {GATEWAY_VERSION} responded to its authenticated health check")
+            } else {
+                backend_exit_reason
+                    .clone()
+                    .unwrap_or_else(|| "Backend is not ready".into())
+            },
+        },
+        credentials: ComponentStatus {
+            state: if active_label.is_some() {
+                "selected"
+            } else {
+                "missing"
+            }
+            .into(),
+            detail: active_label
+                .map(|label| format!("{label} selected"))
+                .unwrap_or_else(|| "No active credential".into()),
+        },
+        route: ComponentStatus {
+            state: if active_provider.is_some() {
+                "ready"
+            } else {
+                "waiting"
+            }
+            .into(),
+            detail: route_detail,
+        },
+        oauth: ComponentStatus {
+            state: login
+                .as_ref()
+                .map(|status| status.state.clone())
+                .unwrap_or_else(|| "idle".into()),
+            detail: login
+                .as_ref()
+                .map(|status| status.detail.clone())
+                .unwrap_or_else(|| "No provider login has run in this session".into()),
+        },
+        claude: ComponentStatus {
+            state: if claude_running { "running" } else { "stopped" }.into(),
+            detail: if claude_running {
+                "The isolated Basiliskos Claude process is running".into()
+            } else {
+                "The isolated Basiliskos Claude process is stopped".into()
+            },
+        },
+        backend_exit_reason,
+        active_requests,
+        diagnostics: diagnostics::snapshot(),
+        login,
     })
 }
 
@@ -1378,18 +2519,23 @@ async fn fetch_usage_json(
 
 #[tauri::command]
 pub async fn get_gateway_account_usage(file_name: String) -> Result<GatewayAccountUsage, String> {
-    let path = exact_auth_path(&file_name)?;
-    let state = load_state()?;
-    let account = list_accounts_inner(&state)?
-        .into_iter()
-        .find(|account| account.file_name == file_name)
-        .ok_or("Account not found")?;
-    let raw = fs::read_to_string(&path)
-        .map_err(|error| format!("Could not read account credentials: {error}"))?;
-    let value: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("Account credentials are invalid: {error}"))?;
-    let token = nested_string(&value, &["access_token"]).ok_or("Sign in again to refresh usage")?;
-    let account_id = nested_string(&value, &["account_id"]);
+    let (account, token, account_id) = {
+        let _mutation = mutation_lock()?;
+        let path = exact_auth_path(&file_name)?;
+        let state = load_state()?;
+        let account = list_accounts_inner(&state)?
+            .into_iter()
+            .find(|account| account.file_name == file_name)
+            .ok_or("Account not found")?;
+        let raw = fs::read_to_string(&path)
+            .map_err(|error| format!("Could not read account credentials: {error}"))?;
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("Account credentials are invalid: {error}"))?;
+        let token =
+            nested_string(&value, &["access_token"]).ok_or("Sign in again to refresh usage")?;
+        let account_id = nested_string(&value, &["account_id"]);
+        (account, token, account_id)
+    };
     let usage = fetch_usage_json(&account.provider, &token, account_id.as_deref()).await?;
     let windows = match account.provider.as_str() {
         "claude" => parse_claude_usage(&usage),
@@ -1409,6 +2555,7 @@ pub async fn get_gateway_account_usage(file_name: String) -> Result<GatewayAccou
 
 #[tauri::command]
 pub fn rename_gateway_account(file_name: String, name: String) -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
     let path = exact_auth_path(&file_name)?;
     if !path.is_file() {
         return Err("Account not found".into());
@@ -1424,7 +2571,7 @@ pub fn rename_gateway_account(file_name: String, name: String) -> Result<Gateway
     let mut labels = load_account_labels()?;
     labels.insert(file_name, label);
     save_account_labels(&labels)?;
-    gateway_snapshot()
+    gateway_snapshot_locked()
 }
 
 fn exact_auth_path(file_name: &str) -> Result<PathBuf, String> {
@@ -1438,7 +2585,7 @@ fn exact_auth_path(file_name: &str) -> Result<PathBuf, String> {
     Ok(auth_dir()?.join(file_name))
 }
 
-fn set_disabled(path: &Path, disabled: bool) -> Result<(), String> {
+fn account_bytes_with_disabled(path: &Path, disabled: bool) -> Result<Vec<u8>, String> {
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
     let mut value: Value = serde_json::from_str(&raw)
@@ -1447,27 +2594,181 @@ fn set_disabled(path: &Path, disabled: bool) -> Result<(), String> {
         .as_object_mut()
         .ok_or("Account file must contain a JSON object")?;
     object.insert("disabled".into(), Value::Bool(disabled));
-    let bytes = serde_json::to_vec_pretty(&value)
-        .map_err(|error| format!("Could not serialize account: {error}"))?;
-    atomic_write(path, &bytes)
+    serde_json::to_vec_pretty(&value)
+        .map_err(|error| format!("Could not serialize account: {error}"))
 }
 
-fn select_account_files(
-    directory: &Path,
-    accounts: &[GatewayAccount],
-    file_name: &str,
-) -> Result<(), String> {
-    for account in accounts {
-        set_disabled(
-            &directory.join(&account.file_name),
-            account.file_name != file_name,
-        )?;
+fn validate_account_invariant(directory: &Path, state_path: &Path) -> Result<(), String> {
+    let state: ControllerState = serde_json::from_slice(
+        &fs::read(state_path)
+            .map_err(|error| format!("Could not validate {}: {error}", state_path.display()))?,
+    )
+    .map_err(|error| format!("Controller state failed transaction validation: {error}"))?;
+    let mut enabled = Vec::new();
+    let mut supported = Vec::new();
+    for entry in fs::read_dir(directory)
+        .map_err(|error| format!("Could not validate {}: {error}", directory.display()))?
+    {
+        let entry = entry.map_err(|error| format!("Could not validate an account: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let value: Value = serde_json::from_slice(
+            &fs::read(&path)
+                .map_err(|error| format!("Could not validate {}: {error}", path.display()))?,
+        )
+        .map_err(|error| {
+            format!(
+                "Account {} failed transaction validation: {error}",
+                path.display()
+            )
+        })?;
+        if account_provider(&value, &file_name).is_none() {
+            continue;
+        }
+        let disabled = value
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        supported.push(file_name.clone());
+        if !disabled {
+            enabled.push(file_name);
+        }
+    }
+    match state.active_account.as_deref() {
+        Some(active) => {
+            if !supported.iter().any(|file| file == active) {
+                return Err("The selected account disappeared during the transaction".into());
+            }
+            if enabled.len() != 1 || enabled[0] != active {
+                return Err(format!(
+                    "Account transaction invariant failed: expected only {active} enabled, found {}",
+                    enabled.join(", ")
+                ));
+            }
+        }
+        None if !enabled.is_empty() => {
+            return Err(format!(
+                "Account transaction invariant failed: no account is selected but these are enabled: {}",
+                enabled.join(", ")
+            ));
+        }
+        None => {}
     }
     Ok(())
 }
 
+fn selection_transaction(
+    root: &Path,
+    directory: &Path,
+    state_path: &Path,
+    accounts: &[GatewayAccount],
+    state: &ControllerState,
+    file_name: &str,
+) -> Result<(Vec<FileMutation>, ControllerState), String> {
+    let mut mutations = Vec::with_capacity(accounts.len() + 1);
+    for account in accounts
+        .iter()
+        .filter(|account| account.file_name != file_name)
+        .chain(
+            accounts
+                .iter()
+                .filter(|account| account.file_name == file_name),
+        )
+    {
+        let path = directory.join(&account.file_name);
+        mutations.push(FileMutation {
+            path,
+            after: Some(account_bytes_with_disabled(
+                &directory.join(&account.file_name),
+                account.file_name != file_name,
+            )?),
+        });
+    }
+    let mut after_state = state.clone();
+    after_state.active_account = Some(file_name.to_string());
+    mutations.push(FileMutation {
+        path: state_path.to_path_buf(),
+        after: Some(
+            serde_json::to_vec_pretty(&after_state)
+                .map_err(|error| format!("Could not serialize controller state: {error}"))?,
+        ),
+    });
+    for mutation in &mutations {
+        mutation
+            .path
+            .strip_prefix(root)
+            .map_err(|_| format!("Refusing to transact outside {}", root.display()))?;
+    }
+    Ok((mutations, after_state))
+}
+
+#[derive(Clone, Copy)]
+struct AccountPaths<'a> {
+    root: &'a Path,
+    directory: &'a Path,
+    state: &'a Path,
+    labels: &'a Path,
+}
+
+fn removal_transaction(
+    paths: AccountPaths<'_>,
+    accounts: &[GatewayAccount],
+    state: &ControllerState,
+    labels: &BTreeMap<String, String>,
+    file_name: &str,
+) -> Result<(Vec<FileMutation>, ControllerState), String> {
+    let removing_active = state.active_account.as_deref() == Some(file_name);
+    let mut mutations = vec![FileMutation {
+        path: paths.directory.join(file_name),
+        after: None,
+    }];
+    if removing_active {
+        for account in accounts {
+            if account.file_name != file_name {
+                let account_path = paths.directory.join(&account.file_name);
+                mutations.push(FileMutation {
+                    after: Some(account_bytes_with_disabled(&account_path, true)?),
+                    path: account_path,
+                });
+            }
+        }
+    }
+    let mut next_labels = labels.clone();
+    if next_labels.remove(file_name).is_some() {
+        mutations.push(FileMutation {
+            path: paths.labels.to_path_buf(),
+            after: Some(
+                serde_json::to_vec_pretty(&next_labels)
+                    .map_err(|error| format!("Could not serialize profile names: {error}"))?,
+            ),
+        });
+    }
+    let mut after_state = state.clone();
+    if removing_active {
+        after_state.active_account = None;
+        mutations.push(FileMutation {
+            path: paths.state.to_path_buf(),
+            after: Some(
+                serde_json::to_vec_pretty(&after_state)
+                    .map_err(|error| format!("Could not serialize controller state: {error}"))?,
+            ),
+        });
+    }
+    for mutation in &mutations {
+        mutation
+            .path
+            .strip_prefix(paths.root)
+            .map_err(|_| format!("Refusing to transact outside {}", paths.root.display()))?;
+    }
+    Ok((mutations, after_state))
+}
+
 #[tauri::command]
 pub fn select_gateway_account(file_name: String) -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
     let selected = exact_auth_path(&file_name)?;
     if !selected.is_file() {
         return Err("Account not found".into());
@@ -1480,13 +2781,24 @@ pub fn select_gateway_account(file_name: String) -> Result<GatewaySnapshot, Stri
     {
         return Err("Unsupported account file".into());
     }
-    select_account_files(&auth_dir()?, &accounts, &file_name)?;
-    let mut state = state;
-    state.active_account = Some(file_name);
-    save_state(&state)?;
+    let root = root_dir()?;
+    let directory = auth_dir()?;
+    let state_path = controller_path()?;
+    let (mutations, state) = selection_transaction(
+        &root,
+        &directory,
+        &state_path,
+        &accounts,
+        &state,
+        &file_name,
+    )?;
+    run_transaction(&root, &mutations, || {
+        validate_account_invariant(&directory, &state_path)
+    })?;
+    runtime_lock()?.last_known_good_models.clear();
     prepare_config()?;
     write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
-    gateway_snapshot()
+    gateway_snapshot_locked()
 }
 
 #[tauri::command]
@@ -1495,6 +2807,7 @@ pub fn set_gateway_route(
     model: String,
     thinking: String,
 ) -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
         return Err("Provider must be claude, codex, or xai".into());
     }
@@ -1508,42 +2821,70 @@ pub fn set_gateway_route(
         ));
     }
     let mut state = load_state()?;
+    let account_is_active = list_accounts_inner(&state)?
+        .iter()
+        .any(|account| account.active && account.provider == provider);
+    if account_is_active {
+        if let Ok(models) = backend_model_ids(&state.api_key) {
+            if !models.is_empty() && !models.contains(&model) {
+                return Err(format!(
+                    "{} is not available for the selected {} credential. Choose a model advertised by the backend.",
+                    spec.label,
+                    provider_label(&provider)
+                ));
+            }
+            if models.contains(&model) {
+                runtime_lock()?
+                    .last_known_good_models
+                    .insert(provider.clone(), model.clone());
+            }
+        }
+    }
     state
         .routes
         .insert(provider.clone(), RouteSelection { model, thinking });
     save_state(&state)?;
     prepare_config()?;
-    if list_accounts_inner(&state)?
-        .iter()
-        .any(|account| account.active && account.provider == provider)
-    {
+    if account_is_active {
         write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
     }
-    gateway_snapshot()
+    gateway_snapshot_locked()
 }
 
 #[tauri::command]
 pub fn remove_gateway_account(file_name: String) -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
     let path = exact_auth_path(&file_name)?;
     let state = load_state()?;
-    if !list_accounts_inner(&state)?
+    let accounts = list_accounts_inner(&state)?;
+    if !accounts
         .iter()
         .any(|account| account.file_name == file_name)
     {
         return Err("Account not found".into());
     }
-    fs::remove_file(&path)
-        .map_err(|error| format!("Could not remove {}: {error}", path.display()))?;
-    let mut labels = load_account_labels()?;
-    if labels.remove(&file_name).is_some() {
-        save_account_labels(&labels)?;
-    }
-    let mut state = state;
-    if state.active_account.as_deref() == Some(file_name.as_str()) {
-        state.active_account = None;
-        save_state(&state)?;
-    }
-    gateway_snapshot()
+    let root = root_dir()?;
+    let directory = auth_dir()?;
+    let state_path = controller_path()?;
+    let labels_path = account_labels_path()?;
+    debug_assert_eq!(path, directory.join(&file_name));
+    let labels = load_account_labels()?;
+    let (mutations, _state) = removal_transaction(
+        AccountPaths {
+            root: &root,
+            directory: &directory,
+            state: &state_path,
+            labels: &labels_path,
+        },
+        &accounts,
+        &state,
+        &labels,
+        &file_name,
+    )?;
+    run_transaction(&root, &mutations, || {
+        validate_account_invariant(&directory, &state_path)
+    })?;
+    gateway_snapshot_locked()
 }
 
 enum LoginOutput {
@@ -1574,6 +2915,304 @@ fn extract_xai_user_code(line: &str) -> Option<String> {
     (!code.is_empty()).then(|| code.to_string())
 }
 
+fn login_staging_root() -> Result<PathBuf, String> {
+    Ok(root_dir()?.join("login-staging"))
+}
+
+fn remove_login_staging(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let root = login_staging_root()?;
+    let canonical_root = fs::canonicalize(&root)
+        .map_err(|error| format!("Could not verify the login staging root: {error}"))?;
+    let canonical_path = fs::canonicalize(path)
+        .map_err(|error| format!("Could not verify the login staging directory: {error}"))?;
+    let relative = canonical_path
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "Refusing to remove a login staging directory outside Basiliskos")?;
+    if relative.components().count() != 1 {
+        return Err("Refusing to remove an unexpected login staging path".into());
+    }
+    fs::remove_dir_all(&canonical_path)
+        .map_err(|error| format!("Could not clean the login staging directory: {error}"))
+}
+
+fn staged_login_config(state: &ControllerState, auth: &Path) -> String {
+    format!(
+        r#"host: "127.0.0.1"
+port: {BACKEND_PORT}
+remote-management:
+  allow-remote: false
+  secret-key: ""
+  disable-control-panel: true
+auth-dir: {auth_dir}
+api-keys:
+  - {api_key}
+debug: false
+logging-to-file: false
+request-log: false
+usage-statistics-enabled: false
+request-retry: 0
+plugins:
+  enabled: false
+"#,
+        auth_dir = yaml_quote(&auth.to_string_lossy()),
+        api_key = yaml_quote(&state.api_key),
+    )
+}
+
+fn credential_identity(value: &Value, file_name: &str) -> String {
+    nested_string(
+        value,
+        &[
+            "email",
+            "account_email",
+            "user_email",
+            "account_id",
+            "user_id",
+            "sub",
+        ],
+    )
+    .map(|identity| identity.trim().to_ascii_lowercase())
+    .filter(|identity| !identity.is_empty())
+    .unwrap_or_else(|| file_name.to_ascii_lowercase())
+}
+
+fn new_credential_destination_name(directory: &Path, staged_name: &str) -> Result<String, String> {
+    if staged_name.contains(['/', '\\'])
+        || !staged_name.ends_with(".json")
+        || staged_name.len() > 240
+    {
+        return Err("The provider login produced an unsafe credential filename".into());
+    }
+    if !directory.join(staged_name).exists() {
+        return Ok(staged_name.to_owned());
+    }
+
+    let stem = staged_name
+        .strip_suffix(".json")
+        .unwrap_or("credential")
+        .chars()
+        .take(180)
+        .collect::<String>();
+    for _ in 0..8 {
+        let candidate = format!("{stem}-{}.json", Uuid::new_v4().simple());
+        if !directory.join(&candidate).exists() {
+            return Ok(candidate);
+        }
+    }
+    Err("Could not allocate a collision-free credential filename".into())
+}
+
+fn merge_staged_login(provider: &str, staging_dir: &Path) -> Result<String, String> {
+    let staged_auth = staging_dir.join("auth");
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&staged_auth)
+        .map_err(|error| format!("Could not inspect completed login credentials: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Could not inspect login output: {error}"))?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read(&path)
+            .map_err(|error| format!("Could not validate a completed login: {error}"))?;
+        let value: Value = serde_json::from_slice(&raw)
+            .map_err(|_| "A completed login produced invalid credential JSON")?;
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or("A completed login produced an invalid credential filename")?;
+        if account_provider(&value, file_name).as_deref() == Some(provider) {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            candidates.push((modified, file_name.to_owned(), value));
+        }
+    }
+    candidates.sort_by_key(|candidate| candidate.0);
+    let (_, staged_name, mut staged_value) = candidates
+        .pop()
+        .ok_or("The provider login exited without a validated credential")?;
+    let identity = credential_identity(&staged_value, &staged_name);
+    let state = load_state()?;
+    let accounts = list_accounts_inner(&state)?;
+    let directory = auth_dir()?;
+    let mut destination_name = None;
+    let mut disabled = true;
+    for account in &accounts {
+        if account.provider != provider {
+            continue;
+        }
+        let current_path = directory.join(&account.file_name);
+        let current_value: Value = serde_json::from_slice(
+            &fs::read(&current_path)
+                .map_err(|error| format!("Could not compare an existing credential: {error}"))?,
+        )
+        .map_err(|_| "An existing credential is invalid")?;
+        if credential_identity(&current_value, &account.file_name) == identity {
+            destination_name = Some(account.file_name.clone());
+            disabled = account.disabled;
+            break;
+        }
+    }
+    let destination_name = match destination_name {
+        Some(existing) => existing,
+        None => new_credential_destination_name(&directory, &staged_name)?,
+    };
+    let object = staged_value
+        .as_object_mut()
+        .ok_or("The provider login credential must be a JSON object")?;
+    object.insert("disabled".into(), Value::Bool(disabled));
+    let after = serde_json::to_vec_pretty(&staged_value)
+        .map_err(|_| "The provider login credential could not be serialized")?;
+    let root = root_dir()?;
+    let state_path = controller_path()?;
+    run_transaction(
+        &root,
+        &[FileMutation {
+            path: directory.join(&destination_name),
+            after: Some(after),
+        }],
+        || validate_account_invariant(&directory, &state_path),
+    )
+    .inspect_err(|_| {
+        diagnostics::record(
+            ErrorCode::ConfigTransactionFailed,
+            "error",
+            "The completed credential could not be committed transactionally.",
+            None,
+            None,
+            Some(provider),
+        );
+    })?;
+    prepare_config()?;
+    Ok(destination_name)
+}
+
+fn finish_login_session(session_id: String) {
+    let Ok(_mutation) = mutation_lock() else {
+        return;
+    };
+    let session = {
+        let Ok(mut runtime) = runtime_lock() else {
+            return;
+        };
+        if runtime
+            .login
+            .as_ref()
+            .map(|login| login.status.session_id.as_str())
+            != Some(session_id.as_str())
+        {
+            return;
+        }
+        runtime.login.take()
+    };
+    let Some(session) = session else { return };
+    let exit = session
+        .child
+        .lock()
+        .map_err(|_| "Provider login process state is unavailable".to_string())
+        .and_then(|mut child| {
+            child
+                .wait()
+                .map_err(|_| "Provider login wait failed".to_string())
+        });
+    let result = match exit {
+        Ok(status) if status.success() => {
+            merge_staged_login(&session.status.provider, &session.staging_dir)
+        }
+        Ok(_) => Err("The provider login exited without completing authorization".into()),
+        Err(error) => Err(error),
+    };
+    #[cfg(target_os = "windows")]
+    close_gateway_job(session.job);
+    let _ = remove_login_staging(&session.staging_dir);
+    let status = match result {
+        Ok(file_name) => ProviderLoginStatus {
+            state: "completed".into(),
+            result_file_name: Some(file_name),
+            detail: "Provider login completed and the validated credential was committed".into(),
+            ..session.status
+        },
+        Err(_) => {
+            diagnostics::record(
+                ErrorCode::LoginFailed,
+                "error",
+                "The provider login did not produce a validated credential.",
+                None,
+                None,
+                Some(&session.status.provider),
+            );
+            ProviderLoginStatus {
+                state: "failed".into(),
+                result_file_name: None,
+                detail: "Provider login failed without changing live credentials".into(),
+                ..session.status
+            }
+        }
+    };
+    if let Ok(mut runtime) = runtime_lock() {
+        runtime.last_login = Some(status);
+    }
+}
+
+fn watch_login_session(session_id: String, child: Arc<Mutex<Child>>) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(250));
+        let active = runtime_lock()
+            .ok()
+            .and_then(|runtime| {
+                runtime
+                    .login
+                    .as_ref()
+                    .map(|login| login.status.session_id == session_id)
+            })
+            .unwrap_or(false);
+        if !active {
+            return;
+        }
+        let exited = match child.lock() {
+            Ok(mut child) => !matches!(child.try_wait(), Ok(None)),
+            Err(_) => true,
+        };
+        if exited {
+            finish_login_session(session_id);
+            return;
+        }
+    });
+}
+
+fn abort_login_start(
+    session_id: &str,
+    staging_dir: &Path,
+    child: Option<Child>,
+    job: Option<usize>,
+    provider: &str,
+) {
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    close_gateway_job(job);
+    let _ = remove_login_staging(staging_dir);
+    if let Ok(mut runtime) = runtime_lock() {
+        if runtime.login_claim.as_deref() == Some(session_id) {
+            runtime.login_claim = None;
+        }
+    }
+    diagnostics::record(
+        ErrorCode::LoginFailed,
+        "error",
+        "The provider login could not reach its authorization step.",
+        None,
+        None,
+        Some(provider),
+    );
+}
+
 fn launch_provider_login_blocking(
     app: AppHandle,
     provider: String,
@@ -1584,32 +3223,70 @@ fn launch_provider_login_blocking(
         "xai" => "-xai-login",
         _ => return Err("Provider must be claude, codex, or xai".into()),
     };
-    prepare_config()?;
-    let executable = prepare_runtime(&app)?;
+    let session_id = Uuid::new_v4().simple().to_string();
+    {
+        let mut runtime = runtime_lock()?;
+        if runtime.login.is_some() || runtime.login_claim.is_some() {
+            return Err("A provider login is already running. Finish or cancel it first.".into());
+        }
+        runtime.login_claim = Some(session_id.clone());
+        runtime.last_login = None;
+    }
+    let staging_dir = login_staging_root()?.join(&session_id);
+    let staged_auth = staging_dir.join("auth");
+    let staged_config = staging_dir.join("login-config.yaml");
+    let prepared = (|| -> Result<(PathBuf, ControllerState), String> {
+        let _mutation = mutation_lock()?;
+        let state = prepare_config()?;
+        secure_create_dir_all(&staged_auth)?;
+        durable_write(
+            &staged_config,
+            staged_login_config(&state, &staged_auth).as_bytes(),
+        )?;
+        Ok((prepare_runtime(&app)?, state))
+    })();
+    let (executable, _state) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            abort_login_start(&session_id, &staging_dir, None, None, &provider);
+            return Err(error);
+        }
+    };
     let mut command = Command::new(executable);
     command
         .args([
             flag,
             "-no-browser",
             "-config",
-            &config_path()?.to_string_lossy(),
+            &staged_config.to_string_lossy(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hidden(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Could not start {provider} login: {error}"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            abort_login_start(&session_id, &staging_dir, None, None, &provider);
+            return Err(format!("Could not start {provider} login: {error}"));
+        }
+    };
+    let job = match assign_gateway_to_kill_on_close_job(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            abort_login_start(&session_id, &staging_dir, Some(child), None, &provider);
+            return Err(error);
+        }
+    };
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("Could not read {provider} login output"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("Could not read {provider} login errors"))?;
+    let Some(stdout) = child.stdout.take() else {
+        abort_login_start(&session_id, &staging_dir, Some(child), job, &provider);
+        return Err(format!("Could not read {provider} login output"));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        abort_login_start(&session_id, &staging_dir, Some(child), job, &provider);
+        return Err(format!("Could not read {provider} login errors"));
+    };
     let (output_tx, output_rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -1632,8 +3309,7 @@ fn launch_provider_login_blocking(
         let output = match output_rx.recv_timeout(remaining) {
             Ok(output) => output,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                abort_login_start(&session_id, &staging_dir, Some(child), job, &provider);
                 return Err(format!(
                     "The {provider} login did not provide an authorization URL within 30 seconds"
                 ));
@@ -1651,8 +3327,49 @@ fn launch_provider_login_blocking(
                 let ready = authorization_url.is_some()
                     && (provider != "xai" || line.contains("Waiting for authorization"));
                 if ready {
+                    let authorization_url = authorization_url.expect("checked above");
+                    let child = Arc::new(Mutex::new(child));
+                    let status = ProviderLoginStatus {
+                        session_id: session_id.clone(),
+                        provider: provider.clone(),
+                        state: "waiting".into(),
+                        started_at: Utc::now().to_rfc3339(),
+                        result_file_name: None,
+                        detail: "Waiting for the official provider authorization to complete"
+                            .into(),
+                    };
+                    {
+                        let mut runtime = match runtime_lock() {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                let child = Arc::try_unwrap(child)
+                                    .ok()
+                                    .and_then(|mutex| mutex.into_inner().ok());
+                                abort_login_start(&session_id, &staging_dir, child, job, &provider);
+                                return Err(error);
+                            }
+                        };
+                        if runtime.login_claim.as_deref() != Some(session_id.as_str()) {
+                            drop(runtime);
+                            let child = Arc::try_unwrap(child)
+                                .ok()
+                                .and_then(|mutex| mutex.into_inner().ok());
+                            abort_login_start(&session_id, &staging_dir, child, job, &provider);
+                            return Err("The provider login was cancelled during startup".into());
+                        }
+                        runtime.login_claim = None;
+                        runtime.login = Some(LoginRuntime {
+                            status,
+                            child: Arc::clone(&child),
+                            staging_dir: staging_dir.clone(),
+                            #[cfg(target_os = "windows")]
+                            job,
+                        });
+                    }
+                    watch_login_session(session_id.clone(), child);
                     return Ok(ProviderLoginLaunch {
-                        authorization_url: authorization_url.expect("checked above"),
+                        session_id,
+                        authorization_url,
                         user_code,
                     });
                 }
@@ -1664,8 +3381,7 @@ fn launch_provider_login_blocking(
                     .flatten()
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "unknown status".into());
-                let _ = child.kill();
-                let _ = child.wait();
+                abort_login_start(&session_id, &staging_dir, Some(child), job, &provider);
                 return Err(format!(
                     "The {provider} login exited before providing a trusted authorization URL ({status})"
                 ));
@@ -1682,6 +3398,44 @@ pub async fn launch_provider_login(
     tauri::async_runtime::spawn_blocking(move || launch_provider_login_blocking(app, provider))
         .await
         .map_err(|error| format!("Could not run the provider login task: {error}"))?
+}
+
+fn cancel_login_runtime() {
+    let session = runtime_lock().ok().and_then(|mut runtime| {
+        runtime.login_claim = None;
+        runtime.login.take()
+    });
+    let Some(session) = session else { return };
+    if let Ok(mut child) = session.child.lock() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    #[cfg(target_os = "windows")]
+    close_gateway_job(session.job);
+    let _ = remove_login_staging(&session.staging_dir);
+    diagnostics::record(
+        ErrorCode::LoginCancelled,
+        "info",
+        "The provider login was cancelled and its staging directory was discarded.",
+        None,
+        None,
+        Some(&session.status.provider),
+    );
+    if let Ok(mut runtime) = runtime_lock() {
+        runtime.last_login = Some(ProviderLoginStatus {
+            state: "cancelled".into(),
+            result_file_name: None,
+            detail: "Provider login cancelled; live credentials were not changed".into(),
+            ..session.status
+        });
+    }
+}
+
+#[tauri::command]
+pub fn cancel_provider_login() -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
+    cancel_login_runtime();
+    gateway_snapshot_locked()
 }
 
 fn read_json_object(path: &Path) -> Result<Map<String, Value>, String> {
@@ -1724,12 +3478,12 @@ fn backup_changed_claude_configs(
     }
 
     let backup_root = profile.join("Basiliskos Backups");
-    let daily = backup_root.join(Utc::now().format("%Y-%m-%d").to_string());
-    if daily.exists() {
-        return Ok(());
-    }
-    fs::create_dir_all(&backup_root)
-        .map_err(|error| format!("Could not create {}: {error}", backup_root.display()))?;
+    let version = backup_root.join(format!(
+        "{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        Uuid::new_v4().simple()
+    ));
+    secure_create_dir_all(&backup_root)?;
     let staging = backup_root.join(format!(".tmp-{}", Uuid::new_v4().simple()));
     for path in changed {
         let relative = path
@@ -1737,8 +3491,7 @@ fn backup_changed_claude_configs(
             .map_err(|_| format!("Refusing to back up a config outside {}", profile.display()))?;
         let destination = staging.join(relative);
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+            secure_create_dir_all(parent)?;
         }
         fs::copy(path, &destination).map_err(|error| {
             format!(
@@ -1748,27 +3501,48 @@ fn backup_changed_claude_configs(
             )
         })?;
     }
-    match fs::rename(&staging, &daily) {
+    match fs::rename(&staging, &version) {
         Ok(()) => Ok(()),
-        Err(_) if daily.exists() => Ok(()),
         Err(error) => Err(format!(
             "Could not finalize Claude config backup {}: {error}",
-            daily.display()
+            version.display()
         )),
     }
 }
 
-fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if fs::read(path).ok().as_deref() == Some(bytes) {
-        return Ok(());
+fn validate_claude_config_set(
+    meta_path: &Path,
+    generated_path: &Path,
+    deployment_path: &Path,
+    config_id: &str,
+) -> Result<(), String> {
+    let meta: Value = serde_json::from_slice(
+        &fs::read(meta_path).map_err(|_| "Claude metadata was not committed")?,
+    )
+    .map_err(|_| "Claude metadata is invalid after commit")?;
+    let generated: Value = serde_json::from_slice(
+        &fs::read(generated_path).map_err(|_| "Claude gateway config was not committed")?,
+    )
+    .map_err(|_| "Claude gateway config is invalid after commit")?;
+    let deployment: Value = serde_json::from_slice(
+        &fs::read(deployment_path).map_err(|_| "Claude deployment config was not committed")?,
+    )
+    .map_err(|_| "Claude deployment config is invalid after commit")?;
+    if meta.get("appliedId").and_then(Value::as_str) != Some(config_id)
+        || generated
+            .get("inferenceGatewayBaseUrl")
+            .and_then(Value::as_str)
+            != Some("http://127.0.0.1:8317")
+        || deployment.get("deploymentMode").and_then(Value::as_str) != Some("3p")
+    {
+        return Err("The Claude config set failed its cross-file invariant".into());
     }
-    atomic_write(path, bytes)
+    Ok(())
 }
 
 fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Result<(), String> {
     let library = profile.join("configLibrary");
-    fs::create_dir_all(&library)
-        .map_err(|error| format!("Could not create {}: {error}", library.display()))?;
+    secure_create_dir_all(&library)?;
     let meta_path = library.join("_meta.json");
     let generated_path = library.join(format!("{}.json", state.claude_config_id));
     let deployment_path = profile.join("claude_desktop_config.json");
@@ -1853,10 +3627,35 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
         (deployment_path, json_bytes(&deployment)?),
     ];
     backup_changed_claude_configs(profile, &writes)?;
-    for (path, bytes) in writes {
-        write_if_changed(&path, &bytes)?;
+    let mutations = writes
+        .into_iter()
+        .filter(|(path, bytes)| fs::read(path).ok().as_deref() != Some(bytes.as_slice()))
+        .map(|(path, bytes)| FileMutation {
+            path,
+            after: Some(bytes),
+        })
+        .collect::<Vec<_>>();
+    if mutations.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    run_transaction(profile, &mutations, || {
+        validate_claude_config_set(
+            &library.join("_meta.json"),
+            &library.join(format!("{}.json", state.claude_config_id)),
+            &profile.join("claude_desktop_config.json"),
+            &state.claude_config_id,
+        )
+    })
+    .inspect_err(|_| {
+        diagnostics::record(
+            ErrorCode::ConfigTransactionFailed,
+            "error",
+            "The isolated Claude config set was rolled back.",
+            None,
+            None,
+            None,
+        );
+    })
 }
 
 fn restore_legacy_shared_config_if_needed(state: &mut ControllerState) -> Result<(), String> {
@@ -1891,7 +3690,7 @@ fn restore_legacy_shared_config_if_needed(state: &mut ControllerState) -> Result
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
-    atomic_write(
+    durable_write(
         &meta_path,
         &serde_json::to_vec_pretty(&meta).map_err(|error| error.to_string())?,
     )?;
@@ -1960,7 +3759,20 @@ fn claude_icon_path(app: &AppHandle, kind: ClaudeIconKind) -> Result<PathBuf, St
 const CLAUDE_BASILISKOS_AUMID: &str = "com.threereadylab.basiliskos.claude";
 
 #[cfg(target_os = "windows")]
-fn load_hicons(path: &Path) -> Result<(isize, isize), String> {
+struct OwnedIcon(isize);
+
+#[cfg(target_os = "windows")]
+impl Drop for OwnedIcon {
+    fn drop(&mut self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon;
+        unsafe {
+            let _ = DestroyIcon(self.0 as windows_sys::Win32::UI::WindowsAndMessaging::HICON);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn load_hicons(path: &Path) -> Result<(OwnedIcon, OwnedIcon), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::WindowsAndMessaging::{LoadImageW, IMAGE_ICON, LR_LOADFROMFILE};
 
@@ -1987,10 +3799,14 @@ fn load_hicons(path: &Path) -> Result<(isize, isize), String> {
             32,
             LR_LOADFROMFILE,
         );
-        if small.is_null() || big.is_null() {
+        if small.is_null() {
             return Err(format!("Could not load icon {}", path.display()));
         }
-        Ok((small as isize, big as isize))
+        let small = OwnedIcon(small as isize);
+        if big.is_null() {
+            return Err(format!("Could not load icon {}", path.display()));
+        }
+        Ok((small, OwnedIcon(big as isize)))
     }
 }
 
@@ -2072,6 +3888,27 @@ fn apply_icons_to_hwnd(hwnd: isize, small: isize, big: isize) {
 
 /// Best-effort AUMID + relaunch icon via raw shell32 COM.
 #[cfg(target_os = "windows")]
+struct ComApartment;
+
+#[cfg(target_os = "windows")]
+impl ComApartment {
+    fn initialize() -> Option<Self> {
+        use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        let result = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        (result >= 0).then_some(Self)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Com::CoUninitialize;
+        unsafe { CoUninitialize() };
+    }
+}
+
+/// Best-effort AUMID + relaunch icon via raw shell32 COM.
+#[cfg(target_os = "windows")]
 fn apply_basiliskos_aumid(hwnd: isize, window_ico: &Path) {
     use std::os::windows::ffi::OsStrExt;
 
@@ -2096,7 +3933,7 @@ fn apply_basiliskos_aumid(hwnd: isize, window_ico: &Path) {
         data: usize,
     }
 
-    type HRESULT = i32;
+    type Hresult = i32;
     type Hwnd = *mut core::ffi::c_void;
 
     #[link(name = "shell32")]
@@ -2105,15 +3942,8 @@ fn apply_basiliskos_aumid(hwnd: isize, window_ico: &Path) {
             hwnd: Hwnd,
             riid: *const Guid,
             ppv: *mut *mut core::ffi::c_void,
-        ) -> HRESULT;
+        ) -> Hresult;
     }
-    #[link(name = "ole32")]
-    extern "system" {
-        fn CoInitializeEx(pvreserved: *mut core::ffi::c_void, dwcoinit: u32) -> HRESULT;
-        fn CoUninitialize();
-    }
-
-    const COINIT_APARTMENTTHREADED: u32 = 0x2;
     const VT_LPWSTR: u16 = 31;
     const FMTID: Guid = Guid {
         data1: 0x9F4C2855,
@@ -2141,11 +3971,12 @@ fn apply_basiliskos_aumid(hwnd: isize, window_ico: &Path) {
     };
 
     unsafe {
-        let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+        let Some(_com) = ComApartment::initialize() else {
+            return;
+        };
         let mut store: *mut core::ffi::c_void = std::ptr::null_mut();
         let hr = SHGetPropertyStoreForWindow(hwnd as Hwnd, &IID_IPROPERTY_STORE, &mut store);
         if hr < 0 || store.is_null() {
-            CoUninitialize();
             return;
         }
 
@@ -2155,8 +3986,8 @@ fn apply_basiliskos_aumid(hwnd: isize, window_ico: &Path) {
             this: *mut core::ffi::c_void,
             key: *const PropertyKey,
             value: *const PropVariant,
-        ) -> HRESULT;
-        type CommitFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> HRESULT;
+        ) -> Hresult;
+        type CommitFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> Hresult;
         type ReleaseFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> u32;
         let set_value: SetValueFn = std::mem::transmute(*vtbl.add(6));
         let commit: CommitFn = std::mem::transmute(*vtbl.add(7));
@@ -2185,7 +4016,6 @@ fn apply_basiliskos_aumid(hwnd: isize, window_ico: &Path) {
         let _ = set_string(&PKEY_RELAUNCH_ICON, ico.as_ref());
         let _ = commit(store);
         let _ = release(store);
-        CoUninitialize();
     }
 }
 
@@ -2193,7 +4023,7 @@ fn apply_basiliskos_aumid(hwnd: isize, window_ico: &Path) {
 fn log_icon_line(message: &str) {
     if let Ok(profile) = isolated_claude_profile_dir() {
         let log_dir = profile.join("Basiliskos Logs");
-        let _ = fs::create_dir_all(&log_dir);
+        let _ = secure_create_dir_all(&log_dir);
         let path = log_dir.join("icon-apply.log");
         if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(file, "{}", message);
@@ -2227,23 +4057,20 @@ fn apply_taskbar_overlay(hwnd: isize, small_icon: isize) {
         data4: [u8; 8],
     }
 
-    type HRESULT = i32;
+    type Hresult = i32;
     type Hwnd = *mut core::ffi::c_void;
 
     #[link(name = "ole32")]
     extern "system" {
-        fn CoInitializeEx(pvreserved: *mut core::ffi::c_void, dwcoinit: u32) -> HRESULT;
-        fn CoUninitialize();
         fn CoCreateInstance(
             rclsid: *const Guid,
             punkouter: *mut core::ffi::c_void,
             dwclscontext: u32,
             riid: *const Guid,
             ppv: *mut *mut core::ffi::c_void,
-        ) -> HRESULT;
+        ) -> Hresult;
     }
 
-    const COINIT_APARTMENTTHREADED: u32 = 0x2;
     const CLSCTX_INPROC_SERVER: u32 = 0x1;
     // CLSID_TaskbarList
     const CLSID_TASKBAR_LIST: Guid = Guid {
@@ -2261,7 +4088,9 @@ fn apply_taskbar_overlay(hwnd: isize, small_icon: isize) {
     };
 
     unsafe {
-        let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+        let Some(_com) = ComApartment::initialize() else {
+            return;
+        };
         let mut obj: *mut core::ffi::c_void = std::ptr::null_mut();
         let hr = CoCreateInstance(
             &CLSID_TASKBAR_LIST,
@@ -2271,18 +4100,17 @@ fn apply_taskbar_overlay(hwnd: isize, small_icon: isize) {
             &mut obj,
         );
         if hr < 0 || obj.is_null() {
-            CoUninitialize();
             return;
         }
         // ITaskbarList3 vtable: HrInit=3, SetOverlayIcon=18
         let vtbl = *(obj as *const *const usize);
-        type HrInitFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> HRESULT;
+        type HrInitFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> Hresult;
         type SetOverlayIconFn = unsafe extern "system" fn(
             this: *mut core::ffi::c_void,
             hwnd: Hwnd,
             hicon: isize,
             description: *const u16,
-        ) -> HRESULT;
+        ) -> Hresult;
         type ReleaseFn = unsafe extern "system" fn(this: *mut core::ffi::c_void) -> u32;
         let hr_init: HrInitFn = std::mem::transmute(*vtbl.add(3));
         let set_overlay: SetOverlayIconFn = std::mem::transmute(*vtbl.add(18));
@@ -2291,16 +4119,16 @@ fn apply_taskbar_overlay(hwnd: isize, small_icon: isize) {
         let desc: Vec<u16> = "Basiliskos\0".encode_utf16().collect();
         let _ = set_overlay(obj, hwnd as Hwnd, small_icon, desc.as_ptr());
         let _ = release(obj);
-        CoUninitialize();
     }
 }
 
 #[cfg(target_os = "windows")]
-fn apply_claude_window_icons(pid: u32, window_ico: &Path) -> usize {
-    let Ok((small, big)) = load_hicons(window_ico) else {
-        log_icon_line(&format!("load window ico failed: {}", window_ico.display()));
-        return 0;
-    };
+fn apply_claude_window_icons(
+    pid: u32,
+    window_ico: &Path,
+    small: &OwnedIcon,
+    big: &OwnedIcon,
+) -> usize {
     let hwnds = enum_claude_hwnds_for_pid(pid);
     let mut applied = 0_usize;
     for info in &hwnds {
@@ -2308,11 +4136,11 @@ fn apply_claude_window_icons(pid: u32, window_ico: &Path) -> usize {
         if info.class_name.contains("NotifyIcon") {
             continue;
         }
-        apply_icons_to_hwnd(info.hwnd, small, big);
+        apply_icons_to_hwnd(info.hwnd, small.0, big.0);
         if info.visible {
             apply_basiliskos_aumid(info.hwnd, window_ico);
             apply_window_title(info.hwnd, "Basiliskos Claude");
-            apply_taskbar_overlay(info.hwnd, small);
+            apply_taskbar_overlay(info.hwnd, small.0);
         }
         applied += 1;
     }
@@ -2329,18 +4157,19 @@ fn apply_claude_window_icons(pid: u32, window_ico: &Path) -> usize {
 /// Shell_NotifyIcon is private to the registering app — class-icon overwrite is the
 /// least-harmful external approach and may still leave stock tray imagery.
 #[cfg(target_os = "windows")]
-fn try_apply_tray_icon_for_pid(pid: u32, tray_ico: &Path) -> bool {
-    let Ok((small, big)) = load_hicons(tray_ico) else {
-        log_icon_line(&format!("load tray ico failed: {}", tray_ico.display()));
-        return false;
-    };
+fn try_apply_tray_icon_for_pid(
+    pid: u32,
+    tray_ico: &Path,
+    small: &OwnedIcon,
+    big: &OwnedIcon,
+) -> bool {
     let hwnds = enum_claude_hwnds_for_pid(pid);
     let mut applied = false;
     for info in hwnds {
         if info.class_name.contains("NotifyIcon")
             || (!info.visible && info.class_name.contains("Chrome_WidgetWin_0"))
         {
-            apply_icons_to_hwnd(info.hwnd, small, big);
+            apply_icons_to_hwnd(info.hwnd, small.0, big.0);
             applied = true;
         }
     }
@@ -2361,26 +4190,43 @@ fn spawn_claude_icon_reapply(pid: u32, window_ico: PathBuf, tray_ico: PathBuf) {
             window_ico.display(),
             tray_ico.display()
         ));
-        let mut consecutive_hits = 0_u8;
-        // Long reassert: Electron resets title/icons after paint and on focus.
-        for attempt in 0..60_u8 {
+        let Ok((window_small, window_big)) = load_hicons(&window_ico) else {
+            log_icon_line("window icon load failed; cosmetic customization skipped");
+            return;
+        };
+        let tray_icons = if tray_ico.is_file() {
+            load_hicons(&tray_ico).ok()
+        } else {
+            None
+        };
+        let mut consecutive_hits = 0_u32;
+        // Keep the owned HICON values alive for exactly the isolated process lifetime.
+        // Electron can reset its class icons after paint or focus, so reassert at a low
+        // cadence after the initial startup window.
+        for attempt in 0_u32.. {
             if attempt > 0 {
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(if attempt < 60 {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(5)
+                });
             }
             // Stop if the process is gone.
             if !process_alive(pid) {
                 log_icon_line(&format!("icon reapply stop pid={pid} process exited"));
                 return;
             }
-            let touched = apply_claude_window_icons(pid, &window_ico);
-            if !tray_ico.as_os_str().is_empty() && tray_ico.is_file() {
-                let _ = try_apply_tray_icon_for_pid(pid, &tray_ico);
+            let touched = apply_claude_window_icons(pid, &window_ico, &window_small, &window_big);
+            if let Some((tray_small, tray_big)) = tray_icons.as_ref() {
+                let _ = try_apply_tray_icon_for_pid(pid, &tray_ico, tray_small, tray_big);
             }
             if touched > 0 {
                 consecutive_hits = consecutive_hits.saturating_add(1);
             }
         }
-        log_icon_line(&format!("icon reapply end pid={pid} hits={consecutive_hits}"));
+        log_icon_line(&format!(
+            "icon reapply end pid={pid} hits={consecutive_hits}"
+        ));
     });
 }
 
@@ -2425,10 +4271,11 @@ fn maybe_apply_claude_icons(_app: &AppHandle, _pid: u32, _state: &ControllerStat
 
 #[tauri::command]
 pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
     #[cfg(target_os = "windows")]
     {
         if !gateway_running() {
-            start_gateway(app.clone())?;
+            start_gateway_locked(app.clone())?;
         }
         let mut state = prepare_config()?;
         restore_legacy_shared_config_if_needed(&mut state)?;
@@ -2440,34 +4287,46 @@ pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
         write_isolated_claude_config(&profile, &state)?;
         let executable = installed_claude_exe()?;
         let log_dir = profile.join("Basiliskos Logs");
-        fs::create_dir_all(&log_dir)
-            .map_err(|error| format!("Could not create {}: {error}", log_dir.display()))?;
+        secure_create_dir_all(&log_dir)?;
         if hydra_claude_running() {
-            if let Ok(guard) = claude_child().lock() {
-                if let Some(child) = guard.as_ref() {
+            if let Ok(runtime) = runtime_lock() {
+                if let Some(child) = runtime.claude_child.as_ref() {
                     maybe_apply_claude_icons(&app, child.id(), &state);
                 }
             }
-            return gateway_snapshot();
+            return gateway_snapshot_locked();
         }
-        let stdout = fs::File::create(log_dir.join("launcher.stdout.log"))
+        let stdout_path = log_dir.join("launcher.stdout.log");
+        let stderr_path = log_dir.join("launcher.stderr.log");
+        durable_write(&stdout_path, b"")?;
+        durable_write(&stderr_path, b"")?;
+        let stdout = fs::File::create(&stdout_path)
             .map_err(|error| format!("Could not create the Basiliskos Claude log: {error}"))?;
-        let stderr = fs::File::create(log_dir.join("launcher.stderr.log"))
+        let stderr = fs::File::create(&stderr_path)
             .map_err(|error| format!("Could not create the Basiliskos Claude log: {error}"))?;
-        let mut command = Command::new(executable);
+        let mut command = Command::new(&executable);
         command
             .env("CLAUDE_USER_DATA_DIR", &profile)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         hidden(&mut command);
-        let child = command.spawn().map_err(|error| {
+        let mut child = command.spawn().map_err(|error| {
             format!("Could not open the isolated Basiliskos Claude window: {error}")
         })?;
+        let job = assign_gateway_to_kill_on_close_job(&child).inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
         let pid = child.id();
-        *claude_child()
-            .lock()
-            .map_err(|_| "Basiliskos Claude process state is locked")? = Some(child);
+        {
+            let mut runtime = runtime_lock()?;
+            runtime.claude_child = Some(child);
+            runtime.claude_job = job;
+            runtime.claude_root_pid = Some(pid);
+            runtime.claude_executable = Some(executable);
+            runtime.claude_profile = Some(profile.clone());
+        }
         maybe_apply_claude_icons(&app, pid, &state);
         std::thread::sleep(Duration::from_millis(900));
         if !hydra_claude_running() {
@@ -2476,7 +4335,7 @@ pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
                     .into(),
             );
         }
-        gateway_snapshot()
+        gateway_snapshot_locked()
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -2487,8 +4346,9 @@ pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
 
 #[tauri::command]
 pub fn stop_hydra_claude() -> Result<GatewaySnapshot, String> {
-    stop_hydra_claude_internal();
-    gateway_snapshot()
+    let _mutation = mutation_lock()?;
+    stop_hydra_claude_runtime();
+    gateway_snapshot_locked()
 }
 
 #[cfg(test)]
@@ -2507,6 +4367,39 @@ mod tests {
             serde_json::json!({"type": provider}).to_string(),
         )
         .unwrap();
+    }
+
+    fn begin_mock_request(
+        runtime: &tokio::runtime::Handle,
+        scenario: crate::test_support::FaultScenario,
+        first_response_timeout: Duration,
+        stream_idle_timeout: Duration,
+    ) -> (
+        crate::test_support::MockBackend,
+        Result<UpstreamMeta, FirstResponseFailure>,
+    ) {
+        // Some Windows endpoint filters intermittently abort a brand-new
+        // loopback GET before response headers. Retrying only the disposable
+        // test fixture keeps the fault harness deterministic; production
+        // requests use begin_upstream_request directly and are never replayed.
+        for _ in 0..3 {
+            let backend = crate::test_support::MockBackend::spawn(scenario).unwrap();
+            let result = begin_upstream_request_with_timeouts(
+                runtime,
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                reqwest::Method::GET,
+                format!("http://{}/fault", backend.address()),
+                Vec::new(),
+                Vec::new(),
+                first_response_timeout,
+                stream_idle_timeout,
+            );
+            if matches!(result, Err(FirstResponseFailure::Connect)) {
+                continue;
+            }
+            return (backend, result);
+        }
+        panic!("the loopback fault fixture was aborted three consecutive times")
     }
 
     #[test]
@@ -2570,7 +4463,10 @@ mod tests {
         assert!(config.contains("port: 8318"));
         assert!(config.contains("disable-control-panel: true"));
         assert!(config.contains("streaming:\n  keepalive-seconds: 15"));
-        assert!(config.contains("bootstrap-retries: 1"));
+        assert!(config.contains("request-retry: 0"));
+        assert!(config.contains("max-retry-credentials: 1"));
+        assert!(config.contains("bootstrap-retries: 0"));
+        assert!(config.contains("disable-claude-cloak-mode: true"));
         let _ = fs::remove_dir_all(auth);
     }
 
@@ -2884,8 +4780,8 @@ mod tests {
             .args(["/C", "ping 127.0.0.1 -n 30 > nul"])
             .spawn()
             .unwrap();
-        assign_gateway_to_kill_on_close_job(&child).unwrap();
-        close_gateway_job();
+        let job = assign_gateway_to_kill_on_close_job(&child).unwrap();
+        close_gateway_job(job);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if child.try_wait().unwrap().is_some() {
@@ -2901,13 +4797,15 @@ mod tests {
     #[test]
     fn account_selection_enables_one_and_disables_the_rest() {
         let root = temp_dir("accounts");
+        let auth = root.join("auth");
+        fs::create_dir_all(&auth).unwrap();
         fs::write(
-            root.join("codex-a.json"),
+            auth.join("codex-a.json"),
             r#"{"type":"codex","disabled":false}"#,
         )
         .unwrap();
         fs::write(
-            root.join("xai-b.json"),
+            auth.join("xai-b.json"),
             r#"{"type":"xai","disabled":false}"#,
         )
         .unwrap();
@@ -2929,14 +4827,242 @@ mod tests {
                 active: false,
             },
         ];
-        select_account_files(&root, &accounts, "xai-b.json").unwrap();
+        let state_path = root.join("controller.json");
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+        };
+        fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        let (mutations, _) =
+            selection_transaction(&root, &auth, &state_path, &accounts, &state, "xai-b.json")
+                .unwrap();
+        run_transaction(&root, &mutations, || {
+            validate_account_invariant(&auth, &state_path)
+        })
+        .unwrap();
         let codex: Value =
-            serde_json::from_str(&fs::read_to_string(root.join("codex-a.json")).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(auth.join("codex-a.json")).unwrap()).unwrap();
         let grok: Value =
-            serde_json::from_str(&fs::read_to_string(root.join("xai-b.json")).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(auth.join("xai-b.json")).unwrap()).unwrap();
         assert_eq!(codex.get("disabled").and_then(Value::as_bool), Some(true));
         assert_eq!(grok.get("disabled").and_then(Value::as_bool), Some(false));
+        let selected: ControllerState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(selected.active_account.as_deref(), Some("xai-b.json"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_selection_rolls_back_every_write_failure() {
+        for fail_after in 0..3 {
+            let root = temp_dir("account-selection-failure");
+            let auth = root.join("auth");
+            fs::create_dir_all(&auth).unwrap();
+            let codex_path = auth.join("codex-a.json");
+            let xai_path = auth.join("xai-b.json");
+            let state_path = root.join("controller.json");
+            let codex_before = br#"{"type":"codex","disabled":false}"#.to_vec();
+            let xai_before = br#"{"type":"xai","disabled":true}"#.to_vec();
+            fs::write(&codex_path, &codex_before).unwrap();
+            fs::write(&xai_path, &xai_before).unwrap();
+            let state = ControllerState {
+                api_key: "secret".into(),
+                claude_config_id: "id".into(),
+                previous_claude_applied_id: None,
+                active_account: Some("codex-a.json".into()),
+                routes: default_routes(),
+                claude_window_icon: default_claude_window_icon(),
+            };
+            let state_before = serde_json::to_vec_pretty(&state).unwrap();
+            fs::write(&state_path, &state_before).unwrap();
+            let accounts = vec![
+                GatewayAccount {
+                    file_name: "codex-a.json".into(),
+                    provider: "codex".into(),
+                    email: None,
+                    label: "Codex".into(),
+                    disabled: false,
+                    active: true,
+                },
+                GatewayAccount {
+                    file_name: "xai-b.json".into(),
+                    provider: "xai".into(),
+                    email: None,
+                    label: "Grok".into(),
+                    disabled: true,
+                    active: false,
+                },
+            ];
+            let (mutations, _) =
+                selection_transaction(&root, &auth, &state_path, &accounts, &state, "xai-b.json")
+                    .unwrap();
+            assert!(crate::persistence::run_transaction_with_fault(
+                &root,
+                &mutations,
+                || validate_account_invariant(&auth, &state_path),
+                fail_after,
+                false,
+            )
+            .is_err());
+            assert_eq!(fs::read(&codex_path).unwrap(), codex_before);
+            assert_eq!(fs::read(&xai_path).unwrap(), xai_before);
+            assert_eq!(fs::read(&state_path).unwrap(), state_before);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    fn active_removal_fixture(
+        root: &Path,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        Vec<GatewayAccount>,
+        ControllerState,
+        BTreeMap<String, String>,
+    ) {
+        let auth = root.join("auth");
+        fs::create_dir_all(&auth).unwrap();
+        fs::write(
+            auth.join("codex-a.json"),
+            br#"{"type":"codex","disabled":false}"#,
+        )
+        .unwrap();
+        fs::write(
+            auth.join("xai-b.json"),
+            br#"{"type":"xai","disabled":true}"#,
+        )
+        .unwrap();
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: Some("codex-a.json".into()),
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+        };
+        let state_path = root.join("controller.json");
+        fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        let labels = BTreeMap::from([
+            ("codex-a.json".into(), "Codex".into()),
+            ("xai-b.json".into(), "Grok".into()),
+        ]);
+        let labels_path = root.join("account-labels.json");
+        fs::write(&labels_path, serde_json::to_vec_pretty(&labels).unwrap()).unwrap();
+        let accounts = vec![
+            GatewayAccount {
+                file_name: "codex-a.json".into(),
+                provider: "codex".into(),
+                email: None,
+                label: "Codex".into(),
+                disabled: false,
+                active: true,
+            },
+            GatewayAccount {
+                file_name: "xai-b.json".into(),
+                provider: "xai".into(),
+                email: None,
+                label: "Grok".into(),
+                disabled: true,
+                active: false,
+            },
+        ];
+        (auth, state_path, labels_path, accounts, state, labels)
+    }
+
+    #[test]
+    fn active_account_removal_disables_every_remaining_account() {
+        let root = temp_dir("active-removal");
+        let (auth, state_path, labels_path, accounts, state, labels) =
+            active_removal_fixture(&root);
+        let (mutations, _) = removal_transaction(
+            AccountPaths {
+                root: &root,
+                directory: &auth,
+                state: &state_path,
+                labels: &labels_path,
+            },
+            &accounts,
+            &state,
+            &labels,
+            "codex-a.json",
+        )
+        .unwrap();
+        run_transaction(&root, &mutations, || {
+            validate_account_invariant(&auth, &state_path)
+        })
+        .unwrap();
+        assert!(!auth.join("codex-a.json").exists());
+        assert!(!crate::persistence::backup_path(&auth.join("codex-a.json"))
+            .unwrap()
+            .exists());
+        let remaining: Value =
+            serde_json::from_slice(&fs::read(auth.join("xai-b.json")).unwrap()).unwrap();
+        assert_eq!(remaining["disabled"], true);
+        let after: ControllerState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(after.active_account, None);
+        let after_labels: BTreeMap<String, String> =
+            serde_json::from_slice(&fs::read(&labels_path).unwrap()).unwrap();
+        assert!(!after_labels.contains_key("codex-a.json"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_account_removal_rolls_back_every_write_failure() {
+        for fail_after in 0..4 {
+            let root = temp_dir("active-removal-failure");
+            let (auth, state_path, labels_path, accounts, state, labels) =
+                active_removal_fixture(&root);
+            let before = [
+                (
+                    auth.join("codex-a.json"),
+                    br#"{"type":"codex","disabled":false}"#.to_vec(),
+                ),
+                (
+                    auth.join("xai-b.json"),
+                    br#"{"type":"xai","disabled":true}"#.to_vec(),
+                ),
+                (
+                    state_path.clone(),
+                    serde_json::to_vec_pretty(&state).unwrap(),
+                ),
+                (
+                    labels_path.clone(),
+                    serde_json::to_vec_pretty(&labels).unwrap(),
+                ),
+            ];
+            let (mutations, _) = removal_transaction(
+                AccountPaths {
+                    root: &root,
+                    directory: &auth,
+                    state: &state_path,
+                    labels: &labels_path,
+                },
+                &accounts,
+                &state,
+                &labels,
+                "codex-a.json",
+            )
+            .unwrap();
+            assert_eq!(mutations.len(), 4);
+            assert!(crate::persistence::run_transaction_with_fault(
+                &root,
+                &mutations,
+                || validate_account_invariant(&auth, &state_path),
+                fail_after,
+                false,
+            )
+            .is_err());
+            for (path, bytes) in before {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -3075,6 +5201,94 @@ mod tests {
     }
 
     #[test]
+    fn relay_faults_have_stable_upstream_classifications() {
+        assert_eq!(
+            classify_upstream_status(401),
+            Some(ErrorCode::ProviderAuthFailed)
+        );
+        assert_eq!(
+            classify_upstream_status(429),
+            Some(ErrorCode::ProviderRateLimited)
+        );
+        assert_eq!(
+            classify_upstream_status(503),
+            Some(ErrorCode::UpstreamServerError)
+        );
+        assert_eq!(classify_upstream_status(200), None);
+    }
+
+    #[test]
+    fn relay_long_sse_stream_survives_while_each_chunk_meets_idle_budget() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_backend, meta) = begin_mock_request(
+            runtime.handle(),
+            crate::test_support::FaultScenario::DelayedSseChunk(Duration::from_millis(120)),
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+        let meta = meta.unwrap();
+        let mut reader = TrackedUpstream {
+            receiver: meta.body,
+            current: None,
+            offset: 0,
+            correlation_id: "sse-test".into(),
+            provider: None,
+        };
+        let mut body = String::new();
+        reader.read_to_string(&mut body).unwrap();
+        assert!(body.contains("data: first"));
+        assert!(body.contains("data: second"));
+    }
+
+    #[test]
+    fn relay_distinguishes_first_response_and_midstream_idle_timeouts() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_first, result) = begin_mock_request(
+            runtime.handle(),
+            crate::test_support::FaultScenario::DelayedFirstByte(Duration::from_millis(120)),
+            Duration::from_millis(20),
+            Duration::from_millis(500),
+        );
+        assert!(matches!(result, Err(FirstResponseFailure::Timeout)));
+
+        let (_stream, meta) = begin_mock_request(
+            runtime.handle(),
+            crate::test_support::FaultScenario::DelayedSseChunk(Duration::from_millis(120)),
+            Duration::from_millis(500),
+            Duration::from_millis(20),
+        );
+        let meta = meta.unwrap();
+        let mut reader = TrackedUpstream {
+            receiver: meta.body,
+            current: None,
+            offset: 0,
+            correlation_id: "idle-test".into(),
+            provider: None,
+        };
+        let mut body = String::new();
+        let error = reader.read_to_string(&mut body).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(body.contains("data: first"));
+    }
+
+    #[test]
+    fn relay_budgets_are_fixed_and_bounded() {
+        assert_eq!(RELAY_WORKERS, 8);
+        assert_eq!(RELAY_QUEUE_CAPACITY, 32);
+        assert_eq!(MAX_RELAY_BODY_BYTES, 8 * 1024 * 1024);
+        assert_eq!(MAX_RELAY_HEADERS, 64);
+        assert_eq!(MAX_RELAY_HEADER_BYTES, 64 * 1024);
+    }
+
+    #[test]
     fn invalid_or_unsupported_route_values_fall_back_safely() {
         let mut state = ControllerState {
             api_key: "secret".into(),
@@ -3101,5 +5315,34 @@ mod tests {
         );
         assert_eq!(normalized_route(&state, "codex").model, "gpt-5.5");
         assert_eq!(normalized_route(&state, "codex").thinking, "auto");
+    }
+
+    #[test]
+    fn provider_login_identity_is_normalized_and_has_a_safe_fallback() {
+        let credential = serde_json::json!({"account": {"email": "  USER@Example.COM "}});
+        assert_eq!(
+            credential_identity(&credential, "Codex-Fallback.JSON"),
+            "user@example.com"
+        );
+        assert_eq!(
+            credential_identity(&serde_json::json!({}), "Codex-Fallback.JSON"),
+            "codex-fallback.json"
+        );
+    }
+
+    #[test]
+    fn new_provider_login_never_overwrites_an_unrelated_filename_collision() {
+        let directory = temp_dir("login-collision");
+        fs::write(directory.join("codex.json"), b"existing credential").unwrap();
+        let destination = new_credential_destination_name(&directory, "codex.json").unwrap();
+        assert_ne!(destination, "codex.json");
+        assert!(destination.starts_with("codex-"));
+        assert!(destination.ends_with(".json"));
+        assert!(new_credential_destination_name(&directory, "..\\escape.json").is_err());
+        assert_eq!(
+            fs::read(directory.join("codex.json")).unwrap(),
+            b"existing credential"
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 }

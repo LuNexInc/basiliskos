@@ -1,0 +1,16 @@
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = false
+
+[advisories]
+ignore = [
+  # Tauri 2.11.5 reaches these unmaintained rust-unic crates through
+  # tauri-utils -> urlpattern. RustSec lists no safe upgrade, and these are
+  # maintenance notices rather than memory-safety or code-execution flaws.
+  # Keep each ID explicit so any different advisory still fails the gate.
+  { id = "RUSTSEC-2025-0075", reason = "Unmaintained transitive Tauri dependency; no safe upgrade is available" },
+  { id = "RUSTSEC-2025-0080", reason = "Unmaintained transitive Tauri dependency; no safe upgrade is available" },
+  { id = "RUSTSEC-2025-0081", reason = "Unmaintained transitive Tauri dependency; no safe upgrade is available" },
+  { id = "RUSTSEC-2025-0098", reason = "Unmaintained transitive Tauri dependency; no safe upgrade is available" },
+  { id = "RUSTSEC-2025-0100", reason = "Unmaintained transitive Tauri dependency; no safe upgrade is available" },
+]

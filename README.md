@@ -74,14 +74,18 @@ Desktop development with C++.
 ```powershell
 pnpm install
 pnpm test:all
-pnpm tauri build
+pnpm bundle
 ```
 
-`prepare-gateway.ps1` downloads CLIProxyAPI v7.2.72 at build time and verifies
+`prepare-gateway.ps1` downloads CLIProxyAPI v7.2.77 at build time and verifies
 both the release archive and executable SHA-256 before bundling it. The binary
 is not committed to Git. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-Installers are written to `src-tauri/target/release/bundle/`.
+The canonical per-machine NSIS installer is written to
+`src-tauri/target/release/bundle/nsis/`. Authenticode signing is optional:
+CI signs when certificate secrets are configured; otherwise it produces an
+explicitly unsigned installer with SHA-256, SBOM, provenance, and lifecycle
+evidence. Windows will show `Unknown publisher` for unsigned installers.
 
 ## Independence
 

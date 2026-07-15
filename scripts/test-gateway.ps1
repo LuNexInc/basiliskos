@@ -85,7 +85,16 @@ try {
         throw 'Gateway model-list response did not contain a data array.'
     }
 
-    Write-Output "Gateway smoke test passed on loopback port $port."
+    Stop-Process -Id $process.Id -Force
+    $process.WaitForExit(5000) | Out-Null
+    foreach ($logPath in @($stdout, $stderr)) {
+        if ((Test-Path -LiteralPath $logPath -PathType Leaf) -and
+            [IO.File]::ReadAllText($logPath).Contains($apiKey)) {
+            throw "Gateway diagnostic log exposed the fixture API key: $([IO.Path]::GetFileName($logPath))"
+        }
+    }
+
+    Write-Output "Gateway smoke and log-redaction tests passed on loopback port $port."
 }
 finally {
     if ($null -ne $process -and -not $process.HasExited) {

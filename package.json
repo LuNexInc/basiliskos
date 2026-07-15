@@ -1,13 +1,21 @@
 {
   "name": "hydra-gateway",
   "private": true,
-  "version": "1.1.5",
+  "version": "1.1.6",
   "type": "module",
   "scripts": {
     "prepare:gateway": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-gateway.ps1",
     "test:gateway": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-gateway.ps1",
-    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "test:all": "pnpm build && pnpm test:rust && pnpm test:gateway",
+    "test:format": "cargo fmt --manifest-path src-tauri/Cargo.toml -- --check",
+    "test:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
+    "test:surface": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-command-surface.ps1",
+    "test:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-installer-contract.ps1",
+    "test:ui": "vitest run",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features",
+    "test:secrets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-sensitive-data.ps1 -SelfTest",
+    "test:log-secrets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-runtime-log-secrets.ps1 -SelfTest",
+    "test:all": "pnpm build && pnpm test:ui && pnpm test:format && pnpm test:clippy && pnpm test:rust && pnpm test:surface && pnpm test:installer && pnpm test:gateway && pnpm test:secrets && pnpm test:log-secrets",
+    "bundle": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri-build.ps1",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
@@ -15,7 +23,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
     "lucide-react": "^1.23.0",
     "react": "^19.1.0",
@@ -23,11 +30,15 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "jsdom": "^26.1.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^3.2.7"
   },
   "packageManager": "pnpm@10.30.1+sha512.3590e550d5384caa39bd5c7c739f72270234b2f6059e13018f975c313b1eb9fefcc09714048765d4d9efe961382c312e624572c0420762bdc5d5940cdf9be73a"
 }
