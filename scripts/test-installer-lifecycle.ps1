@@ -68,7 +68,15 @@ Invoke-Installer $CurrentInstaller
 $afterRepair = (Get-FileHash -LiteralPath $currentExe -Algorithm SHA256).Hash
 if ($beforeRepair -ne $afterRepair) { throw 'Repair changed the installed executable unexpectedly.' }
 
-Invoke-Installer $PreviousInstaller -ExpectFailure
+$uninstallKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Basiliskos'
+$installedVersion = (Get-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion).DisplayVersion
+try {
+    Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value '999.0.0'
+    Invoke-Installer $CurrentInstaller -ExpectFailure
+}
+finally {
+    Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value $installedVersion
+}
 if (-not (Test-Path -LiteralPath $currentExe -PathType Leaf) -or
     (Get-FileHash -LiteralPath $currentExe -Algorithm SHA256).Hash -ne $beforeRepair) {
     throw 'The rejected rollback damaged the current installation.'
