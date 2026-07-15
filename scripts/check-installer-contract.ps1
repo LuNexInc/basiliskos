@@ -19,6 +19,10 @@ if ($lastInstallDirectoryWrite -lt 0 -or $resetExtractionDirectory -lt $lastInst
 }
 
 foreach ($required in @(
+    'ReadRegStr $R8 SHCTX "${UNINSTKEY}" "DisplayVersion"',
+    'nsis_tauri_utils::SemverCompare "${VERSION}" $R8',
+    '${If} $R7 = -1',
+    'Abort "A newer Basiliskos version is already installed."',
     '$PROGRAMFILES64\3ReadyLab\${PRODUCTNAME}',
     '$PROGRAMFILES\3ReadyLab\${PRODUCTNAME}',
     '$PROGRAMFILES64\${PRODUCTNAME}',

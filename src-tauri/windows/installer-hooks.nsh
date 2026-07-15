@@ -9,6 +9,18 @@
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
+  ; Tauri's generated downgrade comparison is populated by a UI page that does
+  ; not run for /S installs. Enforce the same policy before touching any files
+  ; so unattended deployment cannot replace a newer Basiliskos installation.
+  ReadRegStr $R8 SHCTX "${UNINSTKEY}" "DisplayVersion"
+  ${If} $R8 != ""
+    nsis_tauri_utils::SemverCompare "${VERSION}" $R8
+    Pop $R7
+    ${If} $R7 = -1
+      Abort "A newer Basiliskos version is already installed."
+    ${EndIf}
+  ${EndIf}
+
   ; Tauri's per-machine default is Program Files\Basiliskos. Basiliskos ships
   ; under the shared 3ReadyLab publisher directory. Preserve a genuinely custom
   ; user-selected directory, but migrate either historical default first so the
