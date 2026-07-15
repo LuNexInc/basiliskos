@@ -82,7 +82,8 @@ if (-not $projectRoot.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreC
     throw 'Project root is outside the Git worktree.'
 }
 $projectRelative = $projectRoot.Substring($repoPrefix.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar).Replace('\', '/')
-$tracked = @(& git -C $repoRoot ls-files --cached --others --exclude-standard -- $projectRelative)
+$pathspec = if ([string]::IsNullOrWhiteSpace($projectRelative)) { '.' } else { $projectRelative }
+$tracked = @(& git -C $repoRoot ls-files --cached --others --exclude-standard -- $pathspec)
 if ($LASTEXITCODE -ne 0) {
     throw 'Could not enumerate project files for sensitive-data scanning.'
 }
@@ -105,7 +106,8 @@ foreach ($relative in $tracked) {
     foreach ($match in Find-SensitiveMatches -Text $text) {
         $line = 1 + [regex]::Matches($text.Substring(0, $match.Index), "`n").Count
         $display = $relative.Replace('\', '/')
-        if ($display.StartsWith($projectRelative + '/', [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not [string]::IsNullOrWhiteSpace($projectRelative) -and
+            $display.StartsWith($projectRelative + '/', [StringComparison]::OrdinalIgnoreCase)) {
             $display = $display.Substring($projectRelative.Length + 1)
         }
         $findings += [pscustomobject]@{
