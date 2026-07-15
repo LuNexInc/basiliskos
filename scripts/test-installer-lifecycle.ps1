@@ -11,9 +11,12 @@ $sentinelDir = Join-Path $env:USERPROFILE '.hydra-gateway'
 $sentinel = Join-Path $sentinelDir 'installer-ci-sentinel.txt'
 $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\3ReadyLab\Basiliskos.lnk'
 
-function Invoke-Installer([string]$Path) {
+function Invoke-Installer([string]$Path, [switch]$ExpectFailure) {
     $process = Start-Process -FilePath $Path -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
-    if ($process.ExitCode -ne 0) {
+    if ($ExpectFailure) {
+        if ($process.ExitCode -eq 0) { throw 'A downgrade unexpectedly succeeded.' }
+    }
+    elseif ($process.ExitCode -ne 0) {
         throw "$([IO.Path]::GetFileName($Path)) failed with exit code $($process.ExitCode)."
     }
 }
@@ -70,7 +73,7 @@ $installedVersion = (Get-ItemProperty -LiteralPath $uninstallKey -Name DisplayVe
 $futureVersion = '999.0.0'
 try {
     Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value $futureVersion
-    Invoke-Installer $CurrentInstaller
+    Invoke-Installer $CurrentInstaller -ExpectFailure
     $versionAfterRejectedDowngrade =
         (Get-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion).DisplayVersion
     if ($versionAfterRejectedDowngrade -ne $futureVersion) {
