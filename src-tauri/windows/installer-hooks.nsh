@@ -43,3 +43,15 @@
   ; folder while registry entries and shortcuts point to the new one.
   SetOutPath $INSTDIR
 !macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  ; Migrating a historical install runs its uninstaller after Tauri has already
+  ; entered update mode. That removes the old shortcut, while Tauri's normal
+  ; update path deliberately skips creating a replacement. Restore the shortcut
+  ; after installation unless the caller explicitly requested /NS.
+  ${If} $NoShortcutMode = 0
+    CreateDirectory "$SMPROGRAMS\$AppStartMenuFolder"
+    CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+    !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+  ${EndIf}
+!macroend

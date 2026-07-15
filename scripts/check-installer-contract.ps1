@@ -29,4 +29,24 @@ foreach ($required in @(
     }
 }
 
+$postInstallMatch = [regex]::Match(
+    $hook,
+    '(?ms)!macro NSIS_HOOK_POSTINSTALL\s*(?<body>.*?)\s*!macroend'
+)
+if (-not $postInstallMatch.Success) {
+    throw 'NSIS_HOOK_POSTINSTALL is missing.'
+}
+
+$postInstallBody = $postInstallMatch.Groups['body'].Value
+foreach ($required in @(
+    '${If} $NoShortcutMode = 0',
+    'CreateDirectory "$SMPROGRAMS\$AppStartMenuFolder"',
+    'CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"',
+    '!insertmacro SetLnkAppUserModelId'
+)) {
+    if ($postInstallBody.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
+        throw "The installer post-install hook is missing shortcut repair behavior: $required"
+    }
+}
+
 Write-Output 'Installer migration contract passed.'

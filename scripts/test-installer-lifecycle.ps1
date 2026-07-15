@@ -12,7 +12,7 @@ $sentinel = Join-Path $sentinelDir 'installer-ci-sentinel.txt'
 $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\3ReadyLab\Basiliskos.lnk'
 
 function Invoke-Installer([string]$Path, [switch]$ExpectFailure) {
-    $process = Start-Process -FilePath $Path -ArgumentList @('/S', '/NS') -Wait -PassThru -WindowStyle Hidden
+    $process = Start-Process -FilePath $Path -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
     if ($ExpectFailure) {
         if ($process.ExitCode -eq 0) { throw 'A downgrade unexpectedly succeeded.' }
     }
