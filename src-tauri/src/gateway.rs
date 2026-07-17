@@ -26,8 +26,11 @@ use crate::persistence::{
     secure_create_dir_all, secure_existing_path, FileMutation,
 };
 
-const GATEWAY_VERSION: &str = "7.2.77";
-const GATEWAY_EXE_SHA256: &str = "0f2b23b5b533c92c2ce86bb37e2bb7bd7472b81b3f63bf8cc19950aca0a0cc2c";
+// Pin CLIProxyAPI 7.2.83 for Kimi K3 (`kimi-k3`) registry support. Upstream
+// issue #4339 (v7.2.73+ x_search injection vs client web_search) is still open;
+// re-test Grok web_search after this pin if Claude Desktop forces that tool.
+const GATEWAY_VERSION: &str = "7.2.83";
+const GATEWAY_EXE_SHA256: &str = "56b71c9c64816c40857926ebd6e6ec59970a5658e28481046f5842e649d8f62d";
 const GATEWAY_PORT: u16 = 8317;
 const BACKEND_PORT: u16 = 8318;
 const MAX_RELAY_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -172,29 +175,35 @@ const XAI_MODELS: &[ModelSpec] = &[
 
 const KIMI_MODELS: &[ModelSpec] = &[
     ModelSpec {
+        id: "kimi-k3",
+        label: "Kimi K3",
+        // K3 always thinks; official API currently only accepts reasoning_effort=max.
+        thinking_levels: &["max"],
+    },
+    ModelSpec {
         id: "kimi-k2.7-code",
         label: "Kimi K2.7 Code",
-        thinking_levels: &["low", "medium", "high"],
+        thinking_levels: &["low", "high"],
     },
     ModelSpec {
         id: "kimi-k2.7-code-highspeed",
         label: "Kimi K2.7 Code HighSpeed",
-        thinking_levels: &["low", "medium", "high"],
+        thinking_levels: &["low", "high"],
     },
     ModelSpec {
         id: "kimi-k2.6",
         label: "Kimi K2.6",
-        thinking_levels: &["low", "medium", "high"],
+        thinking_levels: &["none", "low", "high"],
     },
     ModelSpec {
         id: "kimi-k2.5",
         label: "Kimi K2.5",
-        thinking_levels: &["none", "low", "medium", "high"],
+        thinking_levels: &["none", "low", "high"],
     },
     ModelSpec {
         id: "kimi-k2-thinking",
         label: "Kimi K2 Thinking",
-        thinking_levels: &["none", "low", "medium", "high"],
+        thinking_levels: &["none", "low", "high"],
     },
     ModelSpec {
         id: "kimi-k2",
@@ -458,7 +467,7 @@ fn default_model(provider: &str) -> &'static str {
         "claude" => "claude-sonnet-4-5-20250929",
         "codex" => "gpt-5.5",
         "xai" => "grok-build-0.1",
-        "kimi" => "kimi-k2.7-code",
+        "kimi" => "kimi-k3",
         _ => "",
     }
 }
@@ -5412,7 +5421,7 @@ mod tests {
         assert_eq!(normalized_route(&state, "codex").model, "gpt-5.5");
         assert_eq!(normalized_route(&state, "xai").model, "grok-build-0.1");
         assert_eq!(normalized_route(&state, "xai").thinking, "auto");
-        assert_eq!(normalized_route(&state, "kimi").model, "kimi-k2.7-code");
+        assert_eq!(normalized_route(&state, "kimi").model, "kimi-k3");
         assert_eq!(normalized_route(&state, "kimi").thinking, "auto");
         assert_eq!(state.claude_window_icon, ClaudeWindowIcon::Black);
     }
@@ -5518,6 +5527,36 @@ mod tests {
         let identity = request["system"][0]["text"].as_str().unwrap();
         assert!(identity.contains("current upstream route is Kimi K2.7 Code via Kimi Code"));
         assert_eq!(route_label(&state, Some("kimi")), "Kimi K2.7 Code");
+    }
+
+    #[test]
+    fn kimi_k3_is_default_and_routes_with_max_thinking() {
+        let mut state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+        };
+        assert_eq!(normalized_route(&state, "kimi").model, "kimi-k3");
+        assert_eq!(route_label(&state, Some("kimi")), "Kimi K3");
+        state.routes.insert(
+            "kimi".into(),
+            RouteSelection {
+                model: "kimi-k3".into(),
+                thinking: "max".into(),
+            },
+        );
+        let mut request = serde_json::json!({"model": "claude-sonnet-4-5"});
+        rewrite_claude_request(&mut request, &state, "kimi", true).unwrap();
+        assert_eq!(
+            request.get("model").and_then(Value::as_str),
+            Some("kimi-k3(max)")
+        );
+        let identity = request["system"][0]["text"].as_str().unwrap();
+        assert!(identity.contains("current upstream route is Kimi K3 via Kimi Code"));
+        assert_eq!(route_label(&state, Some("kimi")), "Kimi K3");
     }
 
     #[test]

@@ -4,6 +4,10 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $projectRoot 'src-tauri\resources\gateway\cli-proxy-api.exe'
+$versionLine = (& $exe -h 2>&1 | Select-Object -First 1)
+if ($versionLine -notmatch 'CLIProxyAPI Version: 7\.2\.83,') {
+    throw "Unexpected CLIProxyAPI runtime version: $versionLine"
+}
 $tempBase = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
 $tempRoot = Join-Path $tempBase ("hydra-gateway-test-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null

@@ -433,10 +433,18 @@ export default function App() {
     setBusy("login");
     try {
       const login = await invoke<ProviderLoginLaunch>("launch_provider_login", { provider });
-      await openUrl(login.authorizationUrl);
+      const providerLabel = PROVIDERS.find((item) => item.id === provider)?.label ?? provider;
       const codeMessage = login.userCode ? ` Enter code ${login.userCode} if asked.` : "";
-      setMessage(`Finish the official ${PROVIDERS.find((item) => item.id === provider)?.label} login in your browser…${codeMessage}`);
-      setIsError(false);
+      try {
+        await openUrl(login.authorizationUrl);
+        setMessage(`Finish the official ${providerLabel} login in your browser…${codeMessage}`);
+        setIsError(false);
+      } catch (openError) {
+        setMessage(
+          `Login started, but the browser did not open automatically (${messageFrom(openError)}). Open this URL manually: ${login.authorizationUrl}.${codeMessage}`,
+        );
+        setIsError(true);
+      }
       await refresh(true);
     } catch (error) {
       setMessage(messageFrom(error));

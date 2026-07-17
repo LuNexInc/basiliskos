@@ -83,7 +83,7 @@ pnpm test:all
 pnpm bundle
 ```
 
-`prepare-gateway.ps1` downloads CLIProxyAPI v7.2.77 at build time and verifies
+`prepare-gateway.ps1` downloads CLIProxyAPI v7.2.83 at build time and verifies
 both the release archive and executable SHA-256 before bundling it. The binary
 is not committed to Git. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 

@@ -16,7 +16,9 @@
         { "url": "https://claude.ai/*" },
         { "url": "https://auth.openai.com/*" },
         { "url": "https://accounts.x.ai/*" },
-        { "url": "https://auth.x.ai/*" }
+        { "url": "https://auth.x.ai/*" },
+        { "url": "https://auth.kimi.com/*" },
+        { "url": "https://www.kimi.com/*" }
       ]
     }
   ]
