@@ -12,7 +12,9 @@ Basiliskos stores controller state and provider credentials under
 access tokens, refresh tokens, or local API keys to an issue.
 
 Replace expired credentials through each provider's official browser OAuth
-flow from the Basiliskos UI (Claude, Codex, or Grok).
+flow from the Basiliskos UI (Claude, Codex, Grok, or Kimi). Kimi uses its
+official device-authorization page and one-time code; Basiliskos never
+automates the approval step.
 
 ## Scope
 

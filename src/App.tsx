@@ -23,7 +23,7 @@ import {
 import brandArt from "./assets/basiliskos-mark.png";
 import "./App.css";
 
-type Provider = "claude" | "codex" | "xai";
+type Provider = "claude" | "codex" | "xai" | "kimi";
 
 type Account = {
   fileName: string;
@@ -121,6 +121,7 @@ const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },
   { id: "codex", label: "Codex", detail: "ChatGPT / Codex OAuth" },
   { id: "xai", label: "Grok", detail: "Grok Build OAuth" },
+  { id: "kimi", label: "Kimi", detail: "Kimi Code OAuth" },
 ];
 
 function messageFrom(error: unknown) {
@@ -612,7 +613,9 @@ export default function App() {
                       )) : usage?.loading ? (
                         <span className="usage-state"><LoaderCircle className="spin" size={11} /> Checking usage…</span>
                       ) : (
-                        <span className="usage-state unavailable" title={usage?.error}>Usage unavailable</span>
+                        <span className="usage-state unavailable" title={usage?.error}>
+                          {usage?.error ?? "Usage unavailable"}
+                        </span>
                       )}
                     </div>
                   </div>

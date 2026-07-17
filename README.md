@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="docs/media/basiliskos-hero.svg" alt="Basiliskos — one isolated Claude Code window, three switchable backends: Claude, Codex, and Grok" width="100%">
+  <img src="docs/media/basiliskos-hero.svg" alt="Basiliskos — one isolated Claude Code window, four switchable backends: Claude, Codex, Grok, and Kimi" width="100%">
 </p>
 
 Open a separate Basiliskos-owned Claude Code Windows app and switch the
-authorized account serving it: Claude, Codex, or Grok Build. Your normal Claude
+authorized account serving it: Claude, Codex, Grok Build, or Kimi Code. Your normal Claude
 app remains untouched.
 
 Inside that isolated window, Basiliskos keeps the selected real engine visible
@@ -21,7 +21,7 @@ limits, or automate approval pages.
 ## How it works
 
 <p align="center">
-  <img src="docs/media/basiliskos-flow.svg" alt="Basiliskos's isolated Claude Code Windows app talks to the Basiliskos relay on 127.0.0.1:8317, which forwards to the selected backend: a Claude OAuth account, a Codex OAuth account (selectable GPT model and thinking), or a Grok OAuth account (selectable Grok model and thinking)" width="760">
+  <img src="docs/media/basiliskos-flow.svg" alt="Basiliskos's isolated Claude Code Windows app talks to the Basiliskos relay on 127.0.0.1:8317, which forwards to the selected backend: a Claude OAuth account, a Codex OAuth account, a Grok OAuth account, or a Kimi Code OAuth account" width="760">
 </p>
 
 Basiliskos launches the installed Claude app with `CLAUDE_USER_DATA_DIR`
@@ -37,9 +37,10 @@ request.
 ## First use
 
 1. Open Basiliskos. Its local proxy starts automatically.
-2. Choose **Claude**, **Codex**, or **Grok**, then select **Add account**.
+2. Choose **Claude**, **Codex**, **Grok**, or **Kimi**, then select **Add account**.
 3. Basiliskos opens the provider's validated HTTPS OAuth URL in your default
-   browser. Finish the official login there.
+   browser. Kimi also shows its one-time device code. Finish the official login
+   there.
 4. Basiliskos automatically opens its own isolated Claude window after an
    account is selected. You can also choose **Open Basiliskos Claude**.
 5. Use **Use account** whenever you want to change the backend underneath the
@@ -47,6 +48,11 @@ request.
 6. Choose the real **Model** and **Thinking** level in **Basiliskos route**.
    Basiliskos exposes only the thinking levels supported by that model; the
    control is disabled when the model manages thinking itself.
+7. The account list shows remaining usage for every supported provider,
+   including Kimi Code's weekly and rolling quota windows when Kimi returns
+   them. If a signed-in Kimi account has no Kimi Code subscription, the
+   account card shows **No active Kimi Code subscription** instead of a
+   misleading re-auth error.
 
 Basiliskos never applies its relay to `%LOCALAPPDATA%\Claude-3p`. Version 1.0.1
 also detects and restores a shared configuration left applied by version 1.0.0.
@@ -91,7 +97,7 @@ evidence. Windows will show `Unknown publisher` for unsigned installers.
 
 This fork is isolated from `../grok-hydra`; the original project remains
 unchanged. Basiliskos is MIT licensed and is not affiliated with Anthropic,
-OpenAI, xAI, or CLIProxyAPI.
+OpenAI, xAI, Moonshot AI, or CLIProxyAPI.
 
 ## Support
 

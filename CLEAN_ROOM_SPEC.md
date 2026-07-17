@@ -2,8 +2,8 @@
 
 ## Purpose
 
-Provide a local Windows desktop interface for selecting among Grok CLI
-profiles that the user owns or is authorized to use.
+Provide a local Windows desktop interface for selecting among authorized
+Claude, Codex, Grok, and Kimi provider profiles.
 
 ## Observable platform contract
 

@@ -5,7 +5,7 @@ Basiliskos is a fork of the committed `../grok-hydra` codebase. The original
 
 The product goal is a small Windows controller that keeps Claude Code Desktop
 as the user's working interface while switching its local gateway between
-Claude, Codex, and Grok accounts the user owns or is authorized to use.
+Claude, Codex, Grok, and Kimi accounts the user owns or is authorized to use.
 
 ## Boundaries
 

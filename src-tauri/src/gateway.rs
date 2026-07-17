@@ -39,10 +39,11 @@ const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const BASILISKOS_CONFIG_NAME: &str = "Basiliskos";
-const SUPPORTED_PROVIDERS: [&str; 3] = ["claude", "codex", "xai"];
+const SUPPORTED_PROVIDERS: [&str; 4] = ["claude", "codex", "xai", "kimi"];
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const XAI_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const KIMI_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 #[derive(Clone, Copy)]
 struct ModelSpec {
     id: &'static str,
@@ -165,6 +166,39 @@ const XAI_MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: "grok-composer-2.5-fast",
         label: "Grok Composer 2.5 Fast",
+        thinking_levels: &[],
+    },
+];
+
+const KIMI_MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        id: "kimi-k2.7-code",
+        label: "Kimi K2.7 Code",
+        thinking_levels: &["low", "medium", "high"],
+    },
+    ModelSpec {
+        id: "kimi-k2.7-code-highspeed",
+        label: "Kimi K2.7 Code HighSpeed",
+        thinking_levels: &["low", "medium", "high"],
+    },
+    ModelSpec {
+        id: "kimi-k2.6",
+        label: "Kimi K2.6",
+        thinking_levels: &["low", "medium", "high"],
+    },
+    ModelSpec {
+        id: "kimi-k2.5",
+        label: "Kimi K2.5",
+        thinking_levels: &["none", "low", "medium", "high"],
+    },
+    ModelSpec {
+        id: "kimi-k2-thinking",
+        label: "Kimi K2 Thinking",
+        thinking_levels: &["none", "low", "medium", "high"],
+    },
+    ModelSpec {
+        id: "kimi-k2",
+        label: "Kimi K2",
         thinking_levels: &[],
     },
 ];
@@ -414,6 +448,7 @@ fn model_specs(provider: &str) -> &'static [ModelSpec] {
         "claude" => CLAUDE_MODELS,
         "codex" => CODEX_MODELS,
         "xai" => XAI_MODELS,
+        "kimi" => KIMI_MODELS,
         _ => &[],
     }
 }
@@ -423,6 +458,7 @@ fn default_model(provider: &str) -> &'static str {
         "claude" => "claude-sonnet-4-5-20250929",
         "codex" => "gpt-5.5",
         "xai" => "grok-build-0.1",
+        "kimi" => "kimi-k2.7-code",
         _ => "",
     }
 }
@@ -511,6 +547,7 @@ fn provider_label(provider: &str) -> &'static str {
         "claude" => "Claude",
         "codex" => "Codex",
         "xai" => "Grok Build",
+        "kimi" => "Kimi Code",
         _ => "Unknown provider",
     }
 }
@@ -1282,10 +1319,20 @@ fn begin_upstream_request_with_timeouts(
 
 fn classify_upstream_status(status: u16) -> Option<ErrorCode> {
     match status {
-        401 | 403 => Some(ErrorCode::ProviderAuthFailed),
+        401 | 402 | 403 => Some(ErrorCode::ProviderAuthFailed),
         429 => Some(ErrorCode::ProviderRateLimited),
         500..=599 => Some(ErrorCode::UpstreamServerError),
         _ => None,
+    }
+}
+
+fn provider_auth_failure_message(provider: Option<&str>, status: u16) -> &'static str {
+    match (provider, status) {
+        (Some("kimi"), 402 | 403) => {
+            "This Kimi account has no active Kimi Code subscription."
+        }
+        (_, 401) => "The provider rejected the selected credential. Sign in again.",
+        _ => "The provider rejected the selected credential.",
     }
 }
 
@@ -1466,7 +1513,9 @@ fn handle_front_proxy_request(
                 "warning"
             },
             match code {
-                ErrorCode::ProviderAuthFailed => "The provider rejected the selected credential.",
+                ErrorCode::ProviderAuthFailed => {
+                    provider_auth_failure_message(provider_for_event.as_deref(), upstream_status)
+                }
                 ErrorCode::ProviderRateLimited => {
                     "The provider rate-limited the selected credential."
                 }
@@ -2215,6 +2264,7 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
             email.clone().unwrap_or_else(|| match provider.as_str() {
                 "xai" => "Grok account".into(),
                 "codex" => "Codex account".into(),
+                "kimi" => "Kimi account".into(),
                 _ => "Claude account".into(),
             })
         });
@@ -2472,6 +2522,98 @@ fn parse_xai_usage(value: &Value) -> Vec<GatewayUsageWindow> {
         .unwrap_or_default()
 }
 
+fn kimi_usage_percent(value: &Value) -> Option<f64> {
+    let limit = number_at(value, &["limit"])?;
+    if limit <= 0.0 {
+        return None;
+    }
+    let used = number_at(value, &["used"])
+        .or_else(|| number_at(value, &["remaining"]).map(|remaining| limit - remaining))?;
+    Some(used / limit * 100.0)
+}
+
+fn kimi_usage_label(item: &Value, detail: &Value, index: usize) -> String {
+    for value in [item, detail] {
+        for key in ["name", "title", "scope"] {
+            if let Some(label) = value
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|label| !label.is_empty())
+            {
+                return label.into();
+            }
+        }
+    }
+
+    let window = item.get("window").unwrap_or(item);
+    let duration = number_at(window, &["duration"])
+        .or_else(|| number_at(item, &["duration"]))
+        .or_else(|| number_at(detail, &["duration"]));
+    let time_unit = window
+        .get("timeUnit")
+        .or_else(|| item.get("timeUnit"))
+        .or_else(|| detail.get("timeUnit"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if let Some(duration) = duration {
+        let duration = duration as i64;
+        if time_unit.contains("MINUTE") {
+            return if duration >= 60 && duration % 60 == 0 {
+                format!("{}h", duration / 60)
+            } else {
+                format!("{duration}m")
+            };
+        }
+        if time_unit.contains("HOUR") {
+            return format!("{duration}h");
+        }
+        if time_unit.contains("DAY") {
+            return if duration == 7 {
+                "Week".into()
+            } else {
+                format!("{duration}d")
+            };
+        }
+    }
+    format!("Limit #{}", index + 1)
+}
+
+fn parse_kimi_usage(value: &Value) -> Vec<GatewayUsageWindow> {
+    let mut windows = Vec::new();
+    if let Some(summary) = value.get("usage") {
+        if let Some(used) = kimi_usage_percent(summary) {
+            let label = summary
+                .get("name")
+                .or_else(|| summary.get("title"))
+                .and_then(Value::as_str)
+                .filter(|label| !label.is_empty())
+                .unwrap_or("Week");
+            windows.push(usage_window(label, used));
+        }
+    }
+    if let Some(limits) = value.get("limits").and_then(Value::as_array) {
+        for (index, item) in limits.iter().enumerate() {
+            let detail = item
+                .get("detail")
+                .filter(|detail| detail.is_object())
+                .unwrap_or(item);
+            if let Some(used) = kimi_usage_percent(detail) {
+                windows.push(usage_window(&kimi_usage_label(item, detail, index), used));
+            }
+        }
+    }
+    windows
+}
+
+fn usage_http_error_message(provider: &str, status: reqwest::StatusCode) -> String {
+    match (provider, status.as_u16()) {
+        ("kimi", 402 | 403) => "No active Kimi Code subscription".into(),
+        ("kimi", 401) => "Sign in again to refresh usage".into(),
+        (_, 401 | 403) => "Sign in again to refresh usage".into(),
+        (_, code) => format!("Usage service returned {code}"),
+    }
+}
+
 async fn fetch_usage_json(
     provider: &str,
     token: &str,
@@ -2496,6 +2638,7 @@ async fn fetch_usage_json(
             }
         }
         "xai" => client.get(XAI_USAGE_URL).bearer_auth(token),
+        "kimi" => client.get(KIMI_USAGE_URL).bearer_auth(token),
         _ => return Err("Unsupported usage provider".into()),
     };
     request = request.header("Accept", "application/json");
@@ -2503,13 +2646,8 @@ async fn fetch_usage_json(
         .send()
         .await
         .map_err(|error| format!("Usage request failed: {error}"))?;
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED
-        || response.status() == reqwest::StatusCode::FORBIDDEN
-    {
-        return Err("Sign in again to refresh usage".into());
-    }
     if !response.status().is_success() {
-        return Err(format!("Usage service returned {}", response.status()));
+        return Err(usage_http_error_message(provider, response.status()));
     }
     response
         .json()
@@ -2541,6 +2679,7 @@ pub async fn get_gateway_account_usage(file_name: String) -> Result<GatewayAccou
         "claude" => parse_claude_usage(&usage),
         "codex" => parse_codex_usage(&usage),
         "xai" => parse_xai_usage(&usage),
+        "kimi" => parse_kimi_usage(&usage),
         _ => Vec::new(),
     };
     if windows.is_empty() {
@@ -2809,7 +2948,7 @@ pub fn set_gateway_route(
 ) -> Result<GatewaySnapshot, String> {
     let _mutation = mutation_lock()?;
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return Err("Provider must be claude, codex, or xai".into());
+        return Err("Provider must be claude, codex, xai, or kimi".into());
     }
     let Some(spec) = model_specs(&provider).iter().find(|spec| spec.id == model) else {
         return Err(format!("{model} is not an available {provider} model"));
@@ -2889,6 +3028,7 @@ pub fn remove_gateway_account(file_name: String) -> Result<GatewaySnapshot, Stri
 
 enum LoginOutput {
     Line(String),
+    Error(String),
     Eof,
 }
 
@@ -2904,6 +3044,10 @@ fn extract_login_url(provider: &str, line: &str) -> Option<String> {
             candidate.starts_with("https://accounts.x.ai/")
                 || candidate.starts_with("https://auth.x.ai/")
         }
+        "kimi" => {
+            candidate.starts_with("https://auth.kimi.com/")
+                || candidate.starts_with("https://www.kimi.com/")
+        }
         _ => false,
     };
     allowed.then(|| candidate.to_string())
@@ -2913,6 +3057,50 @@ fn extract_xai_user_code(line: &str) -> Option<String> {
     let (_, value) = line.split_once("Then enter this code:")?;
     let code = value.trim();
     (!code.is_empty()).then(|| code.to_string())
+}
+
+fn extract_kimi_user_code(line: &str) -> Option<String> {
+    let (_, value) = line.split_once("User code:")?;
+    let code = value.trim();
+    (!code.is_empty()).then(|| code.to_string())
+}
+
+fn login_authorization_ready(
+    provider: &str,
+    authorization_url: &Option<String>,
+    user_code: &Option<String>,
+    line: &str,
+) -> bool {
+    authorization_url.is_some()
+        && match provider {
+            "xai" => line.contains("Waiting for authorization"),
+            "kimi" => user_code.is_some() && line.contains("Waiting for authorization"),
+            _ => true,
+        }
+}
+
+fn login_stderr_failure_reason(provider: &str, line: &str) -> Option<String> {
+    let normalized = line.to_ascii_lowercase();
+    let provider_name = provider_label(provider);
+    let expected = format!("{} authentication failed", provider.to_ascii_lowercase());
+    if !normalized.contains(&expected) {
+        return None;
+    }
+    let detail = if normalized.contains("status 401") || normalized.contains("status 403") {
+        "rejected the device authorization request"
+    } else if normalized.contains("status 429") {
+        "is temporarily rate-limiting device authorization"
+    } else if normalized.contains("timeout")
+        || normalized.contains("connection")
+        || normalized.contains("request failed")
+    {
+        "could not be reached for device authorization"
+    } else {
+        "failed before device authorization could begin"
+    };
+    Some(format!(
+        "{provider_name} {detail}. Check your connection and try again."
+    ))
 }
 
 fn login_staging_root() -> Result<PathBuf, String> {
@@ -3213,16 +3401,21 @@ fn abort_login_start(
     );
 }
 
+fn provider_login_flag(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "claude" => Ok("-claude-login"),
+        "codex" => Ok("-codex-login"),
+        "xai" => Ok("-xai-login"),
+        "kimi" => Ok("-kimi-login"),
+        _ => Err("Provider must be claude, codex, xai, or kimi".into()),
+    }
+}
+
 fn launch_provider_login_blocking(
     app: AppHandle,
     provider: String,
 ) -> Result<ProviderLoginLaunch, String> {
-    let flag = match provider.as_str() {
-        "claude" => "-claude-login",
-        "codex" => "-codex-login",
-        "xai" => "-xai-login",
-        _ => return Err("Provider must be claude, codex, or xai".into()),
-    };
+    let flag = provider_login_flag(&provider)?;
     let session_id = Uuid::new_v4().simple().to_string();
     {
         let mut runtime = runtime_lock()?;
@@ -3288,6 +3481,8 @@ fn launch_provider_login_blocking(
         return Err(format!("Could not read {provider} login errors"));
     };
     let (output_tx, output_rx) = mpsc::channel();
+    let stderr_tx = output_tx.clone();
+    let stderr_provider = provider.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             let _ = output_tx.send(LoginOutput::Line(line));
@@ -3295,9 +3490,12 @@ fn launch_provider_login_blocking(
         let _ = output_tx.send(LoginOutput::Eof);
     });
     std::thread::spawn(move || {
-        for _ in BufReader::new(stderr).lines() {
-            // Keep the child process from blocking on a full stderr pipe. OAuth output is
-            // intentionally not persisted because it can contain short-lived login data.
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            // OAuth output is intentionally not persisted because it can contain short-lived
+            // login data. Only a fixed, sanitized failure category reaches the UI.
+            if let Some(reason) = login_stderr_failure_reason(&stderr_provider, &line) {
+                let _ = stderr_tx.send(LoginOutput::Error(reason));
+            }
         }
     });
 
@@ -3321,11 +3519,15 @@ fn launch_provider_login_blocking(
                 if authorization_url.is_none() {
                     authorization_url = extract_login_url(&provider, &line);
                 }
-                if provider == "xai" && user_code.is_none() {
-                    user_code = extract_xai_user_code(&line);
+                if user_code.is_none() {
+                    user_code = match provider.as_str() {
+                        "xai" => extract_xai_user_code(&line),
+                        "kimi" => extract_kimi_user_code(&line),
+                        _ => None,
+                    };
                 }
-                let ready = authorization_url.is_some()
-                    && (provider != "xai" || line.contains("Waiting for authorization"));
+                let ready =
+                    login_authorization_ready(&provider, &authorization_url, &user_code, &line);
                 if ready {
                     let authorization_url = authorization_url.expect("checked above");
                     let child = Arc::new(Mutex::new(child));
@@ -3373,6 +3575,10 @@ fn launch_provider_login_blocking(
                         user_code,
                     });
                 }
+            }
+            LoginOutput::Error(reason) => {
+                abort_login_start(&session_id, &staging_dir, Some(child), job, &provider);
+                return Err(reason);
             }
             LoginOutput::Eof => {
                 let status = child
@@ -4444,6 +4650,17 @@ mod tests {
             "config": {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY"}}
         }))
         .is_empty());
+
+        let kimi = parse_kimi_usage(&serde_json::json!({
+            "usage": {"limit": 1000, "remaining": 650},
+            "limits": [
+                {"name": "5h", "detail": {"limit": 200, "used": 50}},
+                {"window": {"duration": 7, "timeUnit": "DAY"}, "detail": {"limit": 500, "remaining": 100}}
+            ]
+        }));
+        assert_eq!(kimi[0], usage_window("Week", 35.0));
+        assert_eq!(kimi[1], usage_window("5h", 25.0));
+        assert_eq!(kimi[2], usage_window("Week", 80.0));
     }
 
     #[test]
@@ -5091,6 +5308,22 @@ mod tests {
             .as_deref(),
             Some("https://accounts.x.ai/oauth2/device?user_code=ABCD-1234")
         );
+        assert_eq!(
+            extract_login_url(
+                "kimi",
+                "Verification URL: https://auth.kimi.com/oauth/device?user_code=KIMI-1234"
+            )
+            .as_deref(),
+            Some("https://auth.kimi.com/oauth/device?user_code=KIMI-1234")
+        );
+        assert_eq!(
+            extract_login_url(
+                "kimi",
+                "Verification URL: https://www.kimi.com/code/device?user_code=KIMI-1234"
+            )
+            .as_deref(),
+            Some("https://www.kimi.com/code/device?user_code=KIMI-1234")
+        );
         assert!(extract_login_url("codex", "about:blank").is_none());
         assert!(extract_login_url(
             "codex",
@@ -5098,6 +5331,8 @@ mod tests {
         )
         .is_none());
         assert!(extract_login_url("codex", "http://auth.openai.com/oauth/authorize").is_none());
+        assert!(extract_login_url("kimi", "https://auth.kimi.com.evil.example/oauth").is_none());
+        assert!(extract_login_url("kimi", "https://www.kimi.com.evil.example/oauth").is_none());
     }
 
     #[test]
@@ -5107,6 +5342,61 @@ mod tests {
             Some("ABCD-1234")
         );
         assert!(extract_xai_user_code("Waiting for authorization...").is_none());
+    }
+
+    #[test]
+    fn kimi_device_login_waits_for_its_one_time_code() {
+        let authorization_url =
+            Some("https://auth.kimi.com/oauth/device?user_code=KIMI-1234".into());
+        assert_eq!(
+            extract_kimi_user_code("User code: KIMI-1234").as_deref(),
+            Some("KIMI-1234")
+        );
+        assert!(!login_authorization_ready(
+            "kimi",
+            &authorization_url,
+            &None,
+            "Waiting for authorization..."
+        ));
+        assert!(login_authorization_ready(
+            "kimi",
+            &authorization_url,
+            &Some("KIMI-1234".into()),
+            "Waiting for authorization..."
+        ));
+        assert!(!login_authorization_ready(
+            "kimi",
+            &authorization_url,
+            &Some("KIMI-1234".into()),
+            "User code: KIMI-1234"
+        ));
+    }
+
+    #[test]
+    fn login_stderr_failures_are_classified_without_preserving_provider_output() {
+        assert_eq!(
+            login_stderr_failure_reason(
+                "kimi",
+                "time=... level=error msg=\"Kimi authentication failed: kimi: device code request failed with status 403: response body\""
+            )
+            .as_deref(),
+            Some("Kimi Code rejected the device authorization request. Check your connection and try again.")
+        );
+        assert_eq!(
+            login_stderr_failure_reason(
+                "kimi",
+                "time=... level=error msg=\"Kimi authentication failed: kimi: device code request failed: connection timed out\""
+            )
+            .as_deref(),
+            Some("Kimi Code could not be reached for device authorization. Check your connection and try again.")
+        );
+        assert!(login_stderr_failure_reason("kimi", "User code: KIMI-1234").is_none());
+    }
+
+    #[test]
+    fn provider_login_flags_include_kimi_oauth() {
+        assert_eq!(provider_login_flag("kimi").unwrap(), "-kimi-login");
+        assert!(provider_login_flag("not-a-provider").is_err());
     }
 
     #[test]
@@ -5122,6 +5412,8 @@ mod tests {
         assert_eq!(normalized_route(&state, "codex").model, "gpt-5.5");
         assert_eq!(normalized_route(&state, "xai").model, "grok-build-0.1");
         assert_eq!(normalized_route(&state, "xai").thinking, "auto");
+        assert_eq!(normalized_route(&state, "kimi").model, "kimi-k2.7-code");
+        assert_eq!(normalized_route(&state, "kimi").thinking, "auto");
         assert_eq!(state.claude_window_icon, ClaudeWindowIcon::Black);
     }
 
@@ -5201,6 +5493,34 @@ mod tests {
     }
 
     #[test]
+    fn kimi_route_uses_the_selected_model_and_truthful_identity() {
+        let mut state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+        };
+        state.routes.insert(
+            "kimi".into(),
+            RouteSelection {
+                model: "kimi-k2.7-code".into(),
+                thinking: "high".into(),
+            },
+        );
+        let mut request = serde_json::json!({"model": "claude-sonnet-4-5"});
+        rewrite_claude_request(&mut request, &state, "kimi", true).unwrap();
+        assert_eq!(
+            request.get("model").and_then(Value::as_str),
+            Some("kimi-k2.7-code(high)")
+        );
+        let identity = request["system"][0]["text"].as_str().unwrap();
+        assert!(identity.contains("current upstream route is Kimi K2.7 Code via Kimi Code"));
+        assert_eq!(route_label(&state, Some("kimi")), "Kimi K2.7 Code");
+    }
+
+    #[test]
     fn relay_faults_have_stable_upstream_classifications() {
         assert_eq!(
             classify_upstream_status(401),
@@ -5215,6 +5535,26 @@ mod tests {
             Some(ErrorCode::UpstreamServerError)
         );
         assert_eq!(classify_upstream_status(200), None);
+        assert_eq!(
+            classify_upstream_status(402),
+            Some(ErrorCode::ProviderAuthFailed)
+        );
+        assert_eq!(
+            classify_upstream_status(403),
+            Some(ErrorCode::ProviderAuthFailed)
+        );
+        assert_eq!(
+            provider_auth_failure_message(Some("kimi"), 402),
+            "This Kimi account has no active Kimi Code subscription."
+        );
+        assert_eq!(
+            provider_auth_failure_message(Some("kimi"), 403),
+            "This Kimi account has no active Kimi Code subscription."
+        );
+        assert_eq!(
+            provider_auth_failure_message(Some("codex"), 403),
+            "The provider rejected the selected credential."
+        );
     }
 
     #[test]
@@ -5286,6 +5626,45 @@ mod tests {
         assert_eq!(MAX_RELAY_BODY_BYTES, 8 * 1024 * 1024);
         assert_eq!(MAX_RELAY_HEADERS, 64);
         assert_eq!(MAX_RELAY_HEADER_BYTES, 64 * 1024);
+    }
+
+    #[test]
+    fn kimi_usage_handles_missing_or_invalid_limits() {
+        assert!(parse_kimi_usage(&serde_json::json!({
+            "usage": {"limit": 0, "used": 1},
+            "limits": [{"detail": {"remaining": 1}}]
+        }))
+        .is_empty());
+        assert_eq!(
+            parse_kimi_usage(&serde_json::json!({
+                "limits": [{"window": {"duration": 300, "timeUnit": "MINUTE"}, "detail": {"limit": 100, "used": 10}}]
+            })),
+            vec![usage_window("5h", 10.0)]
+        );
+    }
+
+    #[test]
+    fn kimi_usage_errors_explain_missing_subscription() {
+        assert_eq!(
+            usage_http_error_message("kimi", reqwest::StatusCode::from_u16(402).unwrap()),
+            "No active Kimi Code subscription"
+        );
+        assert_eq!(
+            usage_http_error_message("kimi", reqwest::StatusCode::FORBIDDEN),
+            "No active Kimi Code subscription"
+        );
+        assert_eq!(
+            usage_http_error_message("kimi", reqwest::StatusCode::UNAUTHORIZED),
+            "Sign in again to refresh usage"
+        );
+        assert_eq!(
+            usage_http_error_message("codex", reqwest::StatusCode::FORBIDDEN),
+            "Sign in again to refresh usage"
+        );
+        assert_eq!(
+            usage_http_error_message("xai", reqwest::StatusCode::from_u16(500).unwrap()),
+            "Usage service returned 500"
+        );
     }
 
     #[test]

@@ -136,7 +136,7 @@ button.secondary:hover:not(:disabled) { border-color: rgba(238, 229, 207, 0.55);
 .usage-window.low progress { color: var(--accent-bright); accent-color: var(--accent-bright); }
 .usage-window.low progress::-webkit-progress-value { background: var(--accent-bright); }
 .usage-state { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 9.5px; }
-.usage-state.unavailable { color: #71838a; }
+.usage-state.unavailable { color: #71838a; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .empty-state { min-height: 166px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--muted); text-align: center; }
 .empty-state svg { margin-bottom: 8px; color: var(--choice); }
