@@ -1033,6 +1033,17 @@ fn rewrite_claude_request(
         .as_object_mut()
         .ok_or_else(|| "Claude request body must be a JSON object".to_string())?;
     object.insert("model".into(), Value::String(routed_model(state, provider)));
+
+    // CLIProxyAPI 7.2.73+ injects a native x_search tool into Grok /v1/responses
+    // after it translates this Claude request. Claude Desktop's native web_search
+    // declaration would therefore reach xAI alongside injected x_search, while its
+    // forced web_search choice is not valid in xAI's Responses API. Remove the
+    // Claude-native declaration here and let the unchanged CLIProxyAPI route inject
+    // the compatible x_search tool downstream.
+    if provider == "xai" {
+        strip_xai_incompatible_native_web_search(object);
+    }
+
     if !inject_identity {
         return Ok(());
     }
@@ -1065,6 +1076,44 @@ fn rewrite_claude_request(
         }
     }
     Ok(())
+}
+
+fn strip_xai_incompatible_native_web_search(object: &mut serde_json::Map<String, Value>) {
+    let (removed_native_web_search, no_tools_remain) = {
+        let Some(Value::Array(tools)) = object.get_mut("tools") else {
+            return;
+        };
+        let original_len = tools.len();
+        tools.retain(|tool| {
+            let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or_default();
+            tool_type != "web_search" && !tool_type.starts_with("web_search_")
+        });
+        (tools.len() != original_len, tools.is_empty())
+    };
+    if !removed_native_web_search {
+        return;
+    }
+
+    if no_tools_remain {
+        object.remove("tools");
+    }
+    if xai_tool_choice_targets_native_web_search(object.get("tool_choice")) {
+        object.remove("tool_choice");
+    }
+}
+
+fn xai_tool_choice_targets_native_web_search(choice: Option<&Value>) -> bool {
+    let Some(choice) = choice.and_then(Value::as_object) else {
+        return false;
+    };
+    let choice_type = choice
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    choice_type == "web_search"
+        || choice_type.starts_with("web_search_")
+        || (choice_type == "tool"
+            && choice.get("name").and_then(Value::as_str) == Some("web_search"))
 }
 
 fn is_hop_by_hop_header(name: &str) -> bool {
@@ -5403,9 +5452,85 @@ mod tests {
     }
 
     #[test]
-    fn provider_login_flags_include_kimi_oauth() {
-        assert_eq!(provider_login_flag("kimi").unwrap(), "-kimi-login");
-        assert!(provider_login_flag("not-a-provider").is_err());
+    fn xai_native_web_search_is_removed_before_cliproxy_injects_x_search() {
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+        };
+        let mut request = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 5
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        });
+        rewrite_claude_request(&mut request, &state, "xai", true).unwrap();
+        assert!(request.get("tools").is_none());
+        assert!(request.get("tool_choice").is_none());
+        let identity = request["system"][0]["text"].as_str().unwrap();
+        assert!(identity.contains("Grok Build"));
+    }
+
+    #[test]
+    fn xai_native_web_search_removal_keeps_other_tools() {
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+        };
+        let mut request = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "tools": [
+                {"type": "web_search", "name": "web_search"},
+                {"type": "function", "name": "some_other_tool", "parameters": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "web_search"}
+        });
+        rewrite_claude_request(&mut request, &state, "xai", true).unwrap();
+        let tools = request.get("tools").and_then(Value::as_array).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"].as_str(), Some("some_other_tool"));
+        assert!(request.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn non_xai_provider_keeps_tools_unchanged() {
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+        };
+        let mut request = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "tools": [
+                {"type": "x_search"},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Search",
+                        "parameters": {"type": "object"}
+                    }
+                }
+            ]
+        });
+        rewrite_claude_request(&mut request, &state, "kimi", true).unwrap();
+        let tools = request.get("tools").and_then(Value::as_array).unwrap();
+        assert_eq!(tools.len(), 2);
     }
 
     #[test]

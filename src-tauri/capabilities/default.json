@@ -18,7 +18,8 @@
         { "url": "https://accounts.x.ai/*" },
         { "url": "https://auth.x.ai/*" },
         { "url": "https://auth.kimi.com/*" },
-        { "url": "https://www.kimi.com/*" }
+        { "url": "https://www.kimi.com/*" },
+        { "url": "https://github.com/LuNexInc/basiliskos/releases/download/*" }
       ]
     }
   ]

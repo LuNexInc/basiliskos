@@ -5,8 +5,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AppWindow,
   AlertTriangle,
+  BellDot,
   Check,
   CircleStop,
+  Download,
   FolderOpen,
   LoaderCircle,
   LogIn,
@@ -117,6 +119,24 @@ type ProviderLoginLaunch = {
   userCode?: string;
 };
 
+type ReleaseAsset = {
+  name: string;
+  browser_download_url: string;
+};
+
+type Release = {
+  tagName: string;
+  name: string;
+  publishedAt: string;
+  body: string;
+  installerUrl?: string;
+};
+
+type AppView = "console" | "changes";
+
+const APP_VERSION = "1.1.16";
+const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
+
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },
   { id: "codex", label: "Codex", detail: "ChatGPT / Codex OAuth" },
@@ -140,6 +160,37 @@ function thinkingLabel(value: string) {
     ultra: "Ultra",
   };
   return labels[value] ?? value;
+}
+
+export function isNewerVersion(candidate: string, current: string) {
+  const parts = (value: string) => value.replace(/^v/i, "").split(".").map((part) => Number.parseInt(part, 10));
+  const candidateParts = parts(candidate);
+  const currentParts = parts(current);
+  if ([...candidateParts, ...currentParts].some((part) => Number.isNaN(part))) return false;
+  const length = Math.max(candidateParts.length, currentParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (candidateParts[index] ?? 0) - (currentParts[index] ?? 0);
+    if (difference !== 0) return difference > 0;
+  }
+  return false;
+}
+
+function parseReleases(payload: unknown): Release[] {
+  if (!Array.isArray(payload)) return [];
+  return payload.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    if (record.draft === true || record.prerelease === true || typeof record.tag_name !== "string") return [];
+    const assets = Array.isArray(record.assets) ? record.assets as ReleaseAsset[] : [];
+    const installerUrl = assets.find((asset) => asset?.name?.endsWith("_x64-setup.exe"))?.browser_download_url;
+    return [{
+      tagName: record.tag_name,
+      name: typeof record.name === "string" ? record.name : record.tag_name,
+      publishedAt: typeof record.published_at === "string" ? record.published_at : "",
+      body: typeof record.body === "string" ? record.body : "No release notes were provided.",
+      installerUrl,
+    }];
+  });
 }
 
 export function statusTone(status?: ComponentStatus) {
@@ -177,6 +228,10 @@ export default function App() {
   const [editingAccount, setEditingAccount] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [view, setView] = useState<AppView>("console");
+  const [releases, setReleases] = useState<Release[]>([]);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
   const handledLogin = useRef<string | null>(null);
 
   const refresh = useCallback(async (quiet = false) => {
@@ -194,6 +249,34 @@ export default function App() {
         setIsError(true);
       }
       return null;
+    }
+  }, []);
+
+  const checkForUpdates = useCallback(async (quiet = false) => {
+    setCheckingUpdates(true);
+    try {
+      const response = await fetch(RELEASES_URL, { headers: { Accept: "application/vnd.github+json" } });
+      if (!response.ok) throw new Error(`Update check failed (${response.status})`);
+      const next = parseReleases(await response.json());
+      setReleases(next);
+      setUpdateError(null);
+      const latest = next.find((release) => isNewerVersion(release.tagName, APP_VERSION));
+      if (latest && !quiet) {
+        setMessage(`${latest.name} is ready to download.`);
+        setIsError(false);
+      } else if (!quiet) {
+        setMessage("Basiliskos is up to date.");
+        setIsError(false);
+      }
+    } catch (error) {
+      const detail = messageFrom(error);
+      setUpdateError(detail);
+      if (!quiet) {
+        setMessage(detail);
+        setIsError(true);
+      }
+    } finally {
+      setCheckingUpdates(false);
     }
   }, []);
 
@@ -219,6 +302,10 @@ export default function App() {
       }
     })();
   }, []);
+
+  useEffect(() => {
+    void checkForUpdates(true);
+  }, [checkForUpdates]);
 
   useEffect(() => {
     const interval = window.setInterval(() => void refresh(true), 3000);
@@ -517,6 +604,27 @@ export default function App() {
     await getCurrentWindow().hide();
   }
 
+  async function downloadUpdate(release: Release) {
+    if (!release.installerUrl) {
+      setMessage(`No Windows installer is attached to ${release.name}.`);
+      setIsError(true);
+      return;
+    }
+    setBusy("download-update");
+    try {
+      await openUrl(release.installerUrl);
+      setMessage(`Downloading ${release.name}. Run the downloaded installer to update Basiliskos.`);
+      setIsError(false);
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const availableUpdate = releases.find((release) => isNewerVersion(release.tagName, APP_VERSION));
+
   return (
     <main className="app-shell">
       <header className="topbar" data-tauri-drag-region>
@@ -528,6 +636,11 @@ export default function App() {
           </div>
         </div>
         <div className="topbar-right">
+          {availableUpdate && (
+            <button className="update-indicator" onClick={() => setView("changes")} title={`${availableUpdate.name} is available`}>
+              <BellDot size={15} /> Update {availableUpdate.tagName.replace(/^v/i, "")} available
+            </button>
+          )}
           <div className="health-indicators" aria-label="Basiliskos health">
             <StatusBadge label="Relay" status={snapshot?.relay} />
             <StatusBadge label="Engine" status={snapshot?.backend} />
@@ -540,6 +653,12 @@ export default function App() {
         </div>
       </header>
 
+      <nav className="app-tabs" aria-label="Basiliskos sections">
+        <button className={view === "console" ? "selected" : ""} aria-current={view === "console" ? "page" : undefined} onClick={() => setView("console")}>Console</button>
+        <button className={view === "changes" ? "selected" : ""} aria-current={view === "changes" ? "page" : undefined} onClick={() => setView("changes")}>Changes{availableUpdate && <i aria-label="Update available" />}</button>
+      </nav>
+
+      {view === "console" ? <>
       <section className="hero" aria-label="Current connection">
         <div className="hero-watermark" aria-hidden="true" style={{ backgroundImage: `url(${brandArt})` }} />
         <div className="hero-copy">
@@ -674,8 +793,30 @@ export default function App() {
           </div>
         </section>
       )}
+      </> : (
+        <section className="changes-panel" aria-label="Basiliskos updates and changes">
+          <div className="changes-head">
+            <div><span className="zone-label">UPDATES</span><h2>{availableUpdate ? `${availableUpdate.name} is available` : "Basiliskos is up to date"}</h2><p>Current version {APP_VERSION}</p></div>
+            <div className="changes-actions">
+              <button onClick={() => void checkForUpdates()} disabled={checkingUpdates || busy !== null}>{checkingUpdates ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />} Check now</button>
+              {availableUpdate && <button className="primary" onClick={() => void downloadUpdate(availableUpdate)} disabled={busy !== null}><Download size={15} /> Download update</button>}
+            </div>
+          </div>
+          {updateError && <p className="update-error">Could not reach the update service: {updateError}</p>}
+          <div className="release-list">
+            {releases.length === 0 && !checkingUpdates && !updateError && <p className="no-events">No published releases found yet.</p>}
+            {releases.map((release) => (
+              <article className={`release-entry ${release === availableUpdate ? "available" : ""}`} key={release.tagName}>
+                <div className="release-heading"><div><h3>{release.name}</h3><p>{release.tagName} · {release.publishedAt ? new Date(release.publishedAt).toLocaleDateString() : "Published release"}</p></div>{release === availableUpdate && <span>New</span>}</div>
+                <p className="release-notes">{release.body}</p>
+                {release === availableUpdate && release.installerUrl && <button className="download-inline" onClick={() => void downloadUpdate(release)} disabled={busy !== null}><Download size={14} /> Download {release.tagName}</button>}
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
 
-      <footer><p className={isError ? "error-message" : ""} aria-live="polite" aria-atomic="true">{message} <button className="activity-link" onClick={() => setShowDiagnostics((current) => !current)}>Activity {showDiagnostics ? "▾" : "▸"}</button></p><span>Local only · CLIProxyAPI {snapshot?.version ?? "…"}</span></footer>
+      <footer><p className={isError ? "error-message" : ""} aria-live="polite" aria-atomic="true">{message} {view === "console" && <button className="activity-link" onClick={() => setShowDiagnostics((current) => !current)}>Activity {showDiagnostics ? "▾" : "▸"}</button>}</p><span>Basiliskos {APP_VERSION} · CLIProxyAPI {snapshot?.version ?? "…"}</span></footer>
     </main>
   );
 }

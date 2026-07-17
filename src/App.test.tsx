@@ -1,8 +1,13 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { DiagnosticEventList, StatusBadge } from "./App";
+import { DiagnosticEventList, isNewerVersion, StatusBadge } from "./App";
 
 describe("truthful Basiliskos status components", () => {
+  it("only advertises a numerically newer published version", () => {
+    expect(isNewerVersion("v1.1.16", "1.1.15")).toBe(true);
+    expect(isNewerVersion("v1.1.15", "1.1.15")).toBe(false);
+    expect(isNewerVersion("v1.1.9", "1.1.15")).toBe(false);
+  });
   it("renders a verified healthy backend as healthy", () => {
     render(<StatusBadge label="Engine" status={{ state: "healthy", detail: "Authenticated health check passed" }} />);
     expect(screen.getByText("Engine · healthy")).toHaveClass("healthy");
