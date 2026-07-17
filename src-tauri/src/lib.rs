@@ -78,6 +78,8 @@ pub fn run() {
             gateway::remove_gateway_account,
             gateway::launch_provider_login,
             gateway::cancel_provider_login,
+            gateway::set_skip_model_switch_confirmation,
+            gateway::latest_basiliskos_release,
             gateway::launch_hydra_claude,
             gateway::stop_hydra_claude
         ])

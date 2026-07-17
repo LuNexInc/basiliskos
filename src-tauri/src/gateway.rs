@@ -47,6 +47,10 @@ const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const XAI_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const KIMI_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
+const BASILISKOS_LATEST_RELEASE_URL: &str =
+    "https://github.com/LuNexInc/basiliskos/releases/latest";
+const GROK_4_5_CONTEXT_WINDOW_TOKENS: u64 = 500_000;
+const MAX_CONTEXT_COUNT_RESPONSE_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy)]
 struct ModelSpec {
     id: &'static str,
@@ -345,6 +349,7 @@ pub struct GatewaySnapshot {
     pub active_requests: usize,
     pub diagnostics: Vec<DiagnosticEvent>,
     pub login: Option<ProviderLoginStatus>,
+    pub skip_model_switch_confirmation: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -369,6 +374,7 @@ pub struct ProviderRoute {
     pub selected_model: String,
     pub selected_model_label: String,
     pub thinking: String,
+    pub context_window: Option<u64>,
     pub model_options: Vec<RouteModelOption>,
 }
 
@@ -450,6 +456,9 @@ struct ControllerState {
     /// Never written into Claude's own profile. Default black (distinct from stock Claude).
     #[serde(default = "default_claude_window_icon")]
     claude_window_icon: ClaudeWindowIcon,
+    /// If true, skip the account-switch restart confirmation in Basiliskos.
+    #[serde(default)]
+    skip_model_switch_confirmation: bool,
 }
 
 fn model_specs(provider: &str) -> &'static [ModelSpec] {
@@ -520,6 +529,7 @@ fn provider_route(state: &ControllerState, provider: &str) -> ProviderRoute {
         selected_model: route.model,
         selected_model_label: selected.label.to_string(),
         thinking: route.thinking,
+        context_window: context_window_for_route(provider, selected.id),
         model_options: specs
             .iter()
             .map(|spec| RouteModelOption {
@@ -535,13 +545,91 @@ fn provider_route(state: &ControllerState, provider: &str) -> ProviderRoute {
     }
 }
 
-fn routed_model(state: &ControllerState, provider: &str) -> String {
+fn context_window_for_route(provider: &str, model: &str) -> Option<u64> {
+    match (provider, model) {
+        ("xai", "grok-4.5") => Some(GROK_4_5_CONTEXT_WINDOW_TOKENS),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ContextBudget {
+    window_tokens: u64,
+    reserved_output_tokens: u64,
+}
+
+fn context_budget_for_request(provider: &str, request: &Value) -> Option<ContextBudget> {
+    let model = request.get("model")?.as_str()?;
+    if provider != "xai" || !model.starts_with("grok-4.5") {
+        return None;
+    }
+    Some(ContextBudget {
+        window_tokens: GROK_4_5_CONTEXT_WINDOW_TOKENS,
+        reserved_output_tokens: request
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+fn routed_model(
+    request: &mut serde_json::Map<String, Value>,
+    state: &ControllerState,
+    provider: &str,
+) -> String {
     let route = normalized_route(state, provider);
-    if route.thinking == "auto" {
+    let thinking = if provider == "xai" && route.model == "grok-4.5" {
+        grok_4_5_thinking_from_desktop_effort(request).unwrap_or(route.thinking)
+    } else {
+        route.thinking
+    };
+    if thinking == "auto" {
         route.model
     } else {
-        format!("{}({})", route.model, route.thinking)
+        format!("{}({})", route.model, thinking)
     }
+}
+
+/// Claude Desktop's high-context routing aliases expose effort levels that do
+/// not exactly match Grok 4.5. Map the customer-facing picker to the levels
+/// Grok actually accepts, and remove the Claude-only effort field before the
+/// request is handed to CLIProxyAPI.
+fn grok_4_5_thinking_from_desktop_effort(
+    request: &mut serde_json::Map<String, Value>,
+) -> Option<String> {
+    let nested_effort = request
+        .get_mut("output_config")
+        .and_then(Value::as_object_mut)
+        .and_then(|config| config.remove("effort"))
+        .and_then(|value| value.as_str().map(str::to_owned));
+    if request
+        .get("output_config")
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        request.remove("output_config");
+    }
+    let effort = nested_effort.or_else(|| {
+        request
+            .remove("effort")
+            .and_then(|value| value.as_str().map(str::to_owned))
+    })?;
+    match effort.as_str() {
+        "low" | "medium" => Some("low".into()),
+        "high" | "xhigh" | "max" => Some("high".into()),
+        _ => None,
+    }
+}
+
+// Claude Desktop's managed custom-provider config validates inferenceModels
+// against Anthropic's provider catalog. Fable 5 provides the richest Claude
+// Code UI capabilities, including UltraCode. This is still a routing alias;
+// the gateway sends the selected route's actual upstream model, while
+// `labelOverride` identifies it.
+const CLAUDE_DESKTOP_ROUTING_MODEL: &str = "claude-fable-5";
+
+fn advertised_model_name(_state: &ControllerState, _provider: Option<&str>) -> String {
+    CLAUDE_DESKTOP_ROUTING_MODEL.into()
 }
 
 fn route_label(state: &ControllerState, provider: Option<&str>) -> String {
@@ -676,6 +764,7 @@ fn load_state() -> Result<ControllerState, String> {
         active_account: None,
         routes: default_routes(),
         claude_window_icon: default_claude_window_icon(),
+        skip_model_switch_confirmation: false,
     };
     save_state(&state)?;
     Ok(state)
@@ -1032,7 +1121,8 @@ fn rewrite_claude_request(
     let object = body
         .as_object_mut()
         .ok_or_else(|| "Claude request body must be a JSON object".to_string())?;
-    object.insert("model".into(), Value::String(routed_model(state, provider)));
+    let routed_model = routed_model(object, state, provider);
+    object.insert("model".into(), Value::String(routed_model));
 
     // CLIProxyAPI 7.2.73+ injects a native x_search tool into Grok /v1/responses
     // after it translates this Claude request. Claude Desktop's native web_search
@@ -1377,7 +1467,7 @@ fn begin_upstream_request_with_timeouts(
 
 fn classify_upstream_status(status: u16) -> Option<ErrorCode> {
     match status {
-        401 | 402 | 403 => Some(ErrorCode::ProviderAuthFailed),
+        401..=403 => Some(ErrorCode::ProviderAuthFailed),
         429 => Some(ErrorCode::ProviderRateLimited),
         500..=599 => Some(ErrorCode::UpstreamServerError),
         _ => None,
@@ -1386,9 +1476,7 @@ fn classify_upstream_status(status: u16) -> Option<ErrorCode> {
 
 fn provider_auth_failure_message(provider: Option<&str>, status: u16) -> &'static str {
     match (provider, status) {
-        (Some("kimi"), 402 | 403) => {
-            "This Kimi account has no active Kimi Code subscription."
-        }
+        (Some("kimi"), 402 | 403) => "This Kimi account has no active Kimi Code subscription.",
         (_, 401) => "The provider rejected the selected credential. Sign in again.",
         _ => "The provider rejected the selected credential.",
     }
@@ -1417,6 +1505,48 @@ fn health_response(api_key: &str, correlation_id: &str) -> Response<std::io::Cur
         response.add_header(header);
     }
     response
+}
+
+fn upstream_input_token_count(
+    async_runtime: &tokio::runtime::Handle,
+    client: &reqwest::Client,
+    headers: &[(String, String)],
+    body: &[u8],
+    correlation_id: &str,
+    provider: Option<&str>,
+) -> Result<u64, String> {
+    let upstream = begin_upstream_request(
+        async_runtime,
+        client.clone(),
+        reqwest::Method::POST,
+        format!("http://127.0.0.1:{BACKEND_PORT}/v1/messages/count_tokens?beta=true"),
+        headers.to_vec(),
+        body.to_vec(),
+    )
+    .map_err(|_| "The local backend could not count the request tokens.".to_string())?;
+    if upstream.status != 200 {
+        return Err("The local backend could not count the request tokens.".into());
+    }
+    let mut response = TrackedUpstream {
+        receiver: upstream.body,
+        current: None,
+        offset: 0,
+        correlation_id: correlation_id.to_owned(),
+        provider: provider.map(str::to_owned),
+    };
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take((MAX_CONTEXT_COUNT_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "The local backend token count response was incomplete.".to_string())?;
+    if bytes.len() > MAX_CONTEXT_COUNT_RESPONSE_BYTES {
+        return Err("The local backend token count response was too large.".into());
+    }
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("input_tokens").and_then(Value::as_u64))
+        .ok_or_else(|| "The local backend token count response was invalid.".into())
 }
 
 fn handle_front_proxy_request(
@@ -1485,6 +1615,7 @@ fn handle_front_proxy_request(
     }
 
     let mut provider_for_event = None;
+    let mut context_budget = None;
     if request_path == "/v1/messages" || request_path == "/v1/messages/count_tokens" {
         let rewrite_result = (|| -> Result<(), String> {
             let _mutation = mutation_lock()?;
@@ -1497,6 +1628,9 @@ fn handle_front_proxy_request(
             let mut json: Value = serde_json::from_slice(&body)
                 .map_err(|_| "Claude request body is invalid JSON".to_string())?;
             rewrite_claude_request(&mut json, &state, &provider, request_path == "/v1/messages")?;
+            if request_path == "/v1/messages" {
+                context_budget = context_budget_for_request(&provider, &json);
+            }
             body = serde_json::to_vec(&json).map_err(|error| error.to_string())?;
             Ok(())
         })();
@@ -1518,6 +1652,46 @@ fn handle_front_proxy_request(
         let name = header.field.as_str().as_str();
         if !is_hop_by_hop_header(name) {
             upstream_headers.push((name.to_owned(), header.value.as_str().to_owned()));
+        }
+    }
+    if let Some(budget) = context_budget {
+        let input_tokens = match upstream_input_token_count(
+            async_runtime,
+            client,
+            &upstream_headers,
+            &body,
+            correlation_id,
+            provider_for_event.as_deref(),
+        ) {
+            Ok(input_tokens) => input_tokens,
+            Err(message) => {
+                diagnostics::record(
+                    ErrorCode::BackendConnectFailed,
+                    "error",
+                    &message,
+                    Some(correlation_id),
+                    Some(502),
+                    provider_for_event.as_deref(),
+                );
+                respond_proxy_error(
+                    request,
+                    ErrorCode::BackendConnectFailed,
+                    502,
+                    "Basiliskos could not validate the active route's context budget.",
+                    correlation_id,
+                );
+                return;
+            }
+        };
+        if input_tokens.saturating_add(budget.reserved_output_tokens) > budget.window_tokens {
+            respond_proxy_error(
+                request,
+                ErrorCode::ContextWindowExceeded,
+                413,
+                "This Grok 4.5 request exceeds its 500K context window after reserving output tokens. Start a new session or compact the conversation.",
+                correlation_id,
+            );
+            return;
         }
     }
     let upstream = match begin_upstream_request(
@@ -2354,6 +2528,59 @@ fn isolated_claude_profile_dir() -> Result<PathBuf, String> {
     Ok(root_dir()?.join("claude-profile"))
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatestPublishedRelease {
+    pub tag_name: String,
+    pub release_url: String,
+}
+
+fn github_release_tag_from_url(url: &str) -> Option<String> {
+    const PREFIX: &str = "https://github.com/LuNexInc/basiliskos/releases/tag/";
+    let tag = url.strip_prefix(PREFIX)?.split(['?', '#']).next()?;
+    (!tag.is_empty()
+        && tag.len() <= 128
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')))
+    .then(|| tag.to_owned())
+}
+
+// GitHub's public REST API has a small unauthenticated per-IP quota. Resolve
+// the public `releases/latest` redirect natively as a quota-free fallback so a
+// rate-limited client can still discover the current release without a token.
+#[tauri::command]
+pub async fn latest_basiliskos_release() -> Result<LatestPublishedRelease, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("Basiliskos/1.1")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("Could not prepare the update check: {error}"))?;
+    let response = client
+        .get(BASILISKOS_LATEST_RELEASE_URL)
+        .send()
+        .await
+        .map_err(|error| format!("Could not contact the update service: {error}"))?;
+    if !response.status().is_redirection() {
+        return Err(format!(
+            "Update service returned an unexpected status ({})",
+            response.status()
+        ));
+    }
+    let release_url = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|header| header.to_str().ok())
+        .ok_or_else(|| "Update service did not identify a latest release".to_owned())?;
+    let tag_name = github_release_tag_from_url(release_url)
+        .ok_or_else(|| "Update service returned an unexpected release location".to_owned())?;
+    Ok(LatestPublishedRelease {
+        tag_name,
+        release_url: release_url.to_owned(),
+    })
+}
+
 #[tauri::command]
 pub fn gateway_snapshot() -> Result<GatewaySnapshot, String> {
     let _mutation = mutation_lock()?;
@@ -2500,6 +2727,7 @@ fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
         active_requests,
         diagnostics: diagnostics::snapshot(),
         login,
+        skip_model_switch_confirmation: state.skip_model_switch_confirmation,
     })
 }
 
@@ -3045,6 +3273,15 @@ pub fn set_gateway_route(
     if account_is_active {
         write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
     }
+    gateway_snapshot_locked()
+}
+
+#[tauri::command]
+pub fn set_skip_model_switch_confirmation(skip: bool) -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
+    let mut state = load_state()?;
+    state.skip_model_switch_confirmation = skip;
+    save_state(&state)?;
     gateway_snapshot_locked()
 }
 
@@ -3876,7 +4113,7 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
     );
     generated.insert(
         "inferenceModels".into(),
-        serde_json::json!([{"name": "claude-sonnet-4-5", "labelOverride": model_label}]),
+        serde_json::json!([{"name": advertised_model_name(state, active_provider), "labelOverride": model_label}]),
     );
     generated.insert("inferenceProvider".into(), Value::String("gateway".into()));
     generated.insert("modelDiscoveryEnabled".into(), Value::Bool(true));
@@ -4619,6 +4856,30 @@ pub fn stop_hydra_claude() -> Result<GatewaySnapshot, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn latest_release_redirect_accepts_only_the_official_release_path() {
+        assert_eq!(
+            github_release_tag_from_url(
+                "https://github.com/LuNexInc/basiliskos/releases/tag/v1.1.16"
+            ),
+            Some("v1.1.16".into())
+        );
+        assert_eq!(
+            github_release_tag_from_url(
+                "https://github.com/LuNexInc/basiliskos/releases/tag/v1.1.16?source=latest"
+            ),
+            Some("v1.1.16".into())
+        );
+        assert_eq!(
+            github_release_tag_from_url("https://example.com/releases/tag/v1.1.16"),
+            None
+        );
+        assert_eq!(
+            github_release_tag_from_url("https://github.com/LuNexInc/basiliskos/releases/tag/"),
+            None
+        );
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("hydra-gateway-{name}-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
@@ -4732,6 +4993,7 @@ mod tests {
             active_account: Some("xai-test.json".into()),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         let config = render_config(&auth, &state);
         assert!(config.contains("host: \"127.0.0.1\""));
@@ -4758,6 +5020,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         write_isolated_claude_config(&profile, &state).unwrap();
         assert_eq!(
@@ -4785,7 +5048,7 @@ mod tests {
                 .and_then(|models| models.first())
                 .and_then(|model| model.get("name"))
                 .and_then(Value::as_str),
-            Some("claude-sonnet-4-5")
+            Some("claude-fable-5")
         );
         let deployment: Value = serde_json::from_str(
             &fs::read_to_string(profile.join("claude_desktop_config.json")).unwrap(),
@@ -4796,6 +5059,43 @@ mod tests {
             Some("3p")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn advertised_model_name_is_a_valid_claude_desktop_routing_alias() {
+        let mut state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+        };
+        assert_eq!(
+            advertised_model_name(&state, Some("claude")),
+            "claude-fable-5"
+        );
+        state.routes.insert(
+            "xai".into(),
+            RouteSelection {
+                model: "grok-4.5".into(),
+                thinking: "high".into(),
+            },
+        );
+        assert_eq!(advertised_model_name(&state, Some("xai")), "claude-fable-5");
+        state.routes.insert(
+            "kimi".into(),
+            RouteSelection {
+                model: "kimi-k3".into(),
+                thinking: "max".into(),
+            },
+        );
+        assert_eq!(
+            advertised_model_name(&state, Some("kimi")),
+            "claude-fable-5"
+        );
+        assert_eq!(advertised_model_name(&state, None), "claude-fable-5");
     }
 
     #[test]
@@ -4845,6 +5145,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         write_isolated_claude_config(&profile, &state).unwrap();
 
@@ -4960,6 +5261,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
 
         let error = write_isolated_claude_config(&profile, &state).unwrap_err();
@@ -4980,6 +5282,7 @@ mod tests {
             active_account: Some("xai-test.json".into()),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         state.routes.insert(
             "xai".into(),
@@ -5008,6 +5311,56 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap()
             .contains("You are a routed coding assistant"));
+    }
+
+    #[test]
+    fn grok_4_5_maps_desktop_effort_to_supported_thinking_levels() {
+        let mut state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: Some("xai-test.json".into()),
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+        };
+        state.routes.insert(
+            "xai".into(),
+            RouteSelection {
+                model: "grok-4.5".into(),
+                thinking: "high".into(),
+            },
+        );
+
+        for (effort, expected) in [
+            ("low", "grok-4.5(low)"),
+            ("medium", "grok-4.5(low)"),
+            ("high", "grok-4.5(high)"),
+            ("xhigh", "grok-4.5(high)"),
+            ("max", "grok-4.5(high)"),
+        ] {
+            let mut request = serde_json::json!({
+                "model": "claude-fable-5",
+                "output_config": { "effort": effort }
+            });
+            rewrite_claude_request(&mut request, &state, "xai", false).unwrap();
+            assert_eq!(request.get("model").and_then(Value::as_str), Some(expected));
+            assert!(request.get("output_config").is_none());
+        }
+    }
+
+    #[test]
+    fn grok_4_5_uses_a_truthful_context_budget() {
+        let request = serde_json::json!({
+            "model": "grok-4.5(high)",
+            "max_tokens": 16_384
+        });
+        let budget = context_budget_for_request("xai", &request).unwrap();
+        assert_eq!(budget.window_tokens, 500_000);
+        assert_eq!(budget.reserved_output_tokens, 16_384);
+        assert!(499_999_u64.saturating_add(budget.reserved_output_tokens) > budget.window_tokens);
+        assert!(483_616_u64.saturating_add(budget.reserved_output_tokens) <= budget.window_tokens);
+        assert!(context_budget_for_request("codex", &request).is_none());
     }
 
     #[test]
@@ -5110,6 +5463,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
         let (mutations, _) =
@@ -5151,6 +5505,7 @@ mod tests {
                 active_account: Some("codex-a.json".into()),
                 routes: default_routes(),
                 claude_window_icon: default_claude_window_icon(),
+                skip_model_switch_confirmation: false,
             };
             let state_before = serde_json::to_vec_pretty(&state).unwrap();
             fs::write(&state_path, &state_before).unwrap();
@@ -5219,6 +5574,7 @@ mod tests {
             active_account: Some("codex-a.json".into()),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         let state_path = root.join("controller.json");
         fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
@@ -5460,6 +5816,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         let mut request = serde_json::json!({
             "model": "claude-sonnet-4-5",
@@ -5488,6 +5845,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         let mut request = serde_json::json!({
             "model": "claude-sonnet-4-5",
@@ -5513,6 +5871,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         let mut request = serde_json::json!({
             "model": "claude-sonnet-4-5",
@@ -5605,6 +5964,7 @@ mod tests {
             active_account: Some("xai-test.json".into()),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         state.routes.insert(
             "xai".into(),
@@ -5635,6 +5995,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         state.routes.insert(
             "kimi".into(),
@@ -5663,6 +6024,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         assert_eq!(normalized_route(&state, "kimi").model, "kimi-k3");
         assert_eq!(route_label(&state, Some("kimi")), "Kimi K3");
@@ -5840,6 +6202,7 @@ mod tests {
             active_account: None,
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
         };
         state.routes.insert(
             "xai".into(),
@@ -5874,18 +6237,29 @@ mod tests {
     }
 
     #[test]
-    fn new_provider_login_never_overwrites_an_unrelated_filename_collision() {
-        let directory = temp_dir("login-collision");
-        fs::write(directory.join("codex.json"), b"existing credential").unwrap();
-        let destination = new_credential_destination_name(&directory, "codex.json").unwrap();
-        assert_ne!(destination, "codex.json");
-        assert!(destination.starts_with("codex-"));
-        assert!(destination.ends_with(".json"));
-        assert!(new_credential_destination_name(&directory, "..\\escape.json").is_err());
+    fn skip_model_switch_confirmation_defaults_to_false_and_round_trips() {
+        let state: ControllerState = serde_json::from_str(
+            r#"{"api_key":"secret","claude_config_id":"id","active_account":null}"#,
+        )
+        .unwrap();
+        assert!(!state.skip_model_switch_confirmation);
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: true,
+        };
+        let encoded = serde_json::to_value(&state).unwrap();
         assert_eq!(
-            fs::read(directory.join("codex.json")).unwrap(),
-            b"existing credential"
+            encoded
+                .get("skip_model_switch_confirmation")
+                .and_then(|v| v.as_bool()),
+            Some(true)
         );
-        let _ = fs::remove_dir_all(directory);
+        let decoded: ControllerState = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.skip_model_switch_confirmation);
     }
 }

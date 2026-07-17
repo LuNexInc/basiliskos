@@ -25,6 +25,7 @@ pub enum ErrorCode {
     MidstreamIdleTimeout,
     ClientCancelled,
     ModelFallback,
+    ContextWindowExceeded,
     LoginFailed,
     LoginCancelled,
     ClaudeExited,
@@ -50,6 +51,7 @@ impl ErrorCode {
             Self::MidstreamIdleTimeout => "BAS-UPSTREAM-005",
             Self::ClientCancelled => "BAS-CLIENT-001",
             Self::ModelFallback => "BAS-ROUTE-001",
+            Self::ContextWindowExceeded => "BAS-ROUTE-002",
             Self::LoginFailed => "BAS-AUTH-001",
             Self::LoginCancelled => "BAS-AUTH-002",
             Self::ClaudeExited => "BAS-CLAUDE-001",
@@ -120,6 +122,7 @@ mod tests {
         assert_eq!(ErrorCode::BackendExited.as_str(), "BAS-BACKEND-002");
         assert_eq!(ErrorCode::ProviderRateLimited.as_str(), "BAS-UPSTREAM-002");
         assert_eq!(ErrorCode::ClientCancelled.as_str(), "BAS-CLIENT-001");
+        assert_eq!(ErrorCode::ContextWindowExceeded.as_str(), "BAS-ROUTE-002");
     }
 
     #[test]

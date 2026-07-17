@@ -73,6 +73,7 @@ type Snapshot = {
   activeRequests: number;
   diagnostics: DiagnosticEvent[];
   login?: ProviderLoginStatus;
+  skipModelSwitchConfirmation: boolean;
 };
 
 export type ComponentStatus = {
@@ -110,6 +111,7 @@ type ProviderRoute = {
   selectedModel: string;
   selectedModelLabel: string;
   thinking: string;
+  contextWindow?: number;
   modelOptions: RouteModelOption[];
 };
 
@@ -130,11 +132,17 @@ type Release = {
   publishedAt: string;
   body: string;
   installerUrl?: string;
+  releaseUrl?: string;
+};
+
+type LatestPublishedRelease = {
+  tagName: string;
+  releaseUrl: string;
 };
 
 type AppView = "console" | "changes";
 
-const APP_VERSION = "1.1.16";
+const APP_VERSION = "1.1.17";
 const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
@@ -160,6 +168,11 @@ function thinkingLabel(value: string) {
     ultra: "Ultra",
   };
   return labels[value] ?? value;
+}
+
+function contextWindowLabel(tokens?: number) {
+  if (!tokens) return null;
+  return `${Math.round(tokens / 1000)}K context`;
 }
 
 export function isNewerVersion(candidate: string, current: string) {
@@ -233,6 +246,11 @@ export default function App() {
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const handledLogin = useRef<string | null>(null);
+  const [accountSwitchConfirm, setAccountSwitchConfirm] = useState<{
+    open: boolean;
+    account: Account | null;
+    dontShowAgain: boolean;
+  }>({ open: false, account: null, dontShowAgain: false });
 
   const refresh = useCallback(async (quiet = false) => {
     try {
@@ -256,8 +274,15 @@ export default function App() {
     setCheckingUpdates(true);
     try {
       const response = await fetch(RELEASES_URL, { headers: { Accept: "application/vnd.github+json" } });
-      if (!response.ok) throw new Error(`Update check failed (${response.status})`);
-      const next = parseReleases(await response.json());
+      const next = response.ok
+        ? parseReleases(await response.json())
+        : await invoke<LatestPublishedRelease>("latest_basiliskos_release").then((release) => [{
+          tagName: release.tagName,
+          name: `Basiliskos ${release.tagName}`,
+          publishedAt: "",
+          body: "Release details are available on GitHub.",
+          releaseUrl: release.releaseUrl,
+        }]);
       setReleases(next);
       setUpdateError(null);
       const latest = next.find((release) => isNewerVersion(release.tagName, APP_VERSION));
@@ -407,15 +432,19 @@ export default function App() {
   }
 
   async function selectAccount(account: Account) {
+    const restartClaude = snapshot?.claudeRunning === true;
     setBusy(account.fileName);
     try {
-      const next = await invoke<Snapshot>("select_gateway_account", {
+      let next = await invoke<Snapshot>("select_gateway_account", {
         fileName: account.fileName,
       });
-      const launched = next.claudeRunning
-        ? next
-        : await invoke<Snapshot>("launch_hydra_claude");
-      setSnapshot(launched);
+      if (restartClaude) {
+        await invoke<Snapshot>("stop_hydra_claude");
+        next = await invoke<Snapshot>("launch_hydra_claude");
+      } else if (!next.claudeRunning) {
+        next = await invoke<Snapshot>("launch_hydra_claude");
+      }
+      setSnapshot(next);
       setMessage(`${account.label} is now serving the separate Basiliskos Claude window`);
       setIsError(false);
     } catch (error) {
@@ -516,6 +545,34 @@ export default function App() {
     void updateRoute(model, nextThinking);
   }
 
+  function requestAccountSelection(account: Account) {
+    if (snapshot?.claudeRunning && !snapshot.skipModelSwitchConfirmation) {
+      setAccountSwitchConfirm({ open: true, account, dontShowAgain: false });
+      return;
+    }
+    void selectAccount(account);
+  }
+
+  async function confirmAccountSwitch() {
+    const { account, dontShowAgain } = accountSwitchConfirm;
+    setAccountSwitchConfirm((prev) => ({ ...prev, open: false }));
+    if (!account) return;
+    if (dontShowAgain) {
+      try {
+        setSnapshot(await invoke<Snapshot>("set_skip_model_switch_confirmation", { skip: true }));
+      } catch (error) {
+        setMessage(messageFrom(error));
+        setIsError(true);
+        return;
+      }
+    }
+    void selectAccount(account);
+  }
+
+  function cancelAccountSwitch() {
+    setAccountSwitchConfirm((prev) => ({ ...prev, open: false }));
+  }
+
   async function addAccount() {
     setBusy("login");
     try {
@@ -605,15 +662,18 @@ export default function App() {
   }
 
   async function downloadUpdate(release: Release) {
-    if (!release.installerUrl) {
+    const destination = release.installerUrl ?? release.releaseUrl;
+    if (!destination) {
       setMessage(`No Windows installer is attached to ${release.name}.`);
       setIsError(true);
       return;
     }
     setBusy("download-update");
     try {
-      await openUrl(release.installerUrl);
-      setMessage(`Downloading ${release.name}. Run the downloaded installer to update Basiliskos.`);
+      await openUrl(destination);
+      setMessage(release.installerUrl
+        ? `Downloading ${release.name}. Run the downloaded installer to update Basiliskos.`
+        : `Opened ${release.name} on GitHub. Download the Windows installer from that release.`);
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -666,7 +726,7 @@ export default function App() {
           <h2>{active && activeRoute ? activeRoute.selectedModelLabel : "No account selected"}</h2>
           <p>
             {active && activeRoute
-              ? `${PROVIDERS.find((item) => item.id === active.provider)?.label} · ${active.label} · Thinking ${thinkingLabel(activeRoute.thinking)}`
+              ? `${PROVIDERS.find((item) => item.id === active.provider)?.label} · ${active.label} · Thinking ${thinkingLabel(activeRoute.thinking)}${contextWindowLabel(activeRoute.contextWindow) ? ` · ${contextWindowLabel(activeRoute.contextWindow)}` : ""}`
               : "Add an account, then choose Use account."}
           </p>
         </div>
@@ -747,7 +807,7 @@ export default function App() {
                     </div>
                   </div>
                   <div className="account-actions">
-                    {!account.active && <button className="use-button" onClick={() => void selectAccount(account)} disabled={busy !== null}>{busy === account.fileName ? <LoaderCircle className="spin" size={15} /> : <Power size={15} />} Use account</button>}
+                    {!account.active && <button className="use-button" onClick={() => requestAccountSelection(account)} disabled={busy !== null}>{busy === account.fileName ? <LoaderCircle className="spin" size={15} /> : <Power size={15} />} Use account</button>}
                     {!isEditing && <button className="icon-button" aria-label={`Rename ${account.label}`} title={`Rename ${account.label}`} onClick={() => beginRename(account)} disabled={busy !== null}><Pencil size={15} /></button>}
                     <button className="icon-button danger" aria-label={`Remove ${account.label}`} title={`Remove ${account.label}`} onClick={() => void removeAccount(account)} disabled={busy !== null}><Trash2 size={16} /></button>
                   </div>
@@ -809,11 +869,32 @@ export default function App() {
               <article className={`release-entry ${release === availableUpdate ? "available" : ""}`} key={release.tagName}>
                 <div className="release-heading"><div><h3>{release.name}</h3><p>{release.tagName} · {release.publishedAt ? new Date(release.publishedAt).toLocaleDateString() : "Published release"}</p></div>{release === availableUpdate && <span>New</span>}</div>
                 <p className="release-notes">{release.body}</p>
-                {release === availableUpdate && release.installerUrl && <button className="download-inline" onClick={() => void downloadUpdate(release)} disabled={busy !== null}><Download size={14} /> Download {release.tagName}</button>}
+                {release === availableUpdate && (release.installerUrl || release.releaseUrl) && <button className="download-inline" onClick={() => void downloadUpdate(release)} disabled={busy !== null}><Download size={14} /> {release.installerUrl ? `Download ${release.tagName}` : `View ${release.tagName}`}</button>}
               </article>
             ))}
           </div>
         </section>
+      )}
+
+      {accountSwitchConfirm.open && (
+        <div className="modal-backdrop" role="presentation" onClick={cancelAccountSwitch}>
+          <div className="modal" role="alertdialog" aria-modal="true" aria-labelledby="account-switch-title" onClick={(event) => event.stopPropagation()}>
+            <h3 id="account-switch-title">Switch account?</h3>
+            <p>This will close and reopen the Basiliskos Claude window. Any in-progress request in that window will be interrupted.</p>
+            <label className="modal-checkbox">
+              <input
+                type="checkbox"
+                checked={accountSwitchConfirm.dontShowAgain}
+                onChange={(event) => setAccountSwitchConfirm((prev) => ({ ...prev, dontShowAgain: event.target.checked }))}
+              />
+              <span>Don't show again</span>
+            </label>
+            <div className="modal-actions">
+              <button onClick={cancelAccountSwitch}>Cancel</button>
+              <button className="primary" onClick={() => void confirmAccountSwitch()}>Continue</button>
+            </div>
+          </div>
+        </div>
       )}
 
       <footer><p className={isError ? "error-message" : ""} aria-live="polite" aria-atomic="true">{message} {view === "console" && <button className="activity-link" onClick={() => setShowDiagnostics((current) => !current)}>Activity {showDiagnostics ? "▾" : "▸"}</button>}</p><span>Basiliskos {APP_VERSION} · CLIProxyAPI {snapshot?.version ?? "…"}</span></footer>
