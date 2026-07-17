@@ -140,9 +140,15 @@ type LatestPublishedRelease = {
   releaseUrl: string;
 };
 
+type PreparedBasiliskosUpdate = {
+  token: string;
+  tagName: string;
+  installerName: string;
+};
+
 type AppView = "console" | "changes";
 
-const APP_VERSION = "1.1.17";
+const APP_VERSION = "1.1.18";
 const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
@@ -245,6 +251,7 @@ export default function App() {
   const [releases, setReleases] = useState<Release[]>([]);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [preparedUpdate, setPreparedUpdate] = useState<PreparedBasiliskosUpdate | null>(null);
   const handledLogin = useRef<string | null>(null);
   const [accountSwitchConfirm, setAccountSwitchConfirm] = useState<{
     open: boolean;
@@ -662,23 +669,28 @@ export default function App() {
   }
 
   async function downloadUpdate(release: Release) {
-    const destination = release.installerUrl ?? release.releaseUrl;
-    if (!destination) {
-      setMessage(`No Windows installer is attached to ${release.name}.`);
-      setIsError(true);
-      return;
-    }
     setBusy("download-update");
     try {
-      await openUrl(destination);
-      setMessage(release.installerUrl
-        ? `Downloading ${release.name}. Run the downloaded installer to update Basiliskos.`
-        : `Opened ${release.name} on GitHub. Download the Windows installer from that release.`);
+      const prepared = await invoke<PreparedBasiliskosUpdate>("prepare_basiliskos_update", { tagName: release.tagName });
+      setPreparedUpdate(prepared);
+      setMessage(`${prepared.tagName} was downloaded and its SHA-256 checksum was verified.`);
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
       setIsError(true);
     } finally {
+      setBusy(null);
+    }
+  }
+
+  async function confirmUpdateInstall() {
+    if (!preparedUpdate) return;
+    setBusy("install-update");
+    try {
+      await invoke("install_basiliskos_update", { token: preparedUpdate.token });
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
       setBusy(null);
     }
   }
@@ -859,7 +871,7 @@ export default function App() {
             <div><span className="zone-label">UPDATES</span><h2>{availableUpdate ? `${availableUpdate.name} is available` : "Basiliskos is up to date"}</h2><p>Current version {APP_VERSION}</p></div>
             <div className="changes-actions">
               <button onClick={() => void checkForUpdates()} disabled={checkingUpdates || busy !== null}>{checkingUpdates ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />} Check now</button>
-              {availableUpdate && <button className="primary" onClick={() => void downloadUpdate(availableUpdate)} disabled={busy !== null}><Download size={15} /> Download update</button>}
+              {availableUpdate && <button className="primary" onClick={() => void downloadUpdate(availableUpdate)} disabled={busy !== null}><Download size={15} /> Install update</button>}
             </div>
           </div>
           {updateError && <p className="update-error">Could not reach the update service: {updateError}</p>}
@@ -869,7 +881,7 @@ export default function App() {
               <article className={`release-entry ${release === availableUpdate ? "available" : ""}`} key={release.tagName}>
                 <div className="release-heading"><div><h3>{release.name}</h3><p>{release.tagName} · {release.publishedAt ? new Date(release.publishedAt).toLocaleDateString() : "Published release"}</p></div>{release === availableUpdate && <span>New</span>}</div>
                 <p className="release-notes">{release.body}</p>
-                {release === availableUpdate && (release.installerUrl || release.releaseUrl) && <button className="download-inline" onClick={() => void downloadUpdate(release)} disabled={busy !== null}><Download size={14} /> {release.installerUrl ? `Download ${release.tagName}` : `View ${release.tagName}`}</button>}
+                {release === availableUpdate && <button className="download-inline" onClick={() => void downloadUpdate(release)} disabled={busy !== null}><Download size={14} /> Install ${release.tagName}</button>}
               </article>
             ))}
           </div>
@@ -892,6 +904,19 @@ export default function App() {
             <div className="modal-actions">
               <button onClick={cancelAccountSwitch}>Cancel</button>
               <button className="primary" onClick={() => void confirmAccountSwitch()}>Continue</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {preparedUpdate && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setPreparedUpdate(null)}>
+          <div className="modal" role="alertdialog" aria-modal="true" aria-labelledby="update-install-title" onClick={(event) => event.stopPropagation()}>
+            <h3 id="update-install-title">Install {preparedUpdate.tagName}?</h3>
+            <p>{preparedUpdate.installerName} was downloaded and its SHA-256 checksum matched the published release manifest. Basiliskos will close, then Windows will open the normal installer.</p>
+            <div className="modal-actions">
+              <button onClick={() => setPreparedUpdate(null)} disabled={busy === "install-update"}>Cancel</button>
+              <button className="primary" onClick={() => void confirmUpdateInstall()} disabled={busy === "install-update"}>{busy === "install-update" ? "Launching…" : "Install and close"}</button>
             </div>
           </div>
         </div>

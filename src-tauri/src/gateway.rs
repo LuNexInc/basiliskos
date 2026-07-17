@@ -49,6 +49,10 @@ const XAI_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=c
 const KIMI_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 const BASILISKOS_LATEST_RELEASE_URL: &str =
     "https://github.com/LuNexInc/basiliskos/releases/latest";
+const BASILISKOS_RELEASE_DOWNLOAD_BASE: &str =
+    "https://github.com/LuNexInc/basiliskos/releases/download";
+const MAX_RELEASE_MANIFEST_BYTES: usize = 128 * 1024;
+const MAX_RELEASE_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 const GROK_4_5_CONTEXT_WINDOW_TOKENS: u64 = 500_000;
 const MAX_CONTEXT_COUNT_RESPONSE_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy)]
@@ -298,6 +302,7 @@ struct ControllerManager {
 }
 
 static CONTROLLER: OnceLock<ControllerManager> = OnceLock::new();
+static PREPARED_UPDATE_INSTALLERS: OnceLock<Mutex<BTreeMap<String, PathBuf>>> = OnceLock::new();
 
 fn controller() -> &'static ControllerManager {
     CONTROLLER.get_or_init(ControllerManager::default)
@@ -2535,15 +2540,147 @@ pub struct LatestPublishedRelease {
     pub release_url: String,
 }
 
-fn github_release_tag_from_url(url: &str) -> Option<String> {
-    const PREFIX: &str = "https://github.com/LuNexInc/basiliskos/releases/tag/";
-    let tag = url.strip_prefix(PREFIX)?.split(['?', '#']).next()?;
-    (!tag.is_empty()
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedBasiliskosUpdate {
+    pub token: String,
+    pub tag_name: String,
+    pub installer_name: String,
+}
+
+fn valid_release_tag(tag: &str) -> bool {
+    !tag.is_empty()
         && tag.len() <= 128
         && tag
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')))
-    .then(|| tag.to_owned())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn github_release_tag_from_url(url: &str) -> Option<String> {
+    const PREFIX: &str = "https://github.com/LuNexInc/basiliskos/releases/tag/";
+    let tag = url.strip_prefix(PREFIX)?.split(['?', '#']).next()?;
+    valid_release_tag(tag).then(|| tag.to_owned())
+}
+
+fn release_installer_name(tag: &str) -> Result<String, String> {
+    if !valid_release_tag(tag) {
+        return Err("The update service returned an invalid release tag.".to_owned());
+    }
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    if version.is_empty() {
+        return Err("The update service returned an invalid release tag.".to_owned());
+    }
+    Ok(format!("Basiliskos_{version}_x64-setup.exe"))
+}
+
+fn release_download_url(tag: &str, asset_name: &str) -> Result<String, String> {
+    if !valid_release_tag(tag)
+        || !asset_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err("The update service returned an invalid release asset.".to_owned());
+    }
+    Ok(format!(
+        "{BASILISKOS_RELEASE_DOWNLOAD_BASE}/{tag}/{asset_name}"
+    ))
+}
+
+fn checksum_from_manifest(manifest: &str, asset_name: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let checksum = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        (parts.next().is_none()
+            && name == asset_name
+            && checksum.len() == 64
+            && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| checksum.to_ascii_lowercase())
+    })
+}
+
+async fn download_verified_release_installer(tag: &str) -> Result<(PathBuf, String), String> {
+    let installer_name = release_installer_name(tag)?;
+    let manifest_url = release_download_url(tag, "SHA256SUMS.txt")?;
+    let installer_url = release_download_url(tag, &installer_name)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .user_agent("Basiliskos/1.1")
+        .build()
+        .map_err(|error| format!("Could not prepare the updater: {error}"))?;
+    let manifest_response = client
+        .get(manifest_url)
+        .send()
+        .await
+        .map_err(|error| format!("Could not download the release checksum: {error}"))?;
+    if !manifest_response.status().is_success() {
+        return Err(format!(
+            "The release checksum is unavailable ({}).",
+            manifest_response.status()
+        ));
+    }
+    if manifest_response.content_length().unwrap_or(0) > MAX_RELEASE_MANIFEST_BYTES as u64 {
+        return Err("The release checksum manifest is unexpectedly large.".to_owned());
+    }
+    let manifest = manifest_response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read the release checksum: {error}"))?;
+    if manifest.len() > MAX_RELEASE_MANIFEST_BYTES {
+        return Err("The release checksum manifest is unexpectedly large.".to_owned());
+    }
+    let expected_checksum = checksum_from_manifest(&manifest, &installer_name)
+        .ok_or_else(|| "The release checksum does not include the Windows installer.".to_owned())?;
+
+    let installer_response = client
+        .get(installer_url)
+        .send()
+        .await
+        .map_err(|error| format!("Could not download the Windows installer: {error}"))?;
+    if !installer_response.status().is_success() {
+        return Err(format!(
+            "The Windows installer is unavailable ({}).",
+            installer_response.status()
+        ));
+    }
+    if installer_response.content_length().unwrap_or(0) > MAX_RELEASE_INSTALLER_BYTES {
+        return Err("The Windows installer is unexpectedly large.".to_owned());
+    }
+
+    let update_dir = std::env::temp_dir().join("Basiliskos").join("updates");
+    fs::create_dir_all(&update_dir)
+        .map_err(|error| format!("Could not create the update folder: {error}"))?;
+    let destination = update_dir.join(format!("{}-{installer_name}", Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .map_err(|error| format!("Could not prepare the installer download: {error}"))?;
+    let mut bytes_written = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut stream = installer_response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| format!("The installer download was interrupted: {error}"))?;
+        bytes_written = bytes_written.saturating_add(chunk.len() as u64);
+        if bytes_written > MAX_RELEASE_INSTALLER_BYTES {
+            let _ = fs::remove_file(&destination);
+            return Err("The Windows installer is unexpectedly large.".to_owned());
+        }
+        file.write_all(&chunk)
+            .map_err(|error| format!("Could not save the installer download: {error}"))?;
+        hasher.update(&chunk);
+    }
+    file.flush()
+        .map_err(|error| format!("Could not finish the installer download: {error}"))?;
+    let actual_checksum = hex::encode(hasher.finalize());
+    if actual_checksum != expected_checksum {
+        let _ = fs::remove_file(&destination);
+        return Err(
+            "The downloaded installer did not match the published SHA-256 checksum.".to_owned(),
+        );
+    }
+    Ok((destination, installer_name))
 }
 
 // GitHub's public REST API has a small unauthenticated per-IP quota. Resolve
@@ -2579,6 +2716,46 @@ pub async fn latest_basiliskos_release() -> Result<LatestPublishedRelease, Strin
         tag_name,
         release_url: release_url.to_owned(),
     })
+}
+
+#[tauri::command]
+pub async fn prepare_basiliskos_update(
+    tag_name: String,
+) -> Result<PreparedBasiliskosUpdate, String> {
+    let (installer_path, installer_name) = download_verified_release_installer(&tag_name).await?;
+    let token = Uuid::new_v4().to_string();
+    PREPARED_UPDATE_INSTALLERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| "The updater is busy. Try again.".to_owned())?
+        .insert(token.clone(), installer_path);
+    Ok(PreparedBasiliskosUpdate {
+        token,
+        tag_name,
+        installer_name,
+    })
+}
+
+#[tauri::command]
+pub fn install_basiliskos_update(app: AppHandle, token: String) -> Result<(), String> {
+    let installer_path = PREPARED_UPDATE_INSTALLERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| "The updater is busy. Try again.".to_owned())?
+        .remove(&token)
+        .ok_or_else(|| {
+            "This verified update is no longer available. Download it again.".to_owned()
+        })?;
+    let installer_path = fs::canonicalize(&installer_path)
+        .map_err(|error| format!("The verified installer is no longer available: {error}"))?;
+    if !installer_path.is_file() {
+        return Err("The verified installer is no longer available.".to_owned());
+    }
+    Command::new(&installer_path)
+        .spawn()
+        .map_err(|error| format!("Could not launch the Windows installer: {error}"))?;
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -4876,6 +5053,27 @@ mod tests {
         );
         assert_eq!(
             github_release_tag_from_url("https://github.com/LuNexInc/basiliskos/releases/tag/"),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_update_requires_the_canonical_installer_and_checksum_entry() {
+        assert_eq!(
+            release_installer_name("v1.1.18").unwrap(),
+            "Basiliskos_1.1.18_x64-setup.exe"
+        );
+        assert!(release_installer_name("../v1.1.18").is_err());
+        let installer = "Basiliskos_1.1.18_x64-setup.exe";
+        let checksum = "a".repeat(64);
+        let manifest = format!("{checksum}  {installer}\n{}  other.exe", "b".repeat(64));
+        assert_eq!(checksum_from_manifest(&manifest, installer), Some(checksum));
+        assert_eq!(
+            checksum_from_manifest(&manifest, "other.exe"),
+            Some("b".repeat(64))
+        );
+        assert_eq!(
+            checksum_from_manifest("bad  Basiliskos_1.1.18_x64-setup.exe", installer),
             None
         );
     }

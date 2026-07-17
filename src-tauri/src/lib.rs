@@ -80,6 +80,8 @@ pub fn run() {
             gateway::cancel_provider_login,
             gateway::set_skip_model_switch_confirmation,
             gateway::latest_basiliskos_release,
+            gateway::prepare_basiliskos_update,
+            gateway::install_basiliskos_update,
             gateway::launch_hydra_claude,
             gateway::stop_hydra_claude
         ])
