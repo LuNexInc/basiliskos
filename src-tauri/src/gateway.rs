@@ -3890,6 +3890,11 @@ async fn refresh_kimi_relay_credential_if_needed(file_name: &str) -> Result<bool
         .header("X-Msh-Platform", "CLIProxyAPI")
         .header("X-Msh-Version", GATEWAY_VERSION)
         .header("X-Msh-Device-Id", device_id)
+        .header(
+            "X-Msh-Device-Name",
+            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Basiliskos".into()),
+        )
+        .header("X-Msh-Device-Model", "Windows x86_64")
         .body(form)
         .send()
         .await
