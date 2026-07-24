@@ -56,6 +56,10 @@ const MAX_RELEASE_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 const GROK_4_5_CONTEXT_WINDOW_TOKENS: u64 = 500_000;
 const MAX_CONTEXT_COUNT_RESPONSE_BYTES: usize = 64 * 1024;
 const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: i64 = 60;
+const XAI_CREDENTIAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2 * 60);
+const XAI_DEFAULT_TOKEN_LIFETIME_SECS: i64 = 6 * 60 * 60;
+const XAI_RELOGIN_REQUIRED: &str =
+    "This saved Grok authorization was revoked. Sign in again to renew it.";
 #[derive(Clone, Copy)]
 struct ModelSpec {
     id: &'static str,
@@ -310,6 +314,8 @@ static PREPARED_UPDATE_INSTALLERS: OnceLock<Mutex<BTreeMap<String, PathBuf>>> = 
 // simultaneous selection and "Serve Grok CLI" cannot overwrite a newer grant.
 static XAI_REFRESH_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
+static XAI_REFRESH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static XAI_CREDENTIAL_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
 
 fn controller() -> &'static ControllerManager {
     CONTROLLER.get_or_init(ControllerManager::default)
@@ -510,6 +516,12 @@ struct ControllerState {
     /// If true, skip the account-switch restart confirmation in Basiliskos.
     #[serde(default)]
     skip_model_switch_confirmation: bool,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct XaiRefreshState {
+    #[serde(default)]
+    relogin_required: BTreeSet<String>,
 }
 
 fn model_specs(provider: &str) -> &'static [ModelSpec] {
@@ -745,6 +757,56 @@ fn hidden_models_path() -> Result<PathBuf, String> {
     Ok(root_dir()?.join("hidden-models.json"))
 }
 
+fn xai_refresh_state_path() -> Result<PathBuf, String> {
+    Ok(root_dir()?.join("xai-refresh-state.json"))
+}
+
+fn load_xai_refresh_state() -> Result<XaiRefreshState, String> {
+    let path = xai_refresh_state_path()?;
+    if !path.exists() {
+        return Ok(XaiRefreshState::default());
+    }
+    load_json_with_recovery(&path, "Basiliskos Grok refresh state")
+}
+
+fn save_xai_refresh_state(state: &XaiRefreshState) -> Result<(), String> {
+    let path = xai_refresh_state_path()?;
+    let bytes =
+        serde_json::to_vec_pretty(state).map_err(|_| "Could not save Grok refresh state")?;
+    durable_write(&path, &bytes)
+}
+
+fn xai_relogin_required(file_name: &str) -> Result<bool, String> {
+    let lock = XAI_REFRESH_STATE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| "Basiliskos Grok refresh state is locked".to_string())?;
+    Ok(load_xai_refresh_state()?
+        .relogin_required
+        .contains(file_name))
+}
+
+fn set_xai_relogin_required(file_name: &str, required: bool) -> Result<(), String> {
+    let lock = XAI_REFRESH_STATE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| "Basiliskos Grok refresh state is locked".to_string())?;
+    let mut state = load_xai_refresh_state()?;
+    if required {
+        state.relogin_required.insert(file_name.to_string());
+    } else {
+        state.relogin_required.remove(file_name);
+    }
+    save_xai_refresh_state(&state)
+}
+
+fn xai_refresh_error_requires_relogin(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("invalid_grant") | Some("refresh_token_invalidated")
+    )
+}
+
 fn config_path() -> Result<PathBuf, String> {
     Ok(gateway_dir()?.join("config.yaml"))
 }
@@ -792,10 +854,16 @@ pub fn initialize_controller_storage() -> Result<(), String> {
     let state_file = controller_path()?;
     let labels_file = account_labels_path()?;
     let config_file = config_path()?;
-    for file in [&state_file, &labels_file, &config_file] {
+    let xai_refresh_state_file = xai_refresh_state_path()?;
+    for file in [
+        &state_file,
+        &labels_file,
+        &config_file,
+        &xai_refresh_state_file,
+    ] {
         secure_existing_path(file)?;
     }
-    for json_file in [&state_file, &labels_file] {
+    for json_file in [&state_file, &labels_file, &xai_refresh_state_file] {
         if let Ok(bytes) = fs::read(json_file) {
             if serde_json::from_slice::<Value>(&bytes).is_ok() {
                 durable_write(json_file, &bytes)?;
@@ -808,6 +876,7 @@ pub fn initialize_controller_storage() -> Result<(), String> {
     secure_files_in(&auth, "json")?;
     secure_files_in(&controller_logs, "log")?;
     secure_files_in(&claude_logs, "log")?;
+    start_xai_credential_maintenance();
     Ok(())
 }
 
@@ -3500,6 +3569,10 @@ pub async fn refresh_xai_relay_credential_if_needed(file_name: &str) -> Result<b
     let refresh_lock = xai_refresh_lock(file_name)?;
     let _refresh = refresh_lock.lock().await;
 
+    if xai_relogin_required(file_name)? {
+        return Err(XAI_RELOGIN_REQUIRED.into());
+    }
+
     let raw = fs::read_to_string(&path)
         .map_err(|error| format!("Could not read Grok credential: {error}"))?;
     let mut credential: Value =
@@ -3543,10 +3616,22 @@ pub async fn refresh_xai_relay_credential_if_needed(file_name: &str) -> Result<b
         .map_err(|_| "Grok credential refresh could not reach xAI")?;
     if !response.status().is_success() {
         // Do not expose response bodies: OAuth errors can echo sensitive data.
-        return Err(if response.status().is_client_error() {
-            "Grok approval expired or was revoked. Sign in again to renew it.".into()
+        let status = response.status();
+        let code = response.json::<Value>().await.ok().and_then(|body| {
+            body.get("error")
+                .or_else(|| body.get("code"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        if xai_refresh_error_requires_relogin(code.as_deref()) {
+            set_xai_relogin_required(file_name, true)?;
+            return Err(XAI_RELOGIN_REQUIRED.into());
+        }
+        return Err(if status.is_client_error() {
+            "Grok credential refresh was rejected temporarily. It will retry automatically.".into()
         } else {
-            "Grok credential refresh is temporarily unavailable. Try again shortly.".into()
+            "Grok credential refresh is temporarily unavailable. It will retry automatically."
+                .into()
         });
     }
     let refreshed: Value = response
@@ -3561,7 +3646,7 @@ pub async fn refresh_xai_relay_credential_if_needed(file_name: &str) -> Result<b
         .get("expires_in")
         .and_then(Value::as_i64)
         .filter(|seconds| *seconds > 0)
-        .ok_or("Grok credential refresh returned no expiry")?;
+        .unwrap_or(XAI_DEFAULT_TOKEN_LIFETIME_SECS);
     let object = credential
         .as_object_mut()
         .ok_or("Grok credential is invalid")?;
@@ -3585,7 +3670,88 @@ pub async fn refresh_xai_relay_credential_if_needed(file_name: &str) -> Result<b
     let bytes = serde_json::to_vec_pretty(&credential)
         .map_err(|_| "Could not save refreshed Grok credential")?;
     durable_write(&path, &bytes)?;
+    set_xai_relogin_required(file_name, false)?;
     Ok(true)
+}
+
+fn saved_xai_credential_file_names() -> Result<Vec<String>, String> {
+    let directory = auth_dir()?;
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&directory)
+        .map_err(|error| format!("Could not inspect saved Grok credentials: {error}"))?
+    {
+        let entry =
+            entry.map_err(|error| format!("Could not inspect saved Grok credentials: {error}"))?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if account_provider(&value, name).as_deref() == Some("xai") {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+async fn maintain_saved_xai_credentials_once() {
+    let Ok(names) = saved_xai_credential_file_names() else {
+        return;
+    };
+    for name in names {
+        if xai_relogin_required(&name).unwrap_or(false) {
+            continue;
+        }
+        match refresh_xai_relay_credential_if_needed(&name).await {
+            Ok(true) => {
+                if crate::grok_cli::sync_grok_cli_account_from_relay(&name).is_err() {
+                    diagnostics::record(
+                        ErrorCode::ConfigTransactionFailed,
+                        "warning",
+                        "Grok CLI vault could not be synchronized after a credential refresh.",
+                        None,
+                        None,
+                        Some("xai"),
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                diagnostics::record(
+                    ErrorCode::ProviderAuthFailed,
+                    "warning",
+                    if error == XAI_RELOGIN_REQUIRED {
+                        "A saved Grok authorization was revoked and needs one re-login."
+                    } else {
+                        "A saved Grok authorization refresh failed temporarily and will retry automatically."
+                    },
+                    None,
+                    None,
+                    Some("xai"),
+                );
+            }
+        }
+    }
+}
+
+fn start_xai_credential_maintenance() {
+    if XAI_CREDENTIAL_MAINTENANCE_STARTED.set(()).is_err() {
+        return;
+    }
+    tauri::async_runtime::spawn(async {
+        loop {
+            maintain_saved_xai_credentials_once().await;
+            tokio::time::sleep(XAI_CREDENTIAL_MAINTENANCE_INTERVAL).await;
+        }
+    });
 }
 
 fn validate_account_invariant(directory: &Path, state_path: &Path) -> Result<(), String> {
@@ -4288,6 +4454,9 @@ fn merge_staged_login(provider: &str, staging_dir: &Path) -> Result<String, Stri
             Some(provider),
         );
     })?;
+    if provider == "xai" {
+        set_xai_relogin_required(&destination_name, false)?;
+    }
     prepare_config()?;
     Ok(destination_name)
 }
@@ -7282,5 +7451,17 @@ mod tests {
             "token_endpoint": "https://auth.x.ai.attacker.invalid/oauth2/token"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn xai_refresh_relogin_is_only_required_for_terminal_grant_errors() {
+        assert!(xai_refresh_error_requires_relogin(Some("invalid_grant")));
+        assert!(xai_refresh_error_requires_relogin(Some(
+            "refresh_token_invalidated"
+        )));
+        assert!(!xai_refresh_error_requires_relogin(Some(
+            "temporarily_unavailable"
+        )));
+        assert!(!xai_refresh_error_requires_relogin(None));
     }
 }
