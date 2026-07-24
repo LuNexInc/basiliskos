@@ -1571,8 +1571,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hydra-gateway"
-version = "1.1.18"
+version = "2.0.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "dirs",
@@ -1588,6 +1589,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tiny_http",
  "tokio",
+ "url",
  "uuid",
  "windows-sys 0.61.2",
 ]

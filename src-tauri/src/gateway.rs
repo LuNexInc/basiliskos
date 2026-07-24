@@ -1,11 +1,11 @@
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
@@ -55,6 +55,7 @@ const MAX_RELEASE_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_RELEASE_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 const GROK_4_5_CONTEXT_WINDOW_TOKENS: u64 = 500_000;
 const MAX_CONTEXT_COUNT_RESPONSE_BYTES: usize = 64 * 1024;
+const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: i64 = 60;
 #[derive(Clone, Copy)]
 struct ModelSpec {
     id: &'static str,
@@ -288,6 +289,8 @@ struct ControllerRuntime {
     backend_restart_attempts: u32,
     backend_next_restart: Option<Instant>,
     last_known_good_models: BTreeMap<String, String>,
+    last_known_model_catalog: BTreeMap<String, Vec<String>>,
+    account_cooldowns: BTreeMap<String, chrono::DateTime<Utc>>,
     login_claim: Option<String>,
     login: Option<LoginRuntime>,
     last_login: Option<ProviderLoginStatus>,
@@ -303,6 +306,10 @@ struct ControllerManager {
 
 static CONTROLLER: OnceLock<ControllerManager> = OnceLock::new();
 static PREPARED_UPDATE_INSTALLERS: OnceLock<Mutex<BTreeMap<String, PathBuf>>> = OnceLock::new();
+// Refresh grants may rotate. Keep one refresh exchange per relay account so a
+// simultaneous selection and "Serve Grok CLI" cannot overwrite a newer grant.
+static XAI_REFRESH_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
 fn controller() -> &'static ControllerManager {
     CONTROLLER.get_or_init(ControllerManager::default)
@@ -322,6 +329,17 @@ fn mutation_lock() -> Result<MutexGuard<'static, ()>, String> {
         .map_err(|_| "Basiliskos controller mutation state is locked".into())
 }
 
+fn xai_refresh_lock(file_name: &str) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    let locks = XAI_REFRESH_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut locks = locks
+        .lock()
+        .map_err(|_| "Basiliskos Grok refresh coordination is locked".to_string())?;
+    Ok(locks
+        .entry(file_name.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayAccount {
@@ -331,6 +349,7 @@ pub struct GatewayAccount {
     pub label: String,
     pub disabled: bool,
     pub active: bool,
+    pub cooldown_until_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -357,6 +376,14 @@ pub struct GatewaySnapshot {
     pub skip_model_switch_confirmation: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSelectionResult {
+    #[serde(flatten)]
+    pub snapshot: GatewaySnapshot,
+    pub claude_config_changed: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentStatus {
@@ -370,6 +397,19 @@ pub struct RouteModelOption {
     pub id: String,
     pub label: String,
     pub thinking_levels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogEntry {
+    pub id: String,
+    pub label: String,
+    pub hidden: bool,
+    /// None when the backend's live model catalog hasn't been fetched for
+    /// this provider yet (e.g. no account of this provider has been active
+    /// this session). Some(false) means the backend was reachable and did
+    /// not report this model as available.
+    pub live: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -416,6 +456,12 @@ pub struct GatewayUsageWindow {
     pub label: String,
     pub used_percent: f64,
     pub remaining_percent: f64,
+    /// False when the provider's billing config is real (proving the account
+    /// isn't broken/unreachable) but reported no usage figure at all for this
+    /// window — e.g. xAI omits usage fields entirely once an account has
+    /// recorded zero usage in the current period. Distinct from a genuine
+    /// 0%-used reading so the UI doesn't claim a number it can't back up.
+    pub known: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -529,14 +575,13 @@ fn provider_route(state: &ControllerState, provider: &str) -> ProviderRoute {
         .iter()
         .find(|spec| spec.id == route.model)
         .expect("normalized routes always select a catalog model");
-    ProviderRoute {
-        provider: provider.to_string(),
-        selected_model: route.model,
-        selected_model_label: selected.label.to_string(),
-        thinking: route.thinking,
-        context_window: context_window_for_route(provider, selected.id),
-        model_options: specs
-            .iter()
+    let hidden = load_hidden_models().unwrap_or_default();
+    let live_catalog = runtime_lock()
+        .ok()
+        .and_then(|runtime| runtime.last_known_model_catalog.get(provider).cloned());
+    let model_options =
+        filter_visible_models(specs, &route.model, &hidden, live_catalog.as_deref())
+            .into_iter()
             .map(|spec| RouteModelOption {
                 id: spec.id.to_string(),
                 label: spec.label.to_string(),
@@ -546,7 +591,16 @@ fn provider_route(state: &ControllerState, provider: &str) -> ProviderRoute {
                     .map(|level| level.to_string())
                     .collect(),
             })
-            .collect(),
+            .collect();
+    let context_window = context_window_for_route(provider, selected.id);
+    let selected_model_label = selected.label.to_string();
+    ProviderRoute {
+        provider: provider.to_string(),
+        selected_model: route.model,
+        selected_model_label,
+        thinking: route.thinking,
+        context_window,
+        model_options,
     }
 }
 
@@ -687,6 +741,10 @@ fn account_labels_path() -> Result<PathBuf, String> {
     Ok(root_dir()?.join("account-labels.json"))
 }
 
+fn hidden_models_path() -> Result<PathBuf, String> {
+    Ok(root_dir()?.join("hidden-models.json"))
+}
+
 fn config_path() -> Result<PathBuf, String> {
     Ok(gateway_dir()?.join("config.yaml"))
 }
@@ -793,6 +851,20 @@ fn save_account_labels(labels: &BTreeMap<String, String>) -> Result<(), String> 
     let bytes = serde_json::to_vec_pretty(labels)
         .map_err(|error| format!("Could not serialize profile names: {error}"))?;
     durable_write(&account_labels_path()?, &bytes)
+}
+
+fn load_hidden_models() -> Result<BTreeSet<String>, String> {
+    let path = hidden_models_path()?;
+    if !path.exists() && !crate::persistence::backup_path(&path)?.exists() {
+        return Ok(BTreeSet::new());
+    }
+    load_json_with_recovery(&path, "Basiliskos hidden models")
+}
+
+fn save_hidden_models(hidden: &BTreeSet<String>) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(hidden)
+        .map_err(|error| format!("Could not serialize hidden models: {error}"))?;
+    durable_write(&hidden_models_path()?, &bytes)
 }
 
 fn normalized_account_label(name: &str) -> Result<String, String> {
@@ -978,6 +1050,42 @@ fn backend_model_ids(api_key: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+// Best-effort: refreshes the cached "what does the backend actually report as
+// available" list for a provider. Never fails the caller — if the backend is
+// unreachable or returns nothing, the previous cached catalog (or no catalog,
+// meaning no live filtering) is left in place.
+fn refresh_model_catalog_cache(provider: &str, api_key: &str) {
+    if let Ok(models) = backend_model_ids(api_key) {
+        if !models.is_empty() {
+            if let Ok(mut runtime) = runtime_lock() {
+                runtime
+                    .last_known_model_catalog
+                    .insert(provider.to_string(), models);
+            }
+        }
+    }
+}
+
+// Keeps a model visible if it isn't manually hidden AND (when a live catalog
+// is known for this provider) the backend actually reports it as available.
+// The currently-selected model is always kept visible regardless of either
+// filter, so an existing route selection never disappears out from under it.
+fn filter_visible_models<'a>(
+    specs: &'a [ModelSpec],
+    selected_id: &str,
+    hidden: &BTreeSet<String>,
+    live_catalog: Option<&[String]>,
+) -> Vec<&'a ModelSpec> {
+    specs
+        .iter()
+        .filter(|spec| spec.id == selected_id || !hidden.contains(spec.id))
+        .filter(|spec| {
+            spec.id == selected_id
+                || live_catalog.map_or(true, |live| live.iter().any(|id| id == spec.id))
+        })
+        .collect()
+}
+
 fn validated_route_for_request(
     state: &ControllerState,
     provider: &str,
@@ -1129,14 +1237,8 @@ fn rewrite_claude_request(
     let routed_model = routed_model(object, state, provider);
     object.insert("model".into(), Value::String(routed_model));
 
-    // CLIProxyAPI 7.2.73+ injects a native x_search tool into Grok /v1/responses
-    // after it translates this Claude request. Claude Desktop's native web_search
-    // declaration would therefore reach xAI alongside injected x_search, while its
-    // forced web_search choice is not valid in xAI's Responses API. Remove the
-    // Claude-native declaration here and let the unchanged CLIProxyAPI route inject
-    // the compatible x_search tool downstream.
-    if provider == "xai" {
-        strip_xai_incompatible_native_web_search(object);
+    for fixup in tool_compatibility_fixups(provider) {
+        fixup(object);
     }
 
     if !inject_identity {
@@ -1171,6 +1273,60 @@ fn rewrite_claude_request(
         }
     }
     Ok(())
+}
+
+// Declarative, per-provider list of client-side request fixups for confirmed
+// CLIProxyAPI tool-schema translation gaps. Add an entry here only for a
+// gap that's actually confirmed against CLIProxyAPI's issue tracker (or
+// reproduced directly) and that Basiliskos's own traffic shape (Claude
+// Messages API requests on /v1/messages) can actually trigger — see
+// gateway.rs history/handoffs for what was checked and ruled out.
+fn tool_compatibility_fixups(provider: &str) -> &'static [fn(&mut serde_json::Map<String, Value>)] {
+    match provider {
+        // CLIProxyAPI issue #4339 (v7.2.73+): injects a native x_search tool into
+        // Grok /v1/responses after translating this request. Claude Desktop's
+        // native web_search declaration would reach xAI alongside the injected
+        // x_search, and its forced web_search tool_choice isn't valid there.
+        "xai" => {
+            &[strip_xai_incompatible_native_web_search as fn(&mut serde_json::Map<String, Value>)]
+        }
+        // CLIProxyAPI issue #4405: Kimi's /v1/messages path returns 400 when a
+        // tool_result block's nested content contains an Anthropic deferred-tool
+        // tool_reference block (e.g. from Claude Code's own ToolSearch flow).
+        // Flattening it to plain text (upstream's own suggested fix) returns 200.
+        "kimi" => &[flatten_kimi_tool_reference_blocks as fn(&mut serde_json::Map<String, Value>)],
+        _ => &[],
+    }
+}
+
+fn flatten_kimi_tool_reference_blocks(object: &mut serde_json::Map<String, Value>) {
+    let Some(Value::Array(messages)) = object.get_mut("messages") else {
+        return;
+    };
+    for message in messages {
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(nested) = block.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for nested_block in nested {
+                if nested_block.get("type").and_then(Value::as_str) != Some("tool_reference") {
+                    continue;
+                }
+                let tool_name = nested_block
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                *nested_block = serde_json::json!({"type": "text", "text": tool_name});
+            }
+        }
+    }
 }
 
 fn strip_xai_incompatible_native_web_search(object: &mut serde_json::Map<String, Value>) {
@@ -1479,6 +1635,23 @@ fn classify_upstream_status(status: u16) -> Option<ErrorCode> {
     }
 }
 
+// Accepts either delay-seconds ("120") or an HTTP-date ("Sun, 06 Nov 1994
+// 08:49:37 GMT"). Returns None for a missing, malformed, or already-past value
+// so callers can fall back to a fixed default cooldown.
+fn parse_retry_after_seconds(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    if let Ok(seconds) = trimmed.parse::<i64>() {
+        return (seconds > 0).then_some(seconds);
+    }
+    let parsed =
+        chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d %b %Y %H:%M:%S GMT").ok()?;
+    let remaining = parsed
+        .and_utc()
+        .signed_duration_since(Utc::now())
+        .num_seconds();
+    (remaining > 0).then_some(remaining)
+}
+
 fn provider_auth_failure_message(provider: Option<&str>, status: u16) -> &'static str {
     match (provider, status) {
         (Some("kimi"), 402 | 403) => "This Kimi account has no active Kimi Code subscription.",
@@ -1620,6 +1793,7 @@ fn handle_front_proxy_request(
     }
 
     let mut provider_for_event = None;
+    let mut active_account_for_event = None;
     let mut context_budget = None;
     if request_path == "/v1/messages" || request_path == "/v1/messages/count_tokens" {
         let rewrite_result = (|| -> Result<(), String> {
@@ -1628,6 +1802,7 @@ fn handle_front_proxy_request(
             let provider = active_provider_from_auth(&auth_dir()?, &state)
                 .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
             provider_for_event = Some(provider.clone());
+            active_account_for_event = state.active_account.clone();
             let validated = validated_route_for_request(&state, &provider, correlation_id);
             state.routes.insert(provider.clone(), validated);
             let mut json: Value = serde_json::from_slice(&body)
@@ -1762,6 +1937,27 @@ fn handle_front_proxy_request(
             Some(upstream_status),
             provider_for_event.as_deref(),
         );
+        if code == ErrorCode::ProviderRateLimited {
+            if let Some(account_file) = active_account_for_event.clone() {
+                let retry_after_seconds = upstream
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                    .and_then(|(_, value)| {
+                        parse_retry_after_seconds(&String::from_utf8_lossy(value))
+                    })
+                    .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN_SECS);
+                if let Ok(mut runtime) = runtime_lock() {
+                    runtime.account_cooldowns.insert(
+                        account_file.clone(),
+                        Utc::now() + chrono::Duration::seconds(retry_after_seconds),
+                    );
+                }
+                if let Some(provider) = provider_for_event.as_deref() {
+                    attempt_same_provider_failover(&account_file, provider);
+                }
+            }
+        }
     }
     let status = StatusCode(upstream_status);
     let mut headers: Vec<Header> = upstream
@@ -2473,6 +2669,12 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
     let directory = auth_dir()?;
     let labels = load_account_labels()?;
     secure_create_dir_all(&directory)?;
+    let cooldowns = {
+        let mut runtime = runtime_lock()?;
+        let now = Utc::now();
+        runtime.account_cooldowns.retain(|_, until| *until > now);
+        runtime.account_cooldowns.clone()
+    };
     let mut accounts = Vec::new();
     for entry in fs::read_dir(&directory)
         .map_err(|error| format!("Could not read {}: {error}", directory.display()))?
@@ -2505,6 +2707,9 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
                 _ => "Claude account".into(),
             })
         });
+        let cooldown_until_ms = cooldowns
+            .get(&file_name)
+            .map(|until| until.timestamp_millis());
         accounts.push(GatewayAccount {
             active: state.active_account.as_deref() == Some(file_name.as_str()) && !disabled,
             file_name,
@@ -2512,6 +2717,7 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
             email,
             label,
             disabled,
+            cooldown_until_ms,
         });
     }
     accounts.sort_by(|left, right| {
@@ -2764,6 +2970,18 @@ pub fn gateway_snapshot() -> Result<GatewaySnapshot, String> {
     gateway_snapshot_locked()
 }
 
+/// The email of whichever relay account is currently active, if any. Used
+/// only for the cross-service "currently active for" indicator — never a
+/// hard dependency, so callers should treat `None` as "unknown," not "none."
+pub fn active_relay_email() -> Option<String> {
+    let state = load_state().ok()?;
+    list_accounts_inner(&state)
+        .ok()?
+        .into_iter()
+        .find(|account| account.active)
+        .and_then(|account| account.email)
+}
+
 #[tauri::command]
 pub fn open_diagnostics_folder(app: AppHandle) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -2924,6 +3142,18 @@ fn usage_window(label: &str, used_percent: f64) -> GatewayUsageWindow {
         label: label.into(),
         used_percent,
         remaining_percent: 100.0 - used_percent,
+        known: true,
+    }
+}
+
+// Distinct from `usage_window("Week", 0.0)`: this means the provider never
+// reported a usage figure at all, not that it reported exactly zero.
+fn unrecorded_usage_window(label: &str) -> GatewayUsageWindow {
+    GatewayUsageWindow {
+        label: label.into(),
+        used_percent: 0.0,
+        remaining_percent: 100.0,
+        known: false,
     }
 }
 
@@ -2978,11 +3208,28 @@ fn parse_xai_usage(value: &Value) -> Vec<GatewayUsageWindow> {
                     .flatten()
             })
         });
-    number_at(value, &["config", "creditUsagePercent"])
+    if let Some(used) = number_at(value, &["config", "creditUsagePercent"])
         .or_else(|| number_at(value, &["creditUsagePercent"]))
         .or(product_usage)
-        .map(|used| vec![usage_window("Week", used)])
-        .unwrap_or_default()
+    {
+        return vec![usage_window("Week", used)];
+    }
+    // xAI omits every usage field once an account has recorded zero usage in
+    // the current billing period, which is indistinguishable at this point
+    // from a response that's missing usage data for some other reason. A
+    // present `currentPeriod` proves the billing config itself is real (the
+    // account isn't broken/unreachable), so treat that as "hasn't used
+    // anything yet" rather than folding it into the same error as a
+    // genuinely missing/malformed response.
+    let has_real_billing_config = value
+        .get("config")
+        .and_then(|config| config.get("currentPeriod"))
+        .is_some();
+    if has_real_billing_config {
+        vec![unrecorded_usage_window("Week")]
+    } else {
+        Vec::new()
+    }
 }
 
 fn kimi_usage_percent(value: &Value) -> Option<f64> {
@@ -3200,6 +3447,147 @@ fn account_bytes_with_disabled(path: &Path, disabled: bool) -> Result<Vec<u8>, S
         .map_err(|error| format!("Could not serialize account: {error}"))
 }
 
+const XAI_REFRESH_SKEW_SECS: i64 = 5 * 60;
+
+fn xai_refresh_required(credential: &Value, now: DateTime<Utc>) -> bool {
+    let expiry = credential
+        .get("expired")
+        .or_else(|| credential.get("expires_at"))
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|value| value.with_timezone(&Utc));
+    expiry
+        .map(|value| value <= now + ChronoDuration::seconds(XAI_REFRESH_SKEW_SECS))
+        .unwrap_or(true)
+}
+
+fn xai_refresh_client_id(access_token: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = access_token.split('.').nth(1)?;
+    let claims: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()?,
+    )
+    .ok()?;
+    claims
+        .get("client_id")
+        .and_then(Value::as_str)
+        .or_else(|| claims.get("aud").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn xai_refresh_endpoint(credential: &Value) -> Result<String, String> {
+    let raw = credential
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .ok_or("Grok credential is missing its refresh endpoint")?;
+    let url =
+        reqwest::Url::parse(raw).map_err(|_| "Grok credential has an invalid refresh endpoint")?;
+    let trusted_host = matches!(url.host_str(), Some("auth.x.ai") | Some("accounts.x.ai"));
+    if url.scheme() != "https" || !trusted_host || url.path().is_empty() {
+        return Err("Grok credential has an untrusted refresh endpoint".into());
+    }
+    Ok(url.to_string())
+}
+
+/// Refreshes an xAI relay credential only when it is close to expiry. This is
+/// intentionally owned by Basiliskos: CLIProxyAPI may also refresh active
+/// credentials, but Basiliskos must be able to make a parked account usable
+/// before it becomes the live relay or Grok CLI credential.
+pub async fn refresh_xai_relay_credential_if_needed(file_name: &str) -> Result<bool, String> {
+    let path = exact_auth_path(file_name)?;
+    let refresh_lock = xai_refresh_lock(file_name)?;
+    let _refresh = refresh_lock.lock().await;
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read Grok credential: {error}"))?;
+    let mut credential: Value =
+        serde_json::from_str(&raw).map_err(|_| "Grok credential is invalid")?;
+    if account_provider(&credential, file_name).as_deref() != Some("xai") {
+        return Ok(false);
+    }
+    if !xai_refresh_required(&credential, Utc::now()) {
+        return Ok(false);
+    }
+
+    let access_token = credential
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or("Grok credential is missing an access token")?;
+    let refresh_token = credential
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .ok_or("Grok credential is missing a refresh token")?;
+    let client_id = xai_refresh_client_id(access_token)
+        .ok_or("Grok credential is missing its OAuth client identity")?;
+    let endpoint = xai_refresh_endpoint(&credential)?;
+    let refresh_form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("client_id", &client_id)
+        .append_pair("refresh_token", refresh_token)
+        .finish();
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("Basiliskos/1.1")
+        .build()
+        .map_err(|_| "Could not prepare Grok credential refresh")?
+        .post(endpoint)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(refresh_form)
+        .send()
+        .await
+        .map_err(|_| "Grok credential refresh could not reach xAI")?;
+    if !response.status().is_success() {
+        // Do not expose response bodies: OAuth errors can echo sensitive data.
+        return Err(if response.status().is_client_error() {
+            "Grok approval expired or was revoked. Sign in again to renew it.".into()
+        } else {
+            "Grok credential refresh is temporarily unavailable. Try again shortly.".into()
+        });
+    }
+    let refreshed: Value = response
+        .json()
+        .await
+        .map_err(|_| "Grok credential refresh returned an invalid response")?;
+    let new_access = refreshed
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or("Grok credential refresh returned no access token")?;
+    let expires_in = refreshed
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .filter(|seconds| *seconds > 0)
+        .ok_or("Grok credential refresh returned no expiry")?;
+    let object = credential
+        .as_object_mut()
+        .ok_or("Grok credential is invalid")?;
+    object.insert("access_token".into(), Value::String(new_access.to_string()));
+    if let Some(value) = refreshed.get("refresh_token").and_then(Value::as_str) {
+        object.insert("refresh_token".into(), Value::String(value.to_string()));
+    }
+    if let Some(value) = refreshed.get("id_token").and_then(Value::as_str) {
+        object.insert("id_token".into(), Value::String(value.to_string()));
+    }
+    if let Some(value) = refreshed.get("token_type").and_then(Value::as_str) {
+        object.insert("token_type".into(), Value::String(value.to_string()));
+    }
+    let now = Utc::now();
+    object.insert("expires_in".into(), Value::from(expires_in));
+    object.insert(
+        "expired".into(),
+        Value::String((now + ChronoDuration::seconds(expires_in)).to_rfc3339()),
+    );
+    object.insert("last_refresh".into(), Value::String(now.to_rfc3339()));
+    let bytes = serde_json::to_vec_pretty(&credential)
+        .map_err(|_| "Could not save refreshed Grok credential")?;
+    durable_write(&path, &bytes)?;
+    Ok(true)
+}
+
 fn validate_account_invariant(directory: &Path, state_path: &Path) -> Result<(), String> {
     let state: ControllerState = serde_json::from_slice(
         &fs::read(state_path)
@@ -3368,8 +3756,100 @@ fn removal_transaction(
     Ok((mutations, after_state))
 }
 
+// Picks the first same-provider account other than the one that just got
+// rate-limited, skipping any that are themselves still cooling down.
+fn pick_failover_candidate<'a>(
+    accounts: &'a [GatewayAccount],
+    rate_limited_account: &str,
+    provider: &str,
+    cooling: &BTreeMap<String, chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> Option<&'a GatewayAccount> {
+    accounts.iter().find(|account| {
+        account.provider == provider
+            && account.file_name != rate_limited_account
+            && cooling
+                .get(&account.file_name)
+                .map_or(true, |until| *until <= now)
+    })
+}
+
+// Best-effort, same-provider only: when the active account gets rate-limited,
+// look for another account of the SAME provider that isn't itself cooling
+// down and switch to it automatically. This reuses exactly the manual
+// select_gateway_account transaction/invariant, it just picks the candidate
+// itself instead of waiting for a click. Never touches the isolated Claude
+// window/process — config only varies by provider, not by account, so the
+// running Claude window is left alone and its next request simply lands on
+// the new credential. Silently does nothing if any step fails or no eligible
+// candidate exists; the caller (the relay's 429 path) still returns the
+// original rate-limit response to the client either way.
+fn attempt_same_provider_failover(rate_limited_account: &str, provider: &str) {
+    let Ok(_mutation) = mutation_lock() else {
+        return;
+    };
+    let Ok(state) = load_state() else { return };
+    let Ok(accounts) = list_accounts_inner(&state) else {
+        return;
+    };
+    let now = Utc::now();
+    let cooling = runtime_lock()
+        .map(|runtime| runtime.account_cooldowns.clone())
+        .unwrap_or_default();
+    let Some(candidate) =
+        pick_failover_candidate(&accounts, rate_limited_account, provider, &cooling, now)
+    else {
+        return;
+    };
+    let candidate_file = candidate.file_name.clone();
+    let Ok(root) = root_dir() else { return };
+    let Ok(directory) = auth_dir() else { return };
+    let Ok(state_path) = controller_path() else {
+        return;
+    };
+    let Ok((mutations, new_state)) = selection_transaction(
+        &root,
+        &directory,
+        &state_path,
+        &accounts,
+        &state,
+        &candidate_file,
+    ) else {
+        return;
+    };
+    if run_transaction(&root, &mutations, || {
+        validate_account_invariant(&directory, &state_path)
+    })
+    .is_err()
+    {
+        return;
+    }
+    if let Ok(mut runtime) = runtime_lock() {
+        runtime.last_known_good_models.clear();
+    }
+    let _ = prepare_config();
+    if let Ok(profile) = isolated_claude_profile_dir() {
+        let _ = write_isolated_claude_config(&profile, &new_state);
+    }
+    refresh_model_catalog_cache(provider, &new_state.api_key);
+    diagnostics::record(
+        ErrorCode::AccountAutoFailover,
+        "warning",
+        "Automatically switched to another account of the same provider after a rate limit.",
+        None,
+        None,
+        Some(provider),
+    );
+}
+
 #[tauri::command]
-pub fn select_gateway_account(file_name: String) -> Result<GatewaySnapshot, String> {
+pub async fn select_gateway_account(file_name: String) -> Result<AccountSelectionResult, String> {
+    let refreshed = refresh_xai_relay_credential_if_needed(&file_name).await?;
+    if refreshed {
+        // Keep a previously served Grok CLI account current, but never alter
+        // its live auth file merely because a relay credential rotated.
+        crate::grok_cli::sync_grok_cli_account_from_relay(&file_name)?;
+    }
     let _mutation = mutation_lock()?;
     let selected = exact_auth_path(&file_name)?;
     if !selected.is_file() {
@@ -3399,8 +3879,19 @@ pub fn select_gateway_account(file_name: String) -> Result<GatewaySnapshot, Stri
     })?;
     runtime_lock()?.last_known_good_models.clear();
     prepare_config()?;
-    write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
-    gateway_snapshot_locked()
+    let claude_config_changed =
+        write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
+    if let Some(newly_active_provider) = accounts
+        .iter()
+        .find(|account| account.file_name == file_name)
+        .map(|account| account.provider.clone())
+    {
+        refresh_model_catalog_cache(&newly_active_provider, &state.api_key);
+    }
+    Ok(AccountSelectionResult {
+        snapshot: gateway_snapshot_locked()?,
+        claude_config_changed,
+    })
 }
 
 #[tauri::command]
@@ -3435,6 +3926,13 @@ pub fn set_gateway_route(
                     provider_label(&provider)
                 ));
             }
+            if !models.is_empty() {
+                if let Ok(mut runtime) = runtime_lock() {
+                    runtime
+                        .last_known_model_catalog
+                        .insert(provider.clone(), models.clone());
+                }
+            }
             if models.contains(&model) {
                 runtime_lock()?
                     .last_known_good_models
@@ -3459,6 +3957,48 @@ pub fn set_skip_model_switch_confirmation(skip: bool) -> Result<GatewaySnapshot,
     let mut state = load_state()?;
     state.skip_model_switch_confirmation = skip;
     save_state(&state)?;
+    gateway_snapshot_locked()
+}
+
+#[tauri::command]
+pub fn get_model_catalog(provider: String) -> Result<Vec<ModelCatalogEntry>, String> {
+    let _mutation = mutation_lock()?;
+    if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
+        return Err("Provider must be claude, codex, xai, or kimi".into());
+    }
+    let hidden = load_hidden_models()?;
+    let live_catalog = runtime_lock()
+        .ok()
+        .and_then(|runtime| runtime.last_known_model_catalog.get(&provider).cloned());
+    Ok(model_specs(&provider)
+        .iter()
+        .map(|spec| ModelCatalogEntry {
+            id: spec.id.to_string(),
+            label: spec.label.to_string(),
+            hidden: hidden.contains(spec.id),
+            live: live_catalog
+                .as_ref()
+                .map(|live| live.iter().any(|id| id == spec.id)),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn set_model_hidden(model_id: String, hidden: bool) -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
+    if !SUPPORTED_PROVIDERS
+        .iter()
+        .any(|provider| model_specs(provider).iter().any(|spec| spec.id == model_id))
+    {
+        return Err("Unknown model id".into());
+    }
+    let mut hidden_models = load_hidden_models()?;
+    if hidden {
+        hidden_models.insert(model_id);
+    } else {
+        hidden_models.remove(&model_id);
+    }
+    save_hidden_models(&hidden_models)?;
     gateway_snapshot_locked()
 }
 
@@ -4218,7 +4758,7 @@ fn validate_claude_config_set(
     Ok(())
 }
 
-fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Result<(), String> {
+fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Result<bool, String> {
     let library = profile.join("configLibrary");
     secure_create_dir_all(&library)?;
     let meta_path = library.join("_meta.json");
@@ -4314,7 +4854,7 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
         })
         .collect::<Vec<_>>();
     if mutations.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     run_transaction(profile, &mutations, || {
         validate_claude_config_set(
@@ -4334,6 +4874,7 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
             None,
         );
     })
+    .map(|()| true)
 }
 
 fn restore_legacy_shared_config_if_needed(state: &mut ControllerState) -> Result<(), String> {
@@ -4389,6 +4930,12 @@ fn installed_claude_exe() -> Result<PathBuf, String> {
         return Err("Claude for Windows is not installed for this user.".into());
     }
     let install_location = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if install_location.is_empty() {
+        return Err(
+            "Claude for Windows is not installed for this user. Install it from the Microsoft Store."
+                .into(),
+        );
+    }
     let executable = PathBuf::from(&install_location)
         .join("app")
         .join("Claude.exe");
@@ -5163,10 +5710,19 @@ mod tests {
             }
         }));
         assert_eq!(xai[0], usage_window("Week", 23.0));
-        assert!(parse_xai_usage(&serde_json::json!({
+
+        // A real billing config (proven by `currentPeriod`) with no usage
+        // fields means "hasn't used anything yet this period", not "broken" —
+        // a fresh/idle account, distinct from a genuine 0%-used reading.
+        let xai_idle = parse_xai_usage(&serde_json::json!({
             "config": {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY"}}
-        }))
-        .is_empty());
+        }));
+        assert_eq!(xai_idle, vec![unrecorded_usage_window("Week")]);
+        assert!(!xai_idle[0].known);
+
+        // No billing config at all (not even currentPeriod) is still treated
+        // as genuinely unavailable.
+        assert!(parse_xai_usage(&serde_json::json!({})).is_empty());
 
         let kimi = parse_kimi_usage(&serde_json::json!({
             "usage": {"limit": 1000, "remaining": 650},
@@ -5643,6 +6199,7 @@ mod tests {
                 label: "Codex".into(),
                 disabled: false,
                 active: false,
+                cooldown_until_ms: None,
             },
             GatewayAccount {
                 file_name: "xai-b.json".into(),
@@ -5651,6 +6208,7 @@ mod tests {
                 label: "Grok".into(),
                 disabled: false,
                 active: false,
+                cooldown_until_ms: None,
             },
         ];
         let state_path = root.join("controller.json");
@@ -5715,6 +6273,7 @@ mod tests {
                     label: "Codex".into(),
                     disabled: false,
                     active: true,
+                    cooldown_until_ms: None,
                 },
                 GatewayAccount {
                     file_name: "xai-b.json".into(),
@@ -5723,6 +6282,7 @@ mod tests {
                     label: "Grok".into(),
                     disabled: true,
                     active: false,
+                    cooldown_until_ms: None,
                 },
             ];
             let (mutations, _) =
@@ -5790,6 +6350,7 @@ mod tests {
                 label: "Codex".into(),
                 disabled: false,
                 active: true,
+                cooldown_until_ms: None,
             },
             GatewayAccount {
                 file_name: "xai-b.json".into(),
@@ -5798,6 +6359,7 @@ mod tests {
                 label: "Grok".into(),
                 disabled: true,
                 active: false,
+                cooldown_until_ms: None,
             },
         ];
         (auth, state_path, labels_path, accounts, state, labels)
@@ -6091,6 +6653,62 @@ mod tests {
     }
 
     #[test]
+    fn kimi_flattens_deferred_tool_reference_blocks_that_cliproxyapi_rejects() {
+        // CLIProxyAPI issue #4405 minimal repro: a tool_result whose nested
+        // content contains an Anthropic deferred-tool `tool_reference` block
+        // gets a 400 from Kimi's /v1/messages path. The issue's own suggested
+        // fix is exactly this: replace it with a plain text block.
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+        };
+        let mut request = serde_json::json!({
+            "model": "kimi-k3",
+            "max_tokens": 256,
+            "messages": [
+                {"role": "user", "content": "find tool"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tu_1", "name": "ToolSearch", "input": {"query": "x"}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu_1",
+                            "content": [
+                                {"type": "tool_reference", "tool_name": "SendMessage"}
+                            ]
+                        },
+                        {"type": "text", "text": "ok now say hi"}
+                    ]
+                }
+            ]
+        });
+        rewrite_claude_request(&mut request, &state, "kimi", false).unwrap();
+        let tool_result_content = &request["messages"][2]["content"][0]["content"];
+        assert_eq!(
+            tool_result_content[0],
+            serde_json::json!({"type": "text", "text": "SendMessage"})
+        );
+        // Unrelated blocks (the tool_use, the sibling text block) are untouched.
+        assert_eq!(request["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(request["messages"][2]["content"][1]["type"], "text");
+        assert_eq!(
+            request["messages"][2]["content"][1]["text"],
+            "ok now say hi"
+        );
+    }
+
+    #[test]
     fn old_controller_state_migrates_to_known_good_routes() {
         let state: ControllerState = serde_json::from_str(
             r#"{"api_key":"secret","claude_config_id":"id","active_account":null}"#,
@@ -6282,6 +6900,181 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_parses_delay_seconds_and_http_date_and_rejects_junk() {
+        assert_eq!(parse_retry_after_seconds("120"), Some(120));
+        assert_eq!(parse_retry_after_seconds("  45  "), Some(45));
+        assert_eq!(parse_retry_after_seconds("0"), None);
+        assert_eq!(parse_retry_after_seconds("-5"), None);
+        assert_eq!(parse_retry_after_seconds("not-a-number"), None);
+        assert_eq!(parse_retry_after_seconds(""), None);
+
+        let future = Utc::now() + chrono::Duration::seconds(90);
+        let http_date = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let parsed = parse_retry_after_seconds(&http_date).expect("http-date should parse");
+        assert!((85..=90).contains(&parsed), "expected ~90s, got {parsed}");
+
+        let past = Utc::now() - chrono::Duration::seconds(30);
+        let past_http_date = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        assert_eq!(parse_retry_after_seconds(&past_http_date), None);
+    }
+
+    #[test]
+    fn visible_models_respect_hidden_list_and_live_catalog_but_never_drop_the_selected_model() {
+        const SPECS: &[ModelSpec] = &[
+            ModelSpec {
+                id: "model-a",
+                label: "Model A",
+                thinking_levels: &[],
+            },
+            ModelSpec {
+                id: "model-b",
+                label: "Model B",
+                thinking_levels: &[],
+            },
+            ModelSpec {
+                id: "model-c",
+                label: "Model C",
+                thinking_levels: &[],
+            },
+        ];
+
+        // No hidden list, no live data yet: everything shows.
+        let none_hidden = BTreeSet::new();
+        let ids = |visible: Vec<&ModelSpec>| visible.iter().map(|spec| spec.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(filter_visible_models(SPECS, "model-a", &none_hidden, None)),
+            vec!["model-a", "model-b", "model-c"]
+        );
+
+        // A manually-hidden model disappears, unless it's the current selection.
+        let hidden_b = BTreeSet::from(["model-b".to_string()]);
+        assert_eq!(
+            ids(filter_visible_models(SPECS, "model-a", &hidden_b, None)),
+            vec!["model-a", "model-c"]
+        );
+        assert_eq!(
+            ids(filter_visible_models(SPECS, "model-b", &hidden_b, None)),
+            vec!["model-a", "model-b", "model-c"]
+        );
+
+        // A live catalog that omits a model hides it too, unless it's selected.
+        let live = vec!["model-a".to_string(), "model-c".to_string()];
+        assert_eq!(
+            ids(filter_visible_models(
+                SPECS,
+                "model-a",
+                &none_hidden,
+                Some(&live)
+            )),
+            vec!["model-a", "model-c"]
+        );
+        assert_eq!(
+            ids(filter_visible_models(
+                SPECS,
+                "model-b",
+                &none_hidden,
+                Some(&live)
+            )),
+            vec!["model-a", "model-b", "model-c"]
+        );
+
+        // Both filters combine.
+        assert_eq!(
+            ids(filter_visible_models(
+                SPECS,
+                "model-a",
+                &hidden_b,
+                Some(&live)
+            )),
+            vec!["model-a", "model-c"]
+        );
+    }
+
+    #[test]
+    fn failover_picks_a_same_provider_account_that_is_not_cooling_and_skips_others() {
+        fn account(file_name: &str, provider: &str) -> GatewayAccount {
+            GatewayAccount {
+                file_name: file_name.into(),
+                provider: provider.into(),
+                email: None,
+                label: file_name.into(),
+                disabled: true,
+                active: false,
+                cooldown_until_ms: None,
+            }
+        }
+        let accounts = vec![
+            account("codex-a.json", "codex"),
+            account("codex-b.json", "codex"),
+            account("codex-c.json", "codex"),
+            account("xai-only.json", "xai"),
+        ];
+        let now = Utc::now();
+
+        // No cooldowns recorded: first other same-provider account wins.
+        let none_cooling = BTreeMap::new();
+        assert_eq!(
+            pick_failover_candidate(&accounts, "codex-a.json", "codex", &none_cooling, now)
+                .map(|account| account.file_name.as_str()),
+            Some("codex-b.json")
+        );
+
+        // codex-b is cooling: falls through to codex-c.
+        let mut cooling = BTreeMap::new();
+        cooling.insert(
+            "codex-b.json".to_string(),
+            now + chrono::Duration::seconds(30),
+        );
+        assert_eq!(
+            pick_failover_candidate(&accounts, "codex-a.json", "codex", &cooling, now)
+                .map(|account| account.file_name.as_str()),
+            Some("codex-c.json")
+        );
+
+        // An expired cooldown entry no longer excludes the account.
+        let mut expired = BTreeMap::new();
+        expired.insert(
+            "codex-b.json".to_string(),
+            now - chrono::Duration::seconds(1),
+        );
+        assert_eq!(
+            pick_failover_candidate(&accounts, "codex-a.json", "codex", &expired, now)
+                .map(|account| account.file_name.as_str()),
+            Some("codex-b.json")
+        );
+
+        // Never crosses providers: with no other codex account, the xai
+        // account is not picked as a substitute even though it's available.
+        let single_provider_accounts = vec![
+            account("codex-a.json", "codex"),
+            account("xai-only.json", "xai"),
+        ];
+        assert!(pick_failover_candidate(
+            &single_provider_accounts,
+            "codex-a.json",
+            "codex",
+            &none_cooling,
+            now
+        )
+        .is_none());
+
+        // All same-provider candidates cooling: no failover.
+        let mut all_cooling = BTreeMap::new();
+        all_cooling.insert(
+            "codex-b.json".to_string(),
+            now + chrono::Duration::seconds(30),
+        );
+        all_cooling.insert(
+            "codex-c.json".to_string(),
+            now + chrono::Duration::seconds(30),
+        );
+        assert!(
+            pick_failover_candidate(&accounts, "codex-a.json", "codex", &all_cooling, now)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn relay_long_sse_stream_survives_while_each_chunk_meets_idle_budget() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -6459,5 +7252,35 @@ mod tests {
         );
         let decoded: ControllerState = serde_json::from_value(encoded).unwrap();
         assert!(decoded.skip_model_switch_confirmation);
+    }
+
+    #[test]
+    fn xai_refresh_is_due_only_inside_the_safety_window() {
+        let now = Utc::now();
+        let due = serde_json::json!({
+            "expired": (now + ChronoDuration::seconds(XAI_REFRESH_SKEW_SECS - 1)).to_rfc3339()
+        });
+        let fresh = serde_json::json!({
+            "expired": (now + ChronoDuration::seconds(XAI_REFRESH_SKEW_SECS + 60)).to_rfc3339()
+        });
+        assert!(xai_refresh_required(&due, now));
+        assert!(!xai_refresh_required(&fresh, now));
+        assert!(xai_refresh_required(&serde_json::json!({}), now));
+    }
+
+    #[test]
+    fn xai_refresh_endpoint_accepts_only_trusted_https_hosts() {
+        assert!(xai_refresh_endpoint(&serde_json::json!({
+            "token_endpoint": "https://auth.x.ai/oauth2/token"
+        }))
+        .is_ok());
+        assert!(xai_refresh_endpoint(&serde_json::json!({
+            "token_endpoint": "http://auth.x.ai/oauth2/token"
+        }))
+        .is_err());
+        assert!(xai_refresh_endpoint(&serde_json::json!({
+            "token_endpoint": "https://auth.x.ai.attacker.invalid/oauth2/token"
+        }))
+        .is_err());
     }
 }

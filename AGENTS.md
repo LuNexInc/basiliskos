@@ -31,3 +31,13 @@ pnpm tauri build
 ```
 
 Follow the root workspace `AGENTS.md` and `HANDOFF.md` protocol.
+
+## OpenCodex scaffold (2026-07-23)
+
+- Basiliskos embeds an **OpenCodex-shaped multi-provider catalog** under
+  `src-tauri/src/opencodex.rs` and an **OpenCodex** UI tab.
+- Live request routing still uses only Claude / Codex / Grok / Kimi via the
+  pinned CLIProxyAPI path. Do **not** reinstall `@bitkyc08/opencodex` or rewrite
+  `~/.codex/config.toml` for this product.
+- Design + next milestones: `docs/OPENCODEX-SCAFFOLD.md`. Get Charles's approval
+  before enabling live catalog routing or storing API keys.

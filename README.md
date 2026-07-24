@@ -53,6 +53,11 @@ request.
    them. If a signed-in Kimi account has no Kimi Code subscription, the
    account card shows **No active Kimi Code subscription** instead of a
    misleading re-auth error.
+8. Open the **OpenCodex** tab for the multi-provider catalog scaffold
+   (OpenRouter, Ollama, DeepSeek, Gemini, Azure, custom OpenAI-compatible).
+   It stores preference intent only; live Claude Code traffic still uses the
+   four OAuth backends above until a later milestone turns catalog routing on.
+   See [docs/OPENCODEX-SCAFFOLD.md](docs/OPENCODEX-SCAFFOLD.md).
 
 Basiliskos never applies its relay to `%LOCALAPPDATA%\Claude-3p`. Version 1.0.1
 also detects and restores a shared configuration left applied by version 1.0.0.

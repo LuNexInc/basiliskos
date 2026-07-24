@@ -14,22 +14,28 @@ $gatewayBackend = Get-Content -LiteralPath (Join-Path $projectRoot 'src-tauri\sr
 
 $expected = @(
     'cancel_provider_login'
+    'clear_account_pool_pins'
     'gateway_snapshot'
     'get_gateway_account_usage'
     'install_basiliskos_update'
     'launch_hydra_claude'
+    'launch_hydra_codex'
     'launch_provider_login'
     'latest_basiliskos_release'
     'open_diagnostics_folder'
+    'opencodex_status'
     'prepare_basiliskos_update'
     'remove_gateway_account'
     'rename_gateway_account'
     'select_gateway_account'
     'set_gateway_route'
+    'set_account_pool_mode'
+    'set_opencodex_preferences'
     'set_skip_model_switch_confirmation'
     'start_gateway'
     'stop_gateway'
     'stop_hydra_claude'
+    'stop_hydra_codex'
 ) | Sort-Object -Unique
 
 $handler = [regex]::Match(

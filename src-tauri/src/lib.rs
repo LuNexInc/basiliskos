@@ -4,11 +4,38 @@ use tauri::{
     Manager, WindowEvent,
 };
 
+mod codex_cli;
+mod codex_switcher_import;
 mod diagnostics;
 mod gateway;
+mod grok_cli;
 mod persistence;
 #[cfg(test)]
 mod test_support;
+
+/// Cross-service "currently active for" indicator (see plan/AGENTS.md): who
+/// currently has this same real account active, by email, across
+/// Basiliskos's own relay and the external Codex/Grok CLI switchers. Grok's
+/// half is added once `grok_cli` lands; until then that field is always
+/// `null`, which the frontend already treats as "no match," not an error.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveServiceIdentities {
+    relay_email: Option<String>,
+    codex_cli_email: Option<String>,
+    grok_cli_email: Option<String>,
+}
+
+#[tauri::command]
+fn active_service_identities() -> ActiveServiceIdentities {
+    let codex_cli_email = codex_cli::live_codex_cli_account_id()
+        .and_then(|account_id| codex_cli::find_email_by_account_id(&account_id));
+    ActiveServiceIdentities {
+        relay_email: gateway::active_relay_email(),
+        codex_cli_email,
+        grok_cli_email: grok_cli::live_grok_cli_email(),
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -79,11 +106,30 @@ pub fn run() {
             gateway::launch_provider_login,
             gateway::cancel_provider_login,
             gateway::set_skip_model_switch_confirmation,
+            gateway::get_model_catalog,
+            gateway::set_model_hidden,
             gateway::latest_basiliskos_release,
             gateway::prepare_basiliskos_update,
             gateway::install_basiliskos_update,
             gateway::launch_hydra_claude,
-            gateway::stop_hydra_claude
+            gateway::stop_hydra_claude,
+            codex_cli::list_codex_cli_accounts,
+            codex_cli::switch_codex_cli_account,
+            codex_cli::add_codex_cli_account_from_relay,
+            codex_cli::import_current_codex_cli_account,
+            codex_cli::rename_codex_cli_account,
+            codex_cli::remove_codex_cli_account,
+            codex_cli::serve_codex_cli_from_relay,
+            grok_cli::list_grok_cli_accounts,
+            grok_cli::switch_grok_cli_account,
+            grok_cli::launch_grok_cli_login,
+            grok_cli::grok_cli_login_fingerprint,
+            grok_cli::import_current_grok_cli_account,
+            grok_cli::rename_grok_cli_account,
+            grok_cli::remove_grok_cli_account,
+            grok_cli::serve_grok_cli_from_relay,
+            codex_switcher_import::import_accounts_from_codex_switcher,
+            active_service_identities
         ])
         .build(tauri::generate_context!())
         .expect("error while building Basiliskos")
