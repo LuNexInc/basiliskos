@@ -60,6 +60,13 @@ const XAI_CREDENTIAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2 * 60
 const XAI_DEFAULT_TOKEN_LIFETIME_SECS: i64 = 6 * 60 * 60;
 const XAI_RELOGIN_REQUIRED: &str =
     "This saved Grok authorization was revoked. Sign in again to renew it.";
+const KIMI_CREDENTIAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2 * 60);
+const KIMI_REFRESH_SKEW_SECS: i64 = 5 * 60;
+const KIMI_DEFAULT_TOKEN_LIFETIME_SECS: i64 = 15 * 60;
+const KIMI_TOKEN_ENDPOINT: &str = "https://auth.kimi.com/api/oauth/token";
+const KIMI_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
+const KIMI_RELOGIN_REQUIRED: &str =
+    "This saved Kimi authorization was revoked. Sign in again to renew it.";
 #[derive(Clone, Copy)]
 struct ModelSpec {
     id: &'static str,
@@ -316,6 +323,10 @@ static XAI_REFRESH_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex
     OnceLock::new();
 static XAI_REFRESH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static XAI_CREDENTIAL_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
+static KIMI_REFRESH_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+static KIMI_REFRESH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static KIMI_CREDENTIAL_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
 
 fn controller() -> &'static ControllerManager {
     CONTROLLER.get_or_init(ControllerManager::default)
@@ -340,6 +351,17 @@ fn xai_refresh_lock(file_name: &str) -> Result<Arc<tokio::sync::Mutex<()>>, Stri
     let mut locks = locks
         .lock()
         .map_err(|_| "Basiliskos Grok refresh coordination is locked".to_string())?;
+    Ok(locks
+        .entry(file_name.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
+}
+
+fn kimi_refresh_lock(file_name: &str) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    let locks = KIMI_REFRESH_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut locks = locks
+        .lock()
+        .map_err(|_| "Basiliskos Kimi refresh coordination is locked".to_string())?;
     Ok(locks
         .entry(file_name.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -520,6 +542,12 @@ struct ControllerState {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct XaiRefreshState {
+    #[serde(default)]
+    relogin_required: BTreeSet<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct KimiRefreshState {
     #[serde(default)]
     relogin_required: BTreeSet<String>,
 }
@@ -761,6 +789,53 @@ fn xai_refresh_state_path() -> Result<PathBuf, String> {
     Ok(root_dir()?.join("xai-refresh-state.json"))
 }
 
+fn kimi_refresh_state_path() -> Result<PathBuf, String> {
+    Ok(root_dir()?.join("kimi-refresh-state.json"))
+}
+
+fn kimi_relogin_required(file_name: &str) -> Result<bool, String> {
+    let lock = KIMI_REFRESH_STATE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| "Basiliskos Kimi refresh state is locked".to_string())?;
+    let path = kimi_refresh_state_path()?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(
+        load_json_with_recovery::<KimiRefreshState>(&path, "Basiliskos Kimi refresh state")?
+            .relogin_required
+            .contains(file_name),
+    )
+}
+
+fn set_kimi_relogin_required(file_name: &str, required: bool) -> Result<(), String> {
+    let lock = KIMI_REFRESH_STATE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| "Basiliskos Kimi refresh state is locked".to_string())?;
+    let path = kimi_refresh_state_path()?;
+    let mut state = if path.exists() {
+        load_json_with_recovery::<KimiRefreshState>(&path, "Basiliskos Kimi refresh state")?
+    } else {
+        KimiRefreshState::default()
+    };
+    if required {
+        state.relogin_required.insert(file_name.to_string());
+    } else {
+        state.relogin_required.remove(file_name);
+    }
+    let bytes =
+        serde_json::to_vec_pretty(&state).map_err(|_| "Could not save Kimi refresh state")?;
+    durable_write(&path, &bytes)
+}
+
+fn kimi_refresh_error_requires_relogin(status: reqwest::StatusCode, code: Option<&str>) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+        || matches!(code, Some("invalid_grant") | Some("invalid_token"))
+}
+
 fn load_xai_refresh_state() -> Result<XaiRefreshState, String> {
     let path = xai_refresh_state_path()?;
     if !path.exists() {
@@ -855,15 +930,22 @@ pub fn initialize_controller_storage() -> Result<(), String> {
     let labels_file = account_labels_path()?;
     let config_file = config_path()?;
     let xai_refresh_state_file = xai_refresh_state_path()?;
+    let kimi_refresh_state_file = kimi_refresh_state_path()?;
     for file in [
         &state_file,
         &labels_file,
         &config_file,
         &xai_refresh_state_file,
+        &kimi_refresh_state_file,
     ] {
         secure_existing_path(file)?;
     }
-    for json_file in [&state_file, &labels_file, &xai_refresh_state_file] {
+    for json_file in [
+        &state_file,
+        &labels_file,
+        &xai_refresh_state_file,
+        &kimi_refresh_state_file,
+    ] {
         if let Ok(bytes) = fs::read(json_file) {
             if serde_json::from_slice::<Value>(&bytes).is_ok() {
                 durable_write(json_file, &bytes)?;
@@ -877,6 +959,7 @@ pub fn initialize_controller_storage() -> Result<(), String> {
     secure_files_in(&controller_logs, "log")?;
     secure_files_in(&claude_logs, "log")?;
     start_xai_credential_maintenance();
+    start_kimi_credential_maintenance();
     Ok(())
 }
 
@@ -3754,6 +3837,171 @@ fn start_xai_credential_maintenance() {
     });
 }
 
+fn kimi_refresh_required(credential: &Value, now: DateTime<Utc>) -> bool {
+    credential
+        .get("expired")
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|expiry| {
+            expiry.with_timezone(&Utc) <= now + ChronoDuration::seconds(KIMI_REFRESH_SKEW_SECS)
+        })
+        .unwrap_or(true)
+}
+
+async fn refresh_kimi_relay_credential_if_needed(file_name: &str) -> Result<bool, String> {
+    let path = exact_auth_path(file_name)?;
+    let refresh_lock = kimi_refresh_lock(file_name)?;
+    let _refresh = refresh_lock.lock().await;
+    if kimi_relogin_required(file_name)? {
+        return Err(KIMI_RELOGIN_REQUIRED.into());
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read Kimi credential: {error}"))?;
+    let mut credential: Value =
+        serde_json::from_str(&raw).map_err(|_| "Kimi credential is invalid")?;
+    if account_provider(&credential, file_name).as_deref() != Some("kimi")
+        || !kimi_refresh_required(&credential, Utc::now())
+    {
+        return Ok(false);
+    }
+    let refresh_token = credential
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .ok_or("Kimi credential is missing a refresh token")?;
+    let device_id = credential
+        .get("device_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("client_id", KIMI_CLIENT_ID)
+        .append_pair("refresh_token", refresh_token)
+        .finish();
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("Basiliskos/2.0")
+        .build()
+        .map_err(|_| "Could not prepare Kimi credential refresh")?
+        .post(KIMI_TOKEN_ENDPOINT)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header("X-Msh-Platform", "CLIProxyAPI")
+        .header("X-Msh-Version", GATEWAY_VERSION)
+        .header("X-Msh-Device-Id", device_id)
+        .body(form)
+        .send()
+        .await
+        .map_err(|_| "Kimi credential refresh could not reach Kimi")?;
+    let status = response.status();
+    let refreshed: Value = response.json().await.unwrap_or(Value::Null);
+    let code = refreshed
+        .get("error")
+        .or_else(|| refreshed.get("code"))
+        .and_then(Value::as_str);
+    if !status.is_success()
+        || refreshed
+            .get("access_token")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        if kimi_refresh_error_requires_relogin(status, code) {
+            set_kimi_relogin_required(file_name, true)?;
+            return Err(KIMI_RELOGIN_REQUIRED.into());
+        }
+        return Err(
+            "Kimi credential refresh failed temporarily. It will retry automatically.".into(),
+        );
+    }
+    let object = credential
+        .as_object_mut()
+        .ok_or("Kimi credential is invalid")?;
+    let access = refreshed
+        .get("access_token")
+        .and_then(Value::as_str)
+        .expect("checked above");
+    object.insert("access_token".into(), Value::String(access.to_owned()));
+    for key in ["refresh_token", "token_type", "scope"] {
+        if let Some(value) = refreshed.get(key).and_then(Value::as_str) {
+            object.insert(key.into(), Value::String(value.to_owned()));
+        }
+    }
+    let expires_in = refreshed
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .unwrap_or(KIMI_DEFAULT_TOKEN_LIFETIME_SECS);
+    let now = Utc::now();
+    object.insert(
+        "expired".into(),
+        Value::String((now + ChronoDuration::seconds(expires_in)).to_rfc3339()),
+    );
+    object.insert("last_refresh".into(), Value::String(now.to_rfc3339()));
+    durable_write(
+        &path,
+        &serde_json::to_vec_pretty(&credential)
+            .map_err(|_| "Could not save refreshed Kimi credential")?,
+    )?;
+    set_kimi_relogin_required(file_name, false)?;
+    Ok(true)
+}
+
+async fn maintain_saved_kimi_credentials_once() {
+    let Ok(directory) = auth_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|value| value.to_str()) != Some("json")
+            || kimi_relogin_required(name).unwrap_or(false)
+        {
+            continue;
+        }
+        let is_kimi = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| account_provider(&value, name))
+            .as_deref()
+            == Some("kimi");
+        if !is_kimi {
+            continue;
+        }
+        if let Err(error) = refresh_kimi_relay_credential_if_needed(name).await {
+            diagnostics::record(
+                ErrorCode::ProviderAuthFailed,
+                "warning",
+                if error == KIMI_RELOGIN_REQUIRED {
+                    "A saved Kimi authorization was revoked and needs one re-login."
+                } else {
+                    "A saved Kimi authorization refresh failed temporarily and will retry automatically."
+                },
+                None,
+                None,
+                Some("kimi"),
+            );
+        }
+    }
+}
+
+fn start_kimi_credential_maintenance() {
+    if KIMI_CREDENTIAL_MAINTENANCE_STARTED.set(()).is_err() {
+        return;
+    }
+    tauri::async_runtime::spawn(async {
+        loop {
+            maintain_saved_kimi_credentials_once().await;
+            tokio::time::sleep(KIMI_CREDENTIAL_MAINTENANCE_INTERVAL).await;
+        }
+    });
+}
+
 fn validate_account_invariant(directory: &Path, state_path: &Path) -> Result<(), String> {
     let state: ControllerState = serde_json::from_slice(
         &fs::read(state_path)
@@ -4456,6 +4704,9 @@ fn merge_staged_login(provider: &str, staging_dir: &Path) -> Result<String, Stri
     })?;
     if provider == "xai" {
         set_xai_relogin_required(&destination_name, false)?;
+    }
+    if provider == "kimi" {
+        set_kimi_relogin_required(&destination_name, false)?;
     }
     prepare_config()?;
     Ok(destination_name)
