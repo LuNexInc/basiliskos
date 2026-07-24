@@ -7715,4 +7715,24 @@ mod tests {
         )));
         assert!(!xai_refresh_error_requires_relogin(None));
     }
+
+    #[test]
+    fn kimi_refresh_relogin_is_only_required_for_rejected_grants() {
+        assert!(kimi_refresh_error_requires_relogin(
+            reqwest::StatusCode::UNAUTHORIZED,
+            None
+        ));
+        assert!(kimi_refresh_error_requires_relogin(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("invalid_grant")
+        ));
+        assert!(!kimi_refresh_error_requires_relogin(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("temporarily_unavailable")
+        ));
+        assert!(!kimi_refresh_error_requires_relogin(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            None
+        ));
+    }
 }
