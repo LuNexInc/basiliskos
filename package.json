@@ -1,7 +1,7 @@
 {
   "name": "hydra-gateway",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.0.1",
   "type": "module",
   "scripts": {
     "prepare:gateway": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-gateway.ps1",
