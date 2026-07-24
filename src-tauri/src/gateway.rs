@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -378,6 +378,12 @@ pub struct GatewayAccount {
     pub disabled: bool,
     pub active: bool,
     pub cooldown_until_ms: Option<i64>,
+    /// The provider access-token expiry when the saved credential exposes one.
+    /// This is metadata only: no token material ever leaves the local backend.
+    pub expires_at_ms: Option<i64>,
+    /// A small, user-facing credential health state. `relogin_required` is
+    /// deliberately reserved for a provider-confirmed terminal refresh error.
+    pub credential_status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2817,6 +2823,57 @@ fn account_provider(value: &Value, file_name: &str) -> Option<String> {
         .then_some(provider)
 }
 
+fn credential_expiry(value: &Value) -> Option<DateTime<Utc>> {
+    ["expired", "expires_at", "expiresAt", "expiry"]
+        .into_iter()
+        .find_map(|key| value.get(key))
+        .and_then(|raw| match raw {
+            Value::String(value) => DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|value| value.with_timezone(&Utc)),
+            Value::Number(value) => value.as_i64().and_then(|seconds| {
+                // OAuth documents commonly use epoch seconds, while a few
+                // local stores use milliseconds. Accept both without guessing
+                // from arbitrary string fields.
+                if seconds.abs() >= 100_000_000_000 {
+                    Utc.timestamp_millis_opt(seconds).single()
+                } else {
+                    Utc.timestamp_opt(seconds, 0).single()
+                }
+            }),
+            _ => None,
+        })
+}
+
+fn credential_status(
+    provider: &str,
+    file_name: &str,
+    expiry: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> String {
+    let relogin_required = match provider {
+        "xai" => xai_relogin_required(file_name).unwrap_or(false),
+        "kimi" => kimi_relogin_required(file_name).unwrap_or(false),
+        _ => false,
+    };
+    if relogin_required {
+        return "relogin_required".into();
+    }
+    let renewal_window = match provider {
+        "xai" => XAI_REFRESH_SKEW_SECS,
+        "kimi" => KIMI_REFRESH_SKEW_SECS,
+        _ => 0,
+    };
+    match expiry {
+        None => "unknown".into(),
+        Some(expiry) if expiry <= now && renewal_window == 0 => "expired".into(),
+        Some(expiry) if expiry <= now + ChronoDuration::seconds(renewal_window) => {
+            "renewal_due".into()
+        }
+        Some(_) => "active".into(),
+    }
+}
+
 fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, String> {
     let directory = auth_dir()?;
     let labels = load_account_labels()?;
@@ -2827,6 +2884,7 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
         runtime.account_cooldowns.retain(|_, until| *until > now);
         runtime.account_cooldowns.clone()
     };
+    let now = Utc::now();
     let mut accounts = Vec::new();
     for entry in fs::read_dir(&directory)
         .map_err(|error| format!("Could not read {}: {error}", directory.display()))?
@@ -2862,6 +2920,8 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
         let cooldown_until_ms = cooldowns
             .get(&file_name)
             .map(|until| until.timestamp_millis());
+        let expiry = credential_expiry(&value);
+        let credential_status = credential_status(&provider, &file_name, expiry, now);
         accounts.push(GatewayAccount {
             active: state.active_account.as_deref() == Some(file_name.as_str()) && !disabled,
             file_name,
@@ -2870,6 +2930,8 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
             label,
             disabled,
             cooldown_until_ms,
+            expires_at_ms: expiry.map(|value| value.timestamp_millis()),
+            credential_status,
         });
     }
     accounts.sort_by(|left, right| {
@@ -6625,6 +6687,8 @@ mod tests {
                 disabled: false,
                 active: false,
                 cooldown_until_ms: None,
+                expires_at_ms: None,
+                credential_status: "unknown".into(),
             },
             GatewayAccount {
                 file_name: "xai-b.json".into(),
@@ -6634,6 +6698,8 @@ mod tests {
                 disabled: false,
                 active: false,
                 cooldown_until_ms: None,
+                expires_at_ms: None,
+                credential_status: "unknown".into(),
             },
         ];
         let state_path = root.join("controller.json");
@@ -6699,6 +6765,8 @@ mod tests {
                     disabled: false,
                     active: true,
                     cooldown_until_ms: None,
+                    expires_at_ms: None,
+                    credential_status: "unknown".into(),
                 },
                 GatewayAccount {
                     file_name: "xai-b.json".into(),
@@ -6708,6 +6776,8 @@ mod tests {
                     disabled: true,
                     active: false,
                     cooldown_until_ms: None,
+                    expires_at_ms: None,
+                    credential_status: "unknown".into(),
                 },
             ];
             let (mutations, _) =
@@ -6776,6 +6846,8 @@ mod tests {
                 disabled: false,
                 active: true,
                 cooldown_until_ms: None,
+                expires_at_ms: None,
+                credential_status: "unknown".into(),
             },
             GatewayAccount {
                 file_name: "xai-b.json".into(),
@@ -6785,6 +6857,8 @@ mod tests {
                 disabled: true,
                 active: false,
                 cooldown_until_ms: None,
+                expires_at_ms: None,
+                credential_status: "unknown".into(),
             },
         ];
         (auth, state_path, labels_path, accounts, state, labels)
@@ -7426,6 +7500,8 @@ mod tests {
                 disabled: true,
                 active: false,
                 cooldown_until_ms: None,
+                expires_at_ms: None,
+                credential_status: "unknown".into(),
             }
         }
         let accounts = vec![
@@ -7719,6 +7795,37 @@ mod tests {
             "temporarily_unavailable"
         )));
         assert!(!xai_refresh_error_requires_relogin(None));
+    }
+
+    #[test]
+    fn credential_expiry_status_is_truthful_about_renewal_and_relogin() {
+        let now = Utc::now();
+        let credential = serde_json::json!({
+            "expired": (now + ChronoDuration::minutes(15)).to_rfc3339(),
+        });
+        assert!(credential_expiry(&credential).is_some());
+        assert_eq!(
+            credential_status(
+                "codex",
+                "codex-test.json",
+                credential_expiry(&credential),
+                now
+            ),
+            "active"
+        );
+        assert_eq!(
+            credential_status(
+                "codex",
+                "codex-test.json",
+                Some(now - ChronoDuration::seconds(1)),
+                now
+            ),
+            "expired"
+        );
+        assert_eq!(
+            credential_status("codex", "codex-test.json", None, now),
+            "unknown"
+        );
     }
 
     #[test]

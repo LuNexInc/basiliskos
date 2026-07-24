@@ -143,6 +143,10 @@ button.secondary:hover:not(:disabled) { border-color: rgba(238, 229, 207, 0.55);
 .account-name-line > span.cooldown-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border: 1px solid rgba(232, 121, 61, 0.55); border-radius: 999px; color: #ffcda1; background: rgba(159, 64, 34, 0.28); font-variant-numeric: tabular-nums; animation: cooldown-pulse 2s ease-in-out infinite; }
 @keyframes cooldown-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
 .account-copy p { margin-top: 1px; overflow: hidden; color: var(--muted); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.credential-expiry { display: inline-flex; align-items: center; gap: 4px; margin-top: 4px; color: #9fe0b4; font-size: 9.5px; font-variant-numeric: tabular-nums; }
+.credential-expiry.renewal { color: #ffcda1; }
+.credential-expiry.relogin, .credential-expiry.expired { color: #ffaaa3; }
+.credential-expiry.unknown { color: #71838a; }
 .account-actions { display: flex; gap: 6px; }
 .icon-button { width: 28px; min-height: 28px; padding: 0; border-color: transparent; background: #172832; }
 .icon-button.danger { color: var(--danger); }

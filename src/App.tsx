@@ -37,6 +37,8 @@ type Account = {
   disabled: boolean;
   active: boolean;
   cooldownUntilMs?: number;
+  expiresAtMs?: number;
+  credentialStatus: "active" | "renewal_due" | "relogin_required" | "expired" | "unknown";
 };
 
 type UsageWindow = {
@@ -167,7 +169,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-const APP_VERSION = "2.0.3";
+const APP_VERSION = "2.1.0";
 const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
@@ -279,6 +281,27 @@ function cooldownLabel(remainingMs: number) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+export function credentialExpiry(account: Account, now: number) {
+  if (account.credentialStatus === "relogin_required") {
+    return { label: "Sign in again", tone: "relogin" };
+  }
+  if (!account.expiresAtMs) {
+    return { label: "Expiry unavailable", tone: "unknown" };
+  }
+  const expiry = new Date(account.expiresAtMs);
+  if (Number.isNaN(expiry.getTime())) {
+    return { label: "Expiry unavailable", tone: "unknown" };
+  }
+  const time = expiry.toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
+  if (account.credentialStatus === "renewal_due") {
+    return { label: `Renewing now · ${time}`, tone: "renewal" };
+  }
+  if (account.credentialStatus === "expired" || account.expiresAtMs <= now) {
+    return { label: `Expired · ${time}`, tone: "expired" };
+  }
+  return { label: `Expires · ${time}`, tone: "active" };
 }
 
 function ClaudeCodeMark({ className }: { className?: string }) {
@@ -1012,6 +1035,7 @@ export default function App() {
               const usage = usageByAccount[account.fileName];
               const isEditing = editingAccount === account.fileName;
               const cooling = cooldownRemaining(account.cooldownUntilMs, now);
+              const expiry = credentialExpiry(account, now);
               return (
                 <article className={`account-row ${account.active ? "active" : ""}`} key={account.fileName}>
                   <div className="account-avatar">{account.label.slice(0, 1).toUpperCase()}</div>
@@ -1041,6 +1065,9 @@ export default function App() {
                       </div>
                     )}
                     <p>{account.email ?? "Authorized account"}</p>
+                    <div className={`credential-expiry ${expiry.tone}`} title={account.expiresAtMs ? `Credential expiry: ${new Date(account.expiresAtMs).toLocaleString()}` : "This provider did not expose an expiry time"}>
+                      <Timer size={11} aria-hidden="true" /> {expiry.label}
+                    </div>
                     <div className="usage-summary">
                       {usage?.data ? usage.data.windows.map((window) => window.known ? (
                         <div className={`usage-window ${window.remainingPercent < 20 ? "low" : ""}`} key={window.label} title={`${Math.round(window.usedPercent)}% used`}>
@@ -1063,7 +1090,7 @@ export default function App() {
                     </div>
                   </div>
                   <div className="account-actions">
-                    {usage?.error?.includes("Sign in again") && (
+                    {(account.credentialStatus === "relogin_required" || usage?.error?.includes("Sign in again")) && (
                       <button
                         className="icon-button warn"
                         aria-label={`Re-login ${account.label}`}

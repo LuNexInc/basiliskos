@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { DiagnosticEventList, isNewerVersion, StatusBadge } from "./App";
+import { credentialExpiry, DiagnosticEventList, isNewerVersion, StatusBadge } from "./App";
 
 describe("truthful Basiliskos status components", () => {
   it("only advertises a numerically newer published version", () => {
@@ -49,5 +49,18 @@ describe("truthful Basiliskos status components", () => {
     expect(screen.getByText("BAS-UPSTREAM-001")).toBeInTheDocument();
     expect(screen.getByText("The provider rejected the selected credential.")).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/token|prompt|bearer/i);
+  });
+
+  it("makes confirmed re-login and unknown expiry visible without exposing credentials", () => {
+    const base = {
+      fileName: "kimi-account.json",
+      provider: "kimi" as const,
+      label: "Kimi account",
+      disabled: false,
+      active: false,
+      credentialStatus: "relogin_required" as const,
+    };
+    expect(credentialExpiry(base, Date.now())).toEqual({ label: "Sign in again", tone: "relogin" });
+    expect(credentialExpiry({ ...base, credentialStatus: "unknown" }, Date.now())).toEqual({ label: "Expiry unavailable", tone: "unknown" });
   });
 });
