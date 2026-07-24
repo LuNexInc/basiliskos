@@ -143,7 +143,11 @@ impl From<&CodexCliAccount> for CodexCliAccountView {
 }
 
 fn views(store: &CodexCliStore) -> Vec<CodexCliAccountView> {
-    store.accounts.iter().map(CodexCliAccountView::from).collect()
+    store
+        .accounts
+        .iter()
+        .map(CodexCliAccountView::from)
+        .collect()
 }
 
 fn load_codex_cli_store() -> Result<CodexCliStore, String> {
@@ -358,7 +362,9 @@ fn find_or_add_codex_cli_account_from_relay(
         .get("email")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let label = email.clone().unwrap_or_else(|| "Codex CLI account".to_string());
+    let label = email
+        .clone()
+        .unwrap_or_else(|| "Codex CLI account".to_string());
     let new_id = Uuid::new_v4().to_string();
     store.accounts.push(CodexCliAccount {
         id: new_id.clone(),
@@ -488,7 +494,10 @@ pub fn import_current_codex_cli_account(label: String) -> Result<Vec<CodexCliAcc
 }
 
 #[tauri::command]
-pub fn rename_codex_cli_account(id: String, label: String) -> Result<Vec<CodexCliAccountView>, String> {
+pub fn rename_codex_cli_account(
+    id: String,
+    label: String,
+) -> Result<Vec<CodexCliAccountView>, String> {
     let mut store = load_codex_cli_store()?;
     let account = store
         .accounts
@@ -570,7 +579,10 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("basiliskos-codex-cli-test-{name}-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "basiliskos-codex-cli-test-{name}-{}",
+            Uuid::new_v4()
+        ));
         fs::create_dir_all(&path).unwrap();
         path
     }
@@ -596,7 +608,8 @@ mod tests {
             accounts: vec![stored_account("acc-a", "acct-1", &native)],
         };
         switch_codex_account_at(&mut store, "acc-a", &auth_path).unwrap();
-        let written: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
         assert_eq!(written["tokens"]["account_id"], "acct-1");
         assert!(store.accounts[0].last_used_at.is_some());
         fs::remove_dir_all(dir).ok();
@@ -625,16 +638,25 @@ mod tests {
         fresher_cred["last_refresh"] = Value::String("2026-07-23T12:00:00Z".into());
         fresher_cred["access_token"] = Value::String("at-refreshed".into());
         let fresher_native = translate_codex_cred(&fresher_cred).unwrap();
-        fs::write(&auth_path, serde_json::to_vec_pretty(&fresher_native).unwrap()).unwrap();
+        fs::write(
+            &auth_path,
+            serde_json::to_vec_pretty(&fresher_native).unwrap(),
+        )
+        .unwrap();
 
         let mut store = CodexCliStore {
             accounts: vec![
                 stored_account("acc-a", "acct-1", &stale_native),
-                stored_account("acc-b", "acct-2", &translate_codex_cred(&{
-                    let mut other = sample_cliproxy_cred();
-                    other["account_id"] = Value::String("acct-2".into());
-                    other
-                }).unwrap()),
+                stored_account(
+                    "acc-b",
+                    "acct-2",
+                    &translate_codex_cred(&{
+                        let mut other = sample_cliproxy_cred();
+                        other["account_id"] = Value::String("acct-2".into());
+                        other
+                    })
+                    .unwrap(),
+                ),
             ],
         };
 
@@ -645,7 +667,8 @@ mod tests {
         assert_eq!(acc_a_after["tokens"]["access_token"], "at-refreshed");
         assert_eq!(acc_a_after["last_refresh"], "2026-07-23T12:00:00Z");
 
-        let written: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
         assert_eq!(written["tokens"]["account_id"], "acct-2");
         fs::remove_dir_all(dir).ok();
     }

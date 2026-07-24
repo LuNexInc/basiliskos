@@ -99,7 +99,13 @@ fn build_relay_credential(email: &str, auth_data: &Value) -> Result<Value, Strin
 fn sanitize_for_filename(value: &str) -> String {
     value
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '@' || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '@' || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -181,8 +187,8 @@ mod tests {
         use base64::Engine;
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::json!({"alg": "RS256"}).to_string());
-        let payload =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": exp}).to_string());
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({"exp": exp}).to_string());
         format!("{header}.{payload}.sig")
     }
 
@@ -213,6 +219,9 @@ mod tests {
     #[test]
     fn sanitize_for_filename_keeps_email_shape_safe() {
         assert_eq!(sanitize_for_filename("a.b@c.com"), "a.b@c.com");
-        assert_eq!(sanitize_for_filename("weird name/path\\x"), "weird_name_path_x");
+        assert_eq!(
+            sanitize_for_filename("weird name/path\\x"),
+            "weird_name_path_x"
+        );
     }
 }

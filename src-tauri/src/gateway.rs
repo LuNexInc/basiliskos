@@ -1081,7 +1081,7 @@ fn filter_visible_models<'a>(
         .filter(|spec| spec.id == selected_id || !hidden.contains(spec.id))
         .filter(|spec| {
             spec.id == selected_id
-                || live_catalog.map_or(true, |live| live.iter().any(|id| id == spec.id))
+                || live_catalog.is_none_or(|live| live.iter().any(|id| id == spec.id))
         })
         .collect()
 }
@@ -3770,7 +3770,7 @@ fn pick_failover_candidate<'a>(
             && account.file_name != rate_limited_account
             && cooling
                 .get(&account.file_name)
-                .map_or(true, |until| *until <= now)
+                .is_none_or(|until| *until <= now)
     })
 }
 
