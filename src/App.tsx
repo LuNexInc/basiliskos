@@ -217,7 +217,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-const APP_VERSION = "2.2.1";
+const APP_VERSION = "2.2.2";
 const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
@@ -1609,7 +1609,7 @@ export default function App() {
         <div className="modal-backdrop" role="presentation" onClick={() => setPreparedUpdate(null)}>
           <div className="modal" role="alertdialog" aria-modal="true" aria-labelledby="update-install-title" onClick={(event) => event.stopPropagation()}>
             <h3 id="update-install-title">Install {preparedUpdate.tagName}?</h3>
-            <p>{preparedUpdate.installerName} was downloaded and its SHA-256 checksum matched the published release manifest. Basiliskos will close, then Windows will open the normal installer.</p>
+            <p>{preparedUpdate.installerName} was downloaded and its SHA-256 checksum matched the published release manifest. Basiliskos will close, then Windows will ask for administrator approval and open the installer. Basiliskos itself does not stay elevated.</p>
             <div className="modal-actions">
               <button onClick={() => setPreparedUpdate(null)} disabled={busy === "install-update"}>Cancel</button>
               <button className="primary" onClick={() => void confirmUpdateInstall()} disabled={busy === "install-update"}>{busy === "install-update" ? "Launching…" : "Install and close"}</button>

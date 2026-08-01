@@ -1624,7 +1624,53 @@ fn tool_compatibility_fixups(provider: &str) -> &'static [fn(&mut serde_json::Ma
         // tool_reference block (e.g. from Claude Code's own ToolSearch flow).
         // Flattening it to plain text (upstream's own suggested fix) returns 200.
         "kimi" => &[flatten_kimi_tool_reference_blocks as fn(&mut serde_json::Map<String, Value>)],
+        // DeepSeek V4 is text-only: an image block anywhere in the conversation
+        // is translated to an `image_url` part and DeepSeek rejects the whole
+        // request with 400 "unknown variant `image_url`, expected `text`",
+        // killing the session rather than degrading. Observed with a tool result
+        // carrying a screenshot.
+        "deepseek" => {
+            &[replace_deepseek_unsupported_images as fn(&mut serde_json::Map<String, Value>)]
+        }
         _ => &[],
+    }
+}
+
+/// Replaces Anthropic image blocks with a text placeholder for DeepSeek.
+///
+/// The placeholder is deliberate: dropping the block silently would leave the
+/// model believing it had seen an image it never received, and a tool_result
+/// with empty content is itself an error. Applies to both top-level message
+/// content and content nested inside a tool_result.
+fn replace_deepseek_unsupported_images(object: &mut serde_json::Map<String, Value>) {
+    fn placeholder() -> Value {
+        serde_json::json!({
+            "type": "text",
+            "text": "[image omitted: the selected DeepSeek model does not accept images]"
+        })
+    }
+
+    fn replace_in(blocks: &mut [Value]) {
+        for block in blocks.iter_mut() {
+            match block.get("type").and_then(Value::as_str) {
+                Some("image") => *block = placeholder(),
+                Some("tool_result") => {
+                    if let Some(nested) = block.get_mut("content").and_then(Value::as_array_mut) {
+                        replace_in(nested);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let Some(Value::Array(messages)) = object.get_mut("messages") else {
+        return;
+    };
+    for message in messages {
+        if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+            replace_in(content);
+        }
     }
 }
 
@@ -3349,11 +3395,64 @@ pub fn install_basiliskos_update(app: AppHandle, token: String) -> Result<(), St
     if !installer_path.is_file() {
         return Err("The verified installer is no longer available.".to_owned());
     }
-    Command::new(&installer_path)
-        .spawn()
-        .map_err(|error| format!("Could not launch the Windows installer: {error}"))?;
+    // perMachine NSIS installs to Program Files, so the installer needs elevation.
+    // Elevate only the installer (ShellExecute "runas"), never the Basiliskos
+    // process itself — the controller stays unelevated for OAuth / tray / profile work.
+    launch_installer(&installer_path)?;
     app.exit(0);
     Ok(())
+}
+
+/// Launches the verified NSIS installer. On Windows this uses ShellExecuteW with
+/// the `runas` verb so UAC appears; a plain CreateProcess spawn inherits the
+/// unelevated app token and fails with "requires elevation".
+fn launch_installer(installer_path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let path_wide: Vec<u16> = installer_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let operation: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
+        // ShellExecuteW returns an HINSTANCE cast as isize. Values > 32 mean the
+        // request was accepted (UAC prompt shown / installer started). Values
+        // ≤ 32 are SE_ERR_* codes — most often SE_ERR_ACCESSDENIED when the user
+        // cancels the UAC dialog.
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                path_wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as isize;
+        if result <= 32 {
+            return Err(match result {
+                5 | 1223 => {
+                    "The update installer needs administrator approval. Confirm the Windows UAC prompt, or run the downloaded installer manually."
+                        .to_owned()
+                }
+                _ => format!(
+                    "Could not launch the Windows installer (ShellExecute error {result})."
+                ),
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new(installer_path)
+            .spawn()
+            .map_err(|error| format!("Could not launch the Windows installer: {error}"))?;
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -6704,6 +6803,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn deepseek_requests_carry_no_image_blocks() {
+        // Regression: a tool result containing a screenshot became an `image_url`
+        // part upstream and DeepSeek 400'd the entire request with
+        // "unknown variant `image_url`, expected `text`" (observed at
+        // messages[93] of a real session), which killed the conversation.
+        let mut state = state_with_active("deepseek-aaa.json");
+        state.routes.insert(
+            "deepseek".into(),
+            RouteSelection {
+                model: "deepseek-v4-flash".into(),
+                thinking: "auto".into(),
+            },
+        );
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}},
+                        {"type": "text", "text": "kept"}
+                    ]}
+                ]}
+            ]
+        });
+        rewrite_claude_request(&mut body, &state, "deepseek", false).unwrap();
+
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("\"image\""),
+            "no image block may survive: {serialized}"
+        );
+        assert!(!serialized.contains("base64"));
+        // Text alongside the image, and inside the tool_result, is preserved.
+        assert!(serialized.contains("look"));
+        assert!(serialized.contains("kept"));
+        // The model is told an image was dropped rather than silently losing it,
+        // and the tool_result keeps non-empty content.
+        assert!(serialized.contains("image omitted"));
+        let tool_result = &body["messages"][1]["content"][0];
+        assert_eq!(tool_result["type"], Value::String("tool_result".into()));
+        assert_eq!(
+            tool_result["content"][0]["type"],
+            Value::String("text".into())
+        );
+
+        // The fixup is DeepSeek-only — other providers keep images intact.
+        let mut untouched = serde_json::json!({
+            "model": "x", "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "CCCC"}}
+            ]}]
+        });
+        rewrite_claude_request(&mut untouched, &state, "claude", false).unwrap();
+        assert!(serde_json::to_string(&untouched)
+            .unwrap()
+            .contains("base64"));
     }
 
     #[test]

@@ -66,7 +66,7 @@ type ActiveServiceIdentities = {
 
 type FuelTone = "full" | "mid" | "low" | "critical" | "unknown";
 
-const APP_VERSION = "2.1.0";
+const APP_VERSION = "2.2.2";
 const CORE_SEGMENTS = 18;
 const PREVIEW_TRAY =
   typeof window !== "undefined" &&
