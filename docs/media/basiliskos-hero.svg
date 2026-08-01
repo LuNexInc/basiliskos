@@ -1,6 +1,6 @@
 <svg viewBox="0 0 1200 420" width="1200" height="420" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" role="img" aria-labelledby="heroTitle heroDesc">
   <title id="heroTitle">Basiliskos</title>
-  <desc id="heroDesc">Basiliskos — one isolated Claude Code window, four switchable backends: Claude, Codex, Grok, and Kimi.</desc>
+  <desc id="heroDesc">Basiliskos — one isolated Claude Code window, five switchable backends: Claude, Codex, Grok, Kimi, and DeepSeek.</desc>
   <style>
     .sans { font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; }
     .mono { font-family: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, 'Courier New', monospace; }
@@ -24,18 +24,20 @@
     @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
     .pulse { animation: blink 2.2s ease-in-out infinite; }
 
-    /* 16s backend cycle: each chip active for one quarter */
-    @keyframes chipA { 0%,22% { opacity: 1; } 28%,94% { opacity: 0; } 100% { opacity: 1; } }
-    @keyframes chipB { 0%,22% { opacity: 0; } 28%,47% { opacity: 1; } 53%,100% { opacity: 0; } }
-    @keyframes chipC { 0%,47% { opacity: 0; } 53%,72% { opacity: 1; } 78%,100% { opacity: 0; } }
-    @keyframes chipD { 0%,72% { opacity: 0; } 78%,94% { opacity: 1; } 100% { opacity: 0; } }
-    .actA { animation: chipA 16s linear infinite; }
-    .actB { animation: chipB 16s linear infinite; }
-    .actC { animation: chipC 16s linear infinite; }
-    .actD { animation: chipD 16s linear infinite; }
+    /* 20s backend cycle: each chip active for one fifth */
+    @keyframes chipA { 0%,18% { opacity: 1; } 22%,96% { opacity: 0; } 100% { opacity: 1; } }
+    @keyframes chipB { 0%,18% { opacity: 0; } 22%,38% { opacity: 1; } 42%,96% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes chipC { 0%,38% { opacity: 0; } 42%,58% { opacity: 1; } 62%,96% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes chipD { 0%,58% { opacity: 0; } 62%,78% { opacity: 1; } 82%,96% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes chipE { 0%,78% { opacity: 0; } 82%,96% { opacity: 1; } 100% { opacity: 0; } }
+    .actA { animation: chipA 20s linear infinite; }
+    .actB { animation: chipB 20s linear infinite; }
+    .actC { animation: chipC 20s linear infinite; }
+    .actD { animation: chipD 20s linear infinite; }
+    .actE { animation: chipE 20s linear infinite; }
 
-    @keyframes slide { 0%,22% { transform: translateX(0); } 28%,47% { transform: translateX(160px); } 53%,72% { transform: translateX(320px); } 78%,94% { transform: translateX(480px); } 100% { transform: translateX(0); } }
-    .slider { animation: slide 16s linear infinite; }
+    @keyframes slide { 0%,18% { transform: translateX(0); } 22%,38% { transform: translateX(126px); } 42%,58% { transform: translateX(252px); } 62%,78% { transform: translateX(378px); } 82%,96% { transform: translateX(504px); } 100% { transform: translateX(0); } }
+    .slider { animation: slide 20s linear infinite; }
 
     @keyframes flow { to { stroke-dashoffset: -24; } }
     .flowline { animation: flow 1.2s linear infinite; }
@@ -43,7 +45,7 @@
     @media (prefers-reduced-motion: reduce) {
       .star,.ringA,.ringB,.badgeGlow,.pulse,.slider,.flowline { animation: none; }
       .actA { animation: none; opacity: 1; }
-      .actB, .actC, .actD { animation: none; opacity: 0; }
+      .actB, .actC, .actD, .actE { animation: none; opacity: 0; }
       .shimmer { animation: none; opacity: 0; }
     }
   </style>
@@ -127,32 +129,35 @@
   </g>
 
   <!-- tagline -->
-  <text class="mono" x="382" y="238" font-size="19" letter-spacing="3" fill="#7FDBCA">ONE CLAUDE CODE WINDOW · FOUR BACKENDS</text>
+  <text class="mono" x="382" y="238" font-size="19" letter-spacing="3" fill="#7FDBCA">ONE CLAUDE CODE WINDOW · FIVE BACKENDS</text>
   <text class="mono" x="382" y="266" font-size="14" letter-spacing="1.5" fill="#8A97A8">local relay · account switcher · truthful route identity</text>
 
   <!-- backend chips -->
   <g>
-    <line x1="392" y1="322" x2="1022" y2="322" stroke="#12435A" stroke-width="1" opacity=".6"/>
-    <line class="flowline" x1="392" y1="322" x2="1022" y2="322" stroke="#2AA189" stroke-width="1" stroke-dasharray="4 20" opacity=".5"/>
+    <line x1="390" y1="322" x2="1004" y2="322" stroke="#12435A" stroke-width="1" opacity=".6"/>
+    <line class="flowline" x1="390" y1="322" x2="1004" y2="322" stroke="#2AA189" stroke-width="1" stroke-dasharray="4 20" opacity=".5"/>
 
     <g class="slider">
-      <rect x="382" y="300" width="140" height="44" rx="9" fill="#0B2A38" stroke="#3ED598" stroke-width="1.6"/>
+      <rect x="380" y="300" width="120" height="44" rx="9" fill="#0B2A38" stroke="#3ED598" stroke-width="1.6"/>
     </g>
 
-    <rect x="382" y="300" width="140" height="44" rx="9" fill="none" stroke="#1E3A4A" stroke-width="1"/>
-    <rect x="542" y="300" width="140" height="44" rx="9" fill="none" stroke="#1E3A4A" stroke-width="1"/>
-    <rect x="702" y="300" width="140" height="44" rx="9" fill="none" stroke="#1E3A4A" stroke-width="1"/>
-    <rect x="862" y="300" width="140" height="44" rx="9" fill="none" stroke="#1E3A4A" stroke-width="1"/>
+    <rect x="380" y="300" width="120" height="44" rx="9" fill="none" stroke="#1E3A4A" stroke-width="1"/>
+    <rect x="506" y="300" width="120" height="44" rx="9" fill="none" stroke="#1E3A4A" stroke-width="1"/>
+    <rect x="632" y="300" width="120" height="44" rx="9" fill="none" stroke="#1E3A4A" stroke-width="1"/>
+    <rect x="758" y="300" width="120" height="44" rx="9" fill="none" stroke="#1E3A4A" stroke-width="1"/>
+    <rect x="884" y="300" width="120" height="44" rx="9" fill="none" stroke="#1E3A4A" stroke-width="1"/>
 
-    <text class="mono" x="452" y="327" font-size="14" letter-spacing="3" fill="#93A6B5" text-anchor="middle">CLAUDE</text>
-    <text class="mono" x="612" y="327" font-size="14" letter-spacing="3" fill="#93A6B5" text-anchor="middle">CODEX</text>
-    <text class="mono" x="772" y="327" font-size="14" letter-spacing="3" fill="#93A6B5" text-anchor="middle">GROK</text>
-    <text class="mono" x="932" y="327" font-size="14" letter-spacing="3" fill="#93A6B5" text-anchor="middle">KIMI</text>
+    <text class="mono" x="440" y="327" font-size="12" letter-spacing="2" fill="#93A6B5" text-anchor="middle">CLAUDE</text>
+    <text class="mono" x="566" y="327" font-size="12" letter-spacing="2" fill="#93A6B5" text-anchor="middle">CODEX</text>
+    <text class="mono" x="692" y="327" font-size="12" letter-spacing="2" fill="#93A6B5" text-anchor="middle">GROK</text>
+    <text class="mono" x="818" y="327" font-size="12" letter-spacing="2" fill="#93A6B5" text-anchor="middle">KIMI</text>
+    <text class="mono" x="944" y="327" font-size="12" letter-spacing="1" fill="#93A6B5" text-anchor="middle">DEEPSEEK</text>
 
-    <text class="mono actA" x="452" y="327" font-size="14" letter-spacing="3" fill="#EFE5D0" text-anchor="middle">CLAUDE</text>
-    <text class="mono actB" x="612" y="327" font-size="14" letter-spacing="3" fill="#EFE5D0" text-anchor="middle">CODEX</text>
-    <text class="mono actC" x="772" y="327" font-size="14" letter-spacing="3" fill="#EFE5D0" text-anchor="middle">GROK</text>
-    <text class="mono actD" x="932" y="327" font-size="14" letter-spacing="3" fill="#EFE5D0" text-anchor="middle">KIMI</text>
+    <text class="mono actA" x="440" y="327" font-size="12" letter-spacing="2" fill="#EFE5D0" text-anchor="middle">CLAUDE</text>
+    <text class="mono actB" x="566" y="327" font-size="12" letter-spacing="2" fill="#EFE5D0" text-anchor="middle">CODEX</text>
+    <text class="mono actC" x="692" y="327" font-size="12" letter-spacing="2" fill="#EFE5D0" text-anchor="middle">GROK</text>
+    <text class="mono actD" x="818" y="327" font-size="12" letter-spacing="2" fill="#EFE5D0" text-anchor="middle">KIMI</text>
+    <text class="mono actE" x="944" y="327" font-size="12" letter-spacing="1" fill="#EFE5D0" text-anchor="middle">DEEPSEEK</text>
   </g>
 
   <!-- status HUD -->

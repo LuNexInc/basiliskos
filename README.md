@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="docs/media/basiliskos-hero.svg" alt="Basiliskos — one isolated Claude Code window, four switchable backends: Claude, Codex, Grok, and Kimi" width="100%">
+  <img src="docs/media/basiliskos-hero.svg" alt="Basiliskos — one isolated Claude Code window, five switchable backends: Claude, Codex, Grok, Kimi, and DeepSeek" width="100%">
 </p>
 
 Open a separate Basiliskos-owned Claude Code Windows app and switch the
-authorized account serving it: Claude, Codex, Grok Build, or Kimi Code. Your normal Claude
+authorized account serving it: Claude, Codex, Grok Build, Kimi Code, or DeepSeek. Your normal Claude
 app remains untouched.
 
 Inside that isolated window, Basiliskos keeps the selected real engine visible
@@ -21,7 +21,7 @@ limits, or automate approval pages.
 ## How it works
 
 <p align="center">
-  <img src="docs/media/basiliskos-flow.svg" alt="Basiliskos's isolated Claude Code Windows app talks to the Basiliskos relay on 127.0.0.1:8317, which forwards to the selected backend: a Claude OAuth account, a Codex OAuth account, a Grok OAuth account, or a Kimi Code OAuth account" width="760">
+  <img src="docs/media/basiliskos-flow.svg" alt="Basiliskos's isolated Claude Code Windows app talks to the Basiliskos relay on 127.0.0.1:8317, which forwards to the selected backend: a Claude OAuth account, a Codex OAuth account, a Grok OAuth account, a Kimi Code OAuth account, or a DeepSeek API key" width="760">
 </p>
 
 Basiliskos launches the installed Claude app with `CLAUDE_USER_DATA_DIR`
@@ -106,7 +106,7 @@ evidence. Windows will show `Unknown publisher` for unsigned installers.
 
 This fork is isolated from `../grok-hydra`; the original project remains
 unchanged. Basiliskos is MIT licensed and is not affiliated with Anthropic,
-OpenAI, xAI, Moonshot AI, or CLIProxyAPI.
+OpenAI, xAI, Moonshot AI, DeepSeek, or CLIProxyAPI.
 
 ## Support
 
