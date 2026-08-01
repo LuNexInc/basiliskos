@@ -40,7 +40,9 @@ request.
 2. Choose **Claude**, **Codex**, **Grok**, or **Kimi**, then select **Add account**.
 3. Basiliskos opens the provider's validated HTTPS OAuth URL in your default
    browser. Kimi also shows its one-time device code. Finish the official login
-   there.
+   there. **DeepSeek** has no OAuth flow: choose it and select **Add API key**,
+   then paste a key from platform.deepseek.com. Basiliskos verifies the key with
+   DeepSeek before saving it locally.
 4. Basiliskos automatically opens its own isolated Claude window after an
    account is selected. You can also choose **Open Basiliskos Claude**.
 5. Use **Use account** whenever you want to change the backend underneath the
@@ -48,15 +50,17 @@ request.
 6. Choose the real **Model** and **Thinking** level in **Basiliskos route**.
    Basiliskos exposes only the thinking levels supported by that model; the
    control is disabled when the model manages thinking itself.
-7. The account list shows remaining usage for every supported provider,
+7. The account list shows remaining usage for every OAuth provider,
    including Kimi Code's weekly and rolling quota windows when Kimi returns
    them. If a signed-in Kimi account has no Kimi Code subscription, the
    account card shows **No active Kimi Code subscription** instead of a
-   misleading re-auth error.
+   misleading re-auth error. DeepSeek bills a prepaid balance rather than a
+   quota window, so it reports no usage percentage.
 8. Open the **OpenCodex** tab for the multi-provider catalog scaffold
    (OpenRouter, Ollama, DeepSeek, Gemini, Azure, custom OpenAI-compatible).
    It stores preference intent only; live Claude Code traffic still uses the
-   four OAuth backends above until a later milestone turns catalog routing on.
+   backends above until a later milestone turns catalog routing on. (DeepSeek is
+   no longer scaffold-only — it routes live via the API-key path in step 3.)
    See [docs/OPENCODEX-SCAFFOLD.md](docs/OPENCODEX-SCAFFOLD.md).
 
 Basiliskos never applies its relay to `%LOCALAPPDATA%\Claude-3p`. Version 1.0.1

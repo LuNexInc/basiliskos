@@ -13,6 +13,7 @@ $backend = Get-Content -LiteralPath $backendPath -Raw
 $gatewayBackend = Get-Content -LiteralPath (Join-Path $projectRoot 'src-tauri\src\gateway.rs') -Raw
 
 $expected = @(
+    'add_deepseek_account'
     'cancel_provider_login'
     'gateway_snapshot'
     'get_gateway_account_usage'

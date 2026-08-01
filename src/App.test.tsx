@@ -1,6 +1,13 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { credentialExpiry, DiagnosticEventList, isNewerVersion, StatusBadge } from "./App";
+import {
+  credentialExpiry,
+  DiagnosticEventList,
+  isNewerVersion,
+  prefersManualAuthBrowser,
+  StatusBadge,
+  usesApiKeyAuth,
+} from "./App";
 
 describe("truthful Basiliskos status components", () => {
   it("only advertises a numerically newer published version", () => {
@@ -62,5 +69,23 @@ describe("truthful Basiliskos status components", () => {
     };
     expect(credentialExpiry(base, Date.now())).toEqual({ label: "Sign in again", tone: "relogin" });
     expect(credentialExpiry({ ...base, credentialStatus: "unknown" }, Date.now())).toEqual({ label: "Expiry unavailable", tone: "unknown" });
+  });
+
+  it("prefers manual browser open for multi-account cookie-prone providers only", () => {
+    expect(prefersManualAuthBrowser("xai")).toBe(true);
+    expect(prefersManualAuthBrowser("kimi")).toBe(true);
+    expect(prefersManualAuthBrowser("codex")).toBe(false);
+    expect(prefersManualAuthBrowser("claude")).toBe(false);
+  });
+
+  it("routes only DeepSeek through API-key auth instead of a browser login", () => {
+    expect(usesApiKeyAuth("deepseek")).toBe(true);
+    expect(usesApiKeyAuth("claude")).toBe(false);
+    expect(usesApiKeyAuth("codex")).toBe(false);
+    expect(usesApiKeyAuth("xai")).toBe(false);
+    expect(usesApiKeyAuth("kimi")).toBe(false);
+    // DeepSeek has no OAuth URL at all, so it must never reach the
+    // manual-browser path that exists for cookie-prone OAuth providers.
+    expect(prefersManualAuthBrowser("deepseek")).toBe(false);
   });
 });

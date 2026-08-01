@@ -1,11 +1,14 @@
 # Basiliskos
 
-Basiliskos is a fork of the committed `../grok-hydra` codebase. The original
-`../grok-hydra` project must remain untouched by work in this folder.
+Basiliskos began as a fork of the former `../grok-hydra` codebase. `grok-hydra`
+was deleted 2026-07-25 (superseded by Basiliskos; recoverable from git history if
+ever needed). This folder is now the sole canonical source — see the "Source of
+truth" section below for the dev-vs-publish-repo rules.
 
 The product goal is a small Windows controller that keeps Claude Code Desktop
 as the user's working interface while switching its local gateway between
-Claude, Codex, Grok, and Kimi accounts the user owns or is authorized to use.
+Claude, Codex, Grok, Kimi, and DeepSeek accounts the user owns or is authorized
+to use.
 
 ## Boundaries
 
@@ -30,14 +33,74 @@ cargo test --manifest-path src-tauri/Cargo.toml
 pnpm tauri build
 ```
 
+Run `pnpm test:all` before shipping any feature (especially new Tauri
+commands or provider integrations). Dev doesn't run the release gate, so
+skipping this lets drift pile up and surface only at release time. `test:all`
+= build + ui + format + clippy + rust + surface + installer + gateway +
+secrets + log-secrets. In particular, adding/removing a `gateway::` command
+means updating the `$expected` allowlist in `scripts/check-command-surface.ps1`.
+
 Follow the root workspace `AGENTS.md` and `HANDOFF.md` protocol.
+
+## Source of truth (read this before ANY Basiliskos work)
+
+**This folder in the `ai-projects` monorepo is canonical.** The release repo
+`LuNexInc/basiliskos` (local clone: `../_publish/basiliskos-repo`) is a
+publish target only. They are **not** auto-synced, and on 2026-07-24 they
+silently diverged (Claude released 2.0.0 from dev while Codex released
+2.0.1–2.0.3 from the release repo; neither knew about the other).
+
+Non-negotiable rules for every tool (see also the root `AGENTS.md`
+"Orchestration" section — session claims in `.sessions\` and
+`.tools\preflight.ps1 -Project hydra-gateway -Tool <you>` automate these checks):
+
+- **Start of any Basiliskos session:** compare versions before touching code —
+  `grep version package.json` here vs `gh release list --repo LuNexInc/basiliskos`.
+  If the release repo is ahead, **backport to dev FIRST** (copy the changed
+  files back, verify `pnpm test:all`, commit) before starting new work.
+- **Implement in dev, publish via the release repo** — never implement new
+  work directly in the release clone.
+- **If you do release:** backport any release-repo-only changes to dev in the
+  SAME session, and say so in your handoff (version released + "dev synced").
+- **Before tagging:** check `gh run list --repo LuNexInc/basiliskos` for
+  in-flight runs and `gh release list` for a version newer than yours —
+  another tool may be mid-release. Never assume your version number is free.
+
+## Releasing (public, auto-updates all users)
+
+1. Get Charles's approval on the version number (semver: patch = fixes, minor
+   = new features, major = milestone/breaking). Bump it in **all five** spots:
+   `package.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`,
+   `src-tauri/tauri.conf.json`, and the hardcoded `APP_VERSION` in `src/App.tsx`.
+2. Run `pnpm test:all` locally until green (fix forward; don't relax security
+   gates like the command-surface allowlist or clean-room forbidden list
+   without Charles's explicit OK).
+3. Sync the dev tree's tracked files (+ any new source files) into the release
+   clone, **excluding** dev scratch (`.agents/`, `.claude/`, `outputs/`).
+   Push to `LuNexInc/basiliskos` `main` — this does NOT trigger a release.
+4. Push a `v<version>` tag → triggers `.github/workflows/release-gate.yml`
+   (windows-latest): build → installer-lifecycle → publish-release. Publish
+   `needs: [build, installer-lifecycle]`, so nothing ships unless the whole
+   gate is green. Watch the run; report the published release or the failure.
+   To re-run after a fix on a never-published tag, delete it
+   (`git push origin :refs/tags/v<version>`) and re-create on the fixed commit
+   (auto-mode blocks `git push -f`).
+5. **Write real release notes.** The workflow publishes with `--generate-notes`,
+   which only emits a bare changelog link. After the release publishes, replace
+   the body with user-facing notes (what's new / changed / upgrade notes;
+   flag "Unsigned / Unknown publisher"):
+   `gh release edit v<version> --repo LuNexInc/basiliskos --notes-file <file>`.
+
+Installers publish **Unsigned / Unknown publisher** unless
+`BASILISKOS_SIGN_CERT_BASE64` / `BASILISKOS_SIGN_CERT_PASSWORD` secrets exist
+in the `LuNexInc/basiliskos` repo (workflow already wired for them).
 
 ## OpenCodex scaffold (2026-07-23)
 
 - Basiliskos embeds an **OpenCodex-shaped multi-provider catalog** under
   `src-tauri/src/opencodex.rs` and an **OpenCodex** UI tab.
-- Live request routing still uses only Claude / Codex / Grok / Kimi via the
-  pinned CLIProxyAPI path. Do **not** reinstall `@bitkyc08/opencodex` or rewrite
-  `~/.codex/config.toml` for this product.
+- Live request routing still uses only Claude / Codex / Grok / Kimi / DeepSeek
+  via the pinned CLIProxyAPI path. Do **not** reinstall `@bitkyc08/opencodex` or
+  rewrite `~/.codex/config.toml` for this product.
 - Design + next milestones: `docs/OPENCODEX-SCAFFOLD.md`. Get Charles's approval
   before enabling live catalog routing or storing API keys.

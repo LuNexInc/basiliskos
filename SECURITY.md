@@ -14,7 +14,9 @@ access tokens, refresh tokens, or local API keys to an issue.
 Replace expired credentials through each provider's official browser OAuth
 flow from the Basiliskos UI (Claude, Codex, Grok, or Kimi). Kimi uses its
 official device-authorization page and one-time code; Basiliskos never
-automates the approval step.
+automates the approval step. DeepSeek is API-key based: its key is stored in
+the same `auth` directory and rendered into the local backend config only
+while that account is the selected one.
 
 ## Scope
 

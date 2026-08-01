@@ -42,7 +42,7 @@ const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const BASILISKOS_CONFIG_NAME: &str = "Basiliskos";
-const SUPPORTED_PROVIDERS: [&str; 4] = ["claude", "codex", "xai", "kimi"];
+const SUPPORTED_PROVIDERS: [&str; 5] = ["claude", "codex", "xai", "kimi", "deepseek"];
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const XAI_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
@@ -67,6 +67,29 @@ const KIMI_TOKEN_ENDPOINT: &str = "https://auth.kimi.com/api/oauth/token";
 const KIMI_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const KIMI_RELOGIN_REQUIRED: &str =
     "This saved Kimi authorization was revoked. Sign in again to renew it.";
+// DeepSeek is the one supported provider with no OAuth/device flow: it is an
+// API-key upstream reached through CLIProxyAPI's generic `openai-compatibility`
+// block (verified against the pinned 7.2.83 binary — the key must sit under
+// `api-key-entries`, not `api-keys`, or the provider loads zero clients).
+// Credentials are stored as normal `deepseek-*.json` auth files so every
+// existing account operation (label / activate / disable / remove) applies;
+// CLIProxyAPI itself ignores that file type and advertises no models from it.
+const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
+const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
+const DEEPSEEK_COMPAT_NAME: &str = "deepseek";
+const MAX_DEEPSEEK_API_KEY_LEN: usize = 200;
+// DeepSeek effort travels as an Anthropic `thinking` budget, which CLIProxyAPI
+// translates into `reasoning_effort` for the OpenAI-shaped upstream. Measured
+// against the pinned 7.2.83 runtime by reading the logged upstream payload:
+//   budget <= 1024 -> "low" · 2048..8192 -> "medium" · >= 12288 -> "high"
+// DeepSeek only accepts low/high/max, so the middle band must never be emitted.
+// These two budgets sit inside the low and high bands with margin on each side.
+// ("max" is unreachable this way — the translator saturates at "high".)
+const DEEPSEEK_LOW_EFFORT_BUDGET: u64 = 1024;
+const DEEPSEEK_HIGH_EFFORT_BUDGET: u64 = 12288;
+// Anthropic requires budget_tokens < max_tokens; this is the headroom added when
+// a client's max_tokens is too small to hold the budget we need.
+const DEEPSEEK_EFFORT_MAX_TOKENS_HEADROOM: u64 = 4096;
 #[derive(Clone, Copy)]
 struct ModelSpec {
     id: &'static str,
@@ -229,6 +252,29 @@ const KIMI_MODELS: &[ModelSpec] = &[
         id: "kimi-k2",
         label: "Kimi K2",
         thinking_levels: &[],
+    },
+];
+
+// `deepseek-chat` / `deepseek-reasoner` were fully retired on 2026-07-24 and now
+// return errors, so V4 is the only routable generation.
+//
+// Thinking is delivered via the `thinking` budget (see the DEEPSEEK_*_BUDGET
+// constants), NOT the `model(effort)` suffix used for the OAuth providers — that
+// suffix breaks credential selection on the openai-compatibility path.
+//
+// Only the levels Basiliskos can actually deliver are advertised: "max" is
+// omitted because the translator saturates at "high", and V4 Pro lists only
+// "high" because DeepSeek documents it as treating "low" as "high".
+const DEEPSEEK_MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        id: "deepseek-v4-flash",
+        label: "DeepSeek V4 Flash",
+        thinking_levels: &["low", "high"],
+    },
+    ModelSpec {
+        id: "deepseek-v4-pro",
+        label: "DeepSeek V4 Pro",
+        thinking_levels: &["high"],
     },
 ];
 
@@ -418,6 +464,18 @@ pub struct AccountSelectionResult {
     pub claude_config_changed: bool,
 }
 
+/// Result of adding a DeepSeek API key. Carries the stored account's file name so
+/// the caller can immediately activate it through the normal selection path — a
+/// newly added account is always written disabled, so adding alone never changes
+/// what Claude is talking to.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepseekAccountAdded {
+    #[serde(flatten)]
+    pub snapshot: GatewaySnapshot,
+    pub file_name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentStatus {
@@ -564,6 +622,7 @@ fn model_specs(provider: &str) -> &'static [ModelSpec] {
         "codex" => CODEX_MODELS,
         "xai" => XAI_MODELS,
         "kimi" => KIMI_MODELS,
+        "deepseek" => DEEPSEEK_MODELS,
         _ => &[],
     }
 }
@@ -574,6 +633,7 @@ fn default_model(provider: &str) -> &'static str {
         "codex" => "gpt-5.5",
         "xai" => "grok-build-0.1",
         "kimi" => "kimi-k3",
+        "deepseek" => "deepseek-v4-flash",
         _ => "",
     }
 }
@@ -683,6 +743,14 @@ fn routed_model(
     provider: &str,
 ) -> String {
     let route = normalized_route(state, provider);
+    // DeepSeek reaches the backend through the generic openai-compatibility
+    // path, which matches credentials on the literal model name. A `model(effort)`
+    // suffix there fails selection outright ("auth_unavailable: no auth
+    // available"), so DeepSeek always routes the plain id and carries its effort
+    // in the request body instead — see `apply_deepseek_thinking`.
+    if provider == "deepseek" {
+        return route.model;
+    }
     let thinking = if provider == "xai" && route.model == "grok-4.5" {
         grok_4_5_thinking_from_desktop_effort(request).unwrap_or(route.thinking)
     } else {
@@ -693,6 +761,37 @@ fn routed_model(
     } else {
         format!("{}({})", route.model, thinking)
     }
+}
+
+/// Expresses the selected DeepSeek thinking level as an Anthropic `thinking`
+/// budget, which CLIProxyAPI converts into `reasoning_effort` upstream.
+///
+/// The budget is chosen to land in the "low" or "high" band and never the
+/// "medium" band, which DeepSeek rejects. On "auto" the client's own thinking
+/// request is left untouched.
+fn apply_deepseek_thinking(object: &mut serde_json::Map<String, Value>, state: &ControllerState) {
+    let route = normalized_route(state, "deepseek");
+    let budget = match route.thinking.as_str() {
+        "low" => DEEPSEEK_LOW_EFFORT_BUDGET,
+        "high" => DEEPSEEK_HIGH_EFFORT_BUDGET,
+        _ => return,
+    };
+    // Anthropic requires budget_tokens < max_tokens. Raise a too-small cap so the
+    // budget stays in its intended band; never lower one the client asked for.
+    let max_tokens = object
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if max_tokens <= budget {
+        object.insert(
+            "max_tokens".into(),
+            Value::from(budget + DEEPSEEK_EFFORT_MAX_TOKENS_HEADROOM),
+        );
+    }
+    object.insert(
+        "thinking".into(),
+        serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
+    );
 }
 
 /// Claude Desktop's high-context routing aliases expose effort levels that do
@@ -750,6 +849,7 @@ fn provider_label(provider: &str) -> &'static str {
         "codex" => "Codex",
         "xai" => "Grok Build",
         "kimi" => "Kimi Code",
+        "deepseek" => "DeepSeek",
         _ => "Unknown provider",
     }
 }
@@ -1105,6 +1205,72 @@ fn active_provider_from_auth(auth: &Path, state: &ControllerState) -> Option<Str
     account_provider(&value, file_name)
 }
 
+/// Reads the API key of the *active* DeepSeek account, if one is selected.
+///
+/// Only the selected account's key is ever rendered into the backend config:
+/// CLIProxyAPI load-balances across every `api-key-entries` entry, so emitting
+/// all saved DeepSeek keys would silently route through an account the user did
+/// not choose. It also keeps unselected keys off disk outside their auth file.
+fn active_deepseek_api_key(auth: &Path, state: &ControllerState) -> Option<String> {
+    let file_name = state.active_account.as_deref()?;
+    let raw = fs::read_to_string(auth.join(file_name)).ok()?;
+    let value = serde_json::from_str::<Value>(&raw).ok()?;
+    if account_provider(&value, file_name).as_deref() != Some("deepseek") {
+        return None;
+    }
+    if value
+        .get("disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    nested_string(&value, &["api_key"]).filter(|key| is_valid_deepseek_api_key(key))
+}
+
+/// Renders the CLIProxyAPI `openai-compatibility` provider block for DeepSeek,
+/// or an empty string when no DeepSeek account is active.
+///
+/// The key belongs under `api-key-entries`; `api-keys` parses without error but
+/// yields zero loaded clients (verified against the pinned 7.2.83 runtime).
+fn deepseek_compat_block(auth: &Path, state: &ControllerState) -> String {
+    let Some(api_key) = active_deepseek_api_key(auth, state) else {
+        return String::new();
+    };
+    let models = DEEPSEEK_MODELS
+        .iter()
+        .map(|spec| {
+            format!(
+                "      - name: {name}\n        alias: {name}\n",
+                name = yaml_quote(spec.id)
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"openai-compatibility:
+  - name: {name}
+    base-url: {base_url}
+    api-key-entries:
+      - api-key: {api_key}
+    models:
+{models}"#,
+        name = yaml_quote(DEEPSEEK_COMPAT_NAME),
+        base_url = yaml_quote(DEEPSEEK_BASE_URL),
+        api_key = yaml_quote(&api_key),
+    )
+}
+
+/// DeepSeek keys are `sk-` followed by URL-safe token characters. Validating the
+/// charset keeps a pasted key from breaking out of the quoted YAML scalar it is
+/// rendered into (`yaml_quote` also rewrites `\`, which would corrupt a key).
+fn is_valid_deepseek_api_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_DEEPSEEK_API_KEY_LEN
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
 fn render_config(auth: &Path, state: &ControllerState) -> String {
     format!(
         r#"host: "127.0.0.1"
@@ -1131,9 +1297,10 @@ streaming:
   bootstrap-retries: 0
 plugins:
   enabled: false
-"#,
+{deepseek}"#,
         auth_dir = yaml_quote(&auth.to_string_lossy()),
         api_key = yaml_quote(&state.api_key),
+        deepseek = deepseek_compat_block(auth, state),
     )
 }
 
@@ -1394,6 +1561,10 @@ fn rewrite_claude_request(
         .ok_or_else(|| "Claude request body must be a JSON object".to_string())?;
     let routed_model = routed_model(object, state, provider);
     object.insert("model".into(), Value::String(routed_model));
+
+    if provider == "deepseek" {
+        apply_deepseek_thinking(object, state);
+    }
 
     for fixup in tool_compatibility_fixups(provider) {
         fixup(object);
@@ -2859,6 +3030,12 @@ fn credential_status(
     if relogin_required {
         return "relogin_required".into();
     }
+    // A DeepSeek API key carries no expiry, so the generic `expiry.is_none()`
+    // path ("unknown") would understate a credential that is simply always
+    // valid until the user revokes it upstream.
+    if provider == "deepseek" {
+        return "active".into();
+    }
     let renewal_window = match provider {
         "xai" => XAI_REFRESH_SKEW_SECS,
         "kimi" => KIMI_REFRESH_SKEW_SECS,
@@ -2914,6 +3091,7 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
                 "xai" => "Grok account".into(),
                 "codex" => "Codex account".into(),
                 "kimi" => "Kimi account".into(),
+                "deepseek" => "DeepSeek account".into(),
                 _ => "Claude account".into(),
             })
         });
@@ -3589,6 +3767,15 @@ pub async fn get_gateway_account_usage(file_name: String) -> Result<GatewayAccou
             .into_iter()
             .find(|account| account.file_name == file_name)
             .ok_or("Account not found")?;
+        // DeepSeek bills a prepaid balance rather than a quota window, so there
+        // is no percentage to report. Say that plainly instead of inventing a
+        // denominator to fill the usage bars with.
+        if account.provider == "deepseek" {
+            return Err(
+                "DeepSeek bills a prepaid balance, not a usage quota. Check your balance at platform.deepseek.com."
+                    .into(),
+            );
+        }
         let raw = fs::read_to_string(&path)
             .map_err(|error| format!("Could not read account credentials: {error}"))?;
         let value: Value = serde_json::from_str(&raw)
@@ -4383,7 +4570,7 @@ pub fn set_gateway_route(
 ) -> Result<GatewaySnapshot, String> {
     let _mutation = mutation_lock()?;
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return Err("Provider must be claude, codex, xai, or kimi".into());
+        return Err("Provider must be claude, codex, xai, kimi, or deepseek".into());
     }
     let Some(spec) = model_specs(&provider).iter().find(|spec| spec.id == model) else {
         return Err(format!("{model} is not an available {provider} model"));
@@ -4445,7 +4632,7 @@ pub fn set_skip_model_switch_confirmation(skip: bool) -> Result<GatewaySnapshot,
 pub fn get_model_catalog(provider: String) -> Result<Vec<ModelCatalogEntry>, String> {
     let _mutation = mutation_lock()?;
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return Err("Provider must be claude, codex, xai, or kimi".into());
+        return Err("Provider must be claude, codex, xai, kimi, or deepseek".into());
     }
     let hidden = load_hidden_models()?;
     let live_catalog = runtime_lock()
@@ -4517,6 +4704,115 @@ pub fn remove_gateway_account(file_name: String) -> Result<GatewaySnapshot, Stri
         validate_account_invariant(&directory, &state_path)
     })?;
     gateway_snapshot_locked()
+}
+
+/// Stable per-key account filename, so re-adding the same DeepSeek key updates
+/// the existing account instead of accumulating duplicates. Only a short digest
+/// of the key is used — the key itself must never appear in a filename.
+fn deepseek_credential_file_name(api_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(api_key.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("deepseek-{}.json", &digest[..16])
+}
+
+/// Builds the stored DeepSeek credential.
+///
+/// A brand-new account is created **disabled**, exactly like `merge_staged_login`
+/// does for a completed OAuth login. `validate_account_invariant` requires that
+/// precisely one account be enabled — the active one — so writing a new account
+/// as enabled makes the whole transaction roll back and the add silently fails.
+/// Re-adding a key that already exists preserves whatever state it had.
+fn deepseek_credential_value(api_key: &str, existing: Option<&Value>) -> Value {
+    let disabled = existing
+        .and_then(|value| value.get("disabled").and_then(Value::as_bool))
+        .unwrap_or(true);
+    serde_json::json!({
+        "type": "deepseek",
+        "api_key": api_key,
+        "disabled": disabled,
+    })
+}
+
+/// Verifies a DeepSeek API key against the account balance endpoint.
+///
+/// This is an authorization probe, not a usage reading: it exists so a typo'd or
+/// revoked key is rejected at add time rather than surfacing later as a failed
+/// relay request with no obvious cause.
+async fn verify_deepseek_api_key(api_key: &str) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent("Basiliskos/1.1")
+        .build()
+        .map_err(|error| format!("Could not prepare the DeepSeek check: {error}"))?;
+    let response = client
+        .get(DEEPSEEK_BALANCE_URL)
+        .bearer_auth(api_key)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|_| "Could not reach DeepSeek to verify the API key.".to_string())?;
+    match response.status().as_u16() {
+        200 => Ok(()),
+        401 | 403 => Err("DeepSeek rejected that API key.".into()),
+        code => Err(format!("DeepSeek returned {code} while verifying the key.")),
+    }
+}
+
+/// Adds (or updates) a DeepSeek account from an API key.
+///
+/// DeepSeek is the only supported provider without an OAuth flow, so it has its
+/// own entry point rather than going through `launch_provider_login`. The stored
+/// credential is a normal auth-dir JSON file, which keeps rename / disable /
+/// remove / activate working unchanged.
+///
+/// The account is stored disabled (the single-enabled-account invariant), so the
+/// returned `fileName` lets the caller activate it right away through
+/// `select_gateway_account`.
+#[tauri::command]
+pub async fn add_deepseek_account(api_key: String) -> Result<DeepseekAccountAdded, String> {
+    let api_key = api_key.trim().to_string();
+    if !is_valid_deepseek_api_key(&api_key) {
+        return Err("Enter a valid DeepSeek API key (letters, digits, '-' and '_' only).".into());
+    }
+    verify_deepseek_api_key(&api_key).await?;
+
+    let _mutation = mutation_lock()?;
+    let directory = auth_dir()?;
+    secure_create_dir_all(&directory)?;
+    let file_name = deepseek_credential_file_name(&api_key);
+    let path = exact_auth_path(&file_name)?;
+    let existing = fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+    let credential = deepseek_credential_value(&api_key, existing.as_ref());
+    let after = serde_json::to_vec_pretty(&credential)
+        .map_err(|_| "The DeepSeek credential could not be serialized")?;
+    let root = root_dir()?;
+    let state_path = controller_path()?;
+    run_transaction(
+        &root,
+        &[FileMutation {
+            path,
+            after: Some(after),
+        }],
+        || validate_account_invariant(&directory, &state_path),
+    )
+    .inspect_err(|_| {
+        diagnostics::record(
+            ErrorCode::ConfigTransactionFailed,
+            "error",
+            "The DeepSeek credential could not be committed transactionally.",
+            None,
+            None,
+            Some("deepseek"),
+        );
+    })?;
+    prepare_config()?;
+    Ok(DeepseekAccountAdded {
+        snapshot: gateway_snapshot_locked()?,
+        file_name,
+    })
 }
 
 enum LoginOutput {
@@ -4906,6 +5202,12 @@ fn provider_login_flag(provider: &str) -> Result<&'static str, String> {
         "codex" => Ok("-codex-login"),
         "xai" => Ok("-xai-login"),
         "kimi" => Ok("-kimi-login"),
+        // DeepSeek has no OAuth/device flow — it is added with an API key via
+        // `add_deepseek_account`, so routing it here would be a bug, not a
+        // user error.
+        "deepseek" => {
+            Err("DeepSeek accounts are added with an API key, not a browser login.".into())
+        }
         _ => Err("Provider must be claude, codex, xai, or kimi".into()),
     }
 }
@@ -6221,6 +6523,242 @@ mod tests {
         assert_eq!(kimi[0], usage_window("Week", 35.0));
         assert_eq!(kimi[1], usage_window("5h", 25.0));
         assert_eq!(kimi[2], usage_window("Week", 80.0));
+    }
+
+    fn deepseek_auth_file(auth: &Path, file_name: &str, api_key: &str, disabled: bool) {
+        fs::write(
+            auth.join(file_name),
+            serde_json::json!({"type": "deepseek", "api_key": api_key, "disabled": disabled})
+                .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn state_with_active(auth_file_name: &str) -> ControllerState {
+        ControllerState {
+            api_key: "test-secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: Some(auth_file_name.into()),
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+        }
+    }
+
+    #[test]
+    fn deepseek_api_keys_are_rejected_unless_they_are_safe_yaml_scalars() {
+        assert!(is_valid_deepseek_api_key("sk-abc123_XYZ-456"));
+        assert!(!is_valid_deepseek_api_key(""));
+        // A quote or backslash would either escape the rendered YAML scalar or
+        // be silently rewritten by `yaml_quote`, producing a wrong key.
+        assert!(!is_valid_deepseek_api_key("sk-abc\"def"));
+        assert!(!is_valid_deepseek_api_key("sk-abc\\def"));
+        assert!(!is_valid_deepseek_api_key("sk-abc def"));
+        assert!(!is_valid_deepseek_api_key("sk-abc\ndef"));
+        assert!(!is_valid_deepseek_api_key(
+            &"a".repeat(MAX_DEEPSEEK_API_KEY_LEN + 1)
+        ));
+    }
+
+    #[test]
+    fn deepseek_credential_file_name_is_stable_per_key_and_hides_the_key() {
+        let name = deepseek_credential_file_name("sk-secret-key-value");
+        assert_eq!(name, deepseek_credential_file_name("sk-secret-key-value"));
+        assert_ne!(name, deepseek_credential_file_name("sk-a-different-key"));
+        assert!(name.starts_with("deepseek-"));
+        assert!(name.ends_with(".json"));
+        assert!(!name.contains("secret"));
+    }
+
+    #[test]
+    fn deepseek_config_block_uses_api_key_entries_only_for_the_active_account() {
+        let auth = temp_dir("deepseek-config");
+        deepseek_auth_file(&auth, "deepseek-aaa.json", "sk-active-key", false);
+        deepseek_auth_file(&auth, "deepseek-bbb.json", "sk-other-key", false);
+        auth_file(&auth, "xai-test.json", "xai");
+
+        let config = render_config(&auth, &state_with_active("deepseek-aaa.json"));
+        // `api-keys` parses but loads zero clients on the pinned runtime; the
+        // key must be under `api-key-entries`.
+        assert!(config.contains("openai-compatibility:"));
+        assert!(config.contains("api-key-entries:"));
+        assert!(config.contains("- api-key: \"sk-active-key\""));
+        assert!(config.contains("base-url: \"https://api.deepseek.com/v1\""));
+        assert!(config.contains("- name: \"deepseek-v4-flash\""));
+        assert!(config.contains("- name: \"deepseek-v4-pro\""));
+        // CLIProxyAPI load-balances across entries, so a key the user did not
+        // select must never be rendered alongside the active one.
+        assert!(!config.contains("sk-other-key"));
+
+        // A non-DeepSeek active account keeps every DeepSeek key out of the config.
+        let other = render_config(&auth, &state_with_active("xai-test.json"));
+        assert!(!other.contains("openai-compatibility:"));
+        assert!(!other.contains("sk-active-key"));
+
+        // A disabled DeepSeek account must not be routed either.
+        deepseek_auth_file(&auth, "deepseek-aaa.json", "sk-active-key", true);
+        let disabled = render_config(&auth, &state_with_active("deepseek-aaa.json"));
+        assert!(!disabled.contains("openai-compatibility:"));
+        assert!(!disabled.contains("sk-active-key"));
+
+        let _ = fs::remove_dir_all(auth);
+    }
+
+    #[test]
+    fn adding_a_deepseek_account_does_not_break_the_single_enabled_invariant() {
+        // Regression: a new DeepSeek account was written enabled, so the auth
+        // dir briefly had two enabled accounts, `validate_account_invariant`
+        // rejected it, and `run_transaction` rolled the write back — the add
+        // failed with "Account transaction invariant failed" every time.
+        let root = temp_dir("deepseek-invariant");
+        let directory = root.join("auth");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = root.join("controller.json");
+
+        // An active, enabled Codex account — the normal starting state.
+        fs::write(
+            directory.join("codex-active.json"),
+            serde_json::json!({"type": "codex", "disabled": false}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&state_with_active("codex-active.json")).unwrap(),
+        )
+        .unwrap();
+        validate_account_invariant(&directory, &state_path)
+            .expect("baseline state should satisfy the invariant");
+
+        // Adding DeepSeek must leave the invariant intact.
+        let credential = deepseek_credential_value("sk-new-key", None);
+        assert_eq!(credential.get("disabled"), Some(&Value::Bool(true)));
+        fs::write(
+            directory.join("deepseek-new.json"),
+            serde_json::to_vec(&credential).unwrap(),
+        )
+        .unwrap();
+        validate_account_invariant(&directory, &state_path)
+            .expect("adding a DeepSeek account must not break the invariant");
+
+        // The auto-switch depends on the add result naming a file that actually
+        // exists in the auth dir and is recognised as a DeepSeek account —
+        // otherwise the UI silently falls back to "select it yourself".
+        let added_name = deepseek_credential_file_name("sk-new-key");
+        let stored: Value =
+            serde_json::from_slice(&fs::read(directory.join("deepseek-new.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            account_provider(&stored, &added_name).as_deref(),
+            Some("deepseek")
+        );
+
+        // Re-adding the same key preserves state instead of re-enabling it.
+        let reused = deepseek_credential_value("sk-new-key", Some(&credential));
+        assert_eq!(reused.get("disabled"), Some(&Value::Bool(true)));
+        let enabled = serde_json::json!({"type": "deepseek", "disabled": false});
+        assert_eq!(
+            deepseek_credential_value("sk-new-key", Some(&enabled)).get("disabled"),
+            Some(&Value::Bool(false)),
+            "an already-active DeepSeek account must not be disabled by re-adding its key"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deepseek_credentials_report_active_rather_than_unknown_expiry() {
+        let now = Utc::now();
+        // API keys carry no expiry; the generic path would call that "unknown".
+        assert_eq!(
+            credential_status("deepseek", "deepseek-aaa.json", None, now),
+            "active"
+        );
+        assert_eq!(
+            credential_status("claude", "claude-aaa.json", None, now),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn deepseek_is_routable_but_has_no_browser_login() {
+        assert!(SUPPORTED_PROVIDERS.contains(&"deepseek"));
+        assert_eq!(default_model("deepseek"), "deepseek-v4-flash");
+        assert_eq!(provider_label("deepseek"), "DeepSeek");
+        assert!(default_routes().contains_key("deepseek"));
+        // Every DeepSeek model must be advertised in the rendered config block,
+        // or the route would be selectable in the UI but unknown to the backend.
+        assert_eq!(model_specs("deepseek").len(), DEEPSEEK_MODELS.len());
+        assert!(provider_login_flag("deepseek").is_err());
+
+        // The retired 2026-07-24 model IDs must never come back, and only levels
+        // Basiliskos can actually deliver may be advertised ("max" saturates to
+        // "high" in translation, so offering it would be a lie).
+        for spec in DEEPSEEK_MODELS {
+            assert!(spec.id != "deepseek-chat" && spec.id != "deepseek-reasoner");
+            for level in spec.thinking_levels {
+                assert!(
+                    matches!(*level, "low" | "high"),
+                    "{} advertises {level}, which cannot be delivered through the thinking budget",
+                    spec.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek_effort_uses_a_thinking_budget_and_never_the_medium_band() {
+        fn rewrite(thinking: &str, max_tokens: u64) -> serde_json::Map<String, Value> {
+            let mut state = state_with_active("deepseek-aaa.json");
+            state.routes.insert(
+                "deepseek".into(),
+                RouteSelection {
+                    model: "deepseek-v4-flash".into(),
+                    thinking: thinking.into(),
+                },
+            );
+            let mut body = serde_json::json!({
+                "model": "claude-sonnet-4-5-20250929",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            rewrite_claude_request(&mut body, &state, "deepseek", false).unwrap();
+            body.as_object().unwrap().clone()
+        }
+
+        // The plain model id must survive — a `model(effort)` suffix breaks
+        // credential selection on the openai-compatibility path.
+        let high = rewrite("high", 200_000);
+        assert_eq!(high["model"], Value::String("deepseek-v4-flash".into()));
+        assert_eq!(high["thinking"]["budget_tokens"], Value::from(12288u64));
+        assert_eq!(high["thinking"]["type"], Value::String("enabled".into()));
+
+        let low = rewrite("low", 200_000);
+        assert_eq!(low["thinking"]["budget_tokens"], Value::from(1024u64));
+
+        // Measured translator bands: <=1024 low, 2048..8192 medium, >=12288 high.
+        // DeepSeek rejects "medium", so no configured level may land in between.
+        for level in ["low", "high"] {
+            let budget = rewrite(level, 200_000)["thinking"]["budget_tokens"]
+                .as_u64()
+                .unwrap();
+            assert!(
+                budget <= 1024 || budget >= 12288,
+                "{level} produced budget {budget}, which translates to the rejected \"medium\""
+            );
+        }
+
+        // A client cap too small for the budget is raised, never lowered.
+        let cramped = rewrite("high", 4096);
+        assert_eq!(cramped["thinking"]["budget_tokens"], Value::from(12288u64));
+        assert!(cramped["max_tokens"].as_u64().unwrap() > 12288);
+        assert_eq!(
+            rewrite("high", 200_000)["max_tokens"],
+            Value::from(200_000u64)
+        );
+
+        // "auto" leaves the client's own request alone.
+        assert!(!rewrite("auto", 200_000).contains_key("thinking"));
     }
 
     #[test]

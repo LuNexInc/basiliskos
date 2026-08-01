@@ -8,7 +8,9 @@ import {
   BellDot,
   Check,
   CircleStop,
+  Copy,
   Download,
+  ExternalLink,
   FolderOpen,
   ListFilter,
   LoaderCircle,
@@ -27,7 +29,16 @@ import {
 import brandArt from "./assets/basiliskos-mark.png";
 import "./App.css";
 
-type Provider = "claude" | "codex" | "xai" | "kimi";
+type Provider = "claude" | "codex" | "xai" | "kimi" | "deepseek";
+
+/**
+ * DeepSeek is the one provider with no OAuth/device flow — it is authorized with
+ * an API key, so the "Add account" button opens a key field instead of starting
+ * a browser login.
+ */
+export function usesApiKeyAuth(provider: Provider): boolean {
+  return provider === "deepseek";
+}
 
 type Account = {
   fileName: string;
@@ -83,6 +94,7 @@ type Snapshot = {
 };
 
 type AccountSelectionResult = Snapshot & { claudeConfigChanged: boolean };
+type DeepseekAccountAdded = Snapshot & { fileName: string };
 
 export type ComponentStatus = {
   state: string;
@@ -142,6 +154,42 @@ type ProviderLoginLaunch = {
   userCode?: string;
 };
 
+/** In-flight OAuth details held in the UI so the user can copy/open deliberately. */
+type PendingAuthLaunch = {
+  sessionId: string;
+  provider: Provider;
+  authorizationUrl: string;
+  userCode?: string;
+  accountLabel?: string;
+};
+
+/**
+ * Providers whose browser session cookie often auto-completes the wrong account.
+ * For these we never auto-open the default browser — surface the URL + code instead
+ * so the user can paste into a private window or dedicated profile.
+ */
+export function prefersManualAuthBrowser(provider: Provider): boolean {
+  return provider === "xai" || provider === "kimi";
+}
+
+export async function copyTextToClipboard(text: string): Promise<void> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  // Fallback for non-secure contexts / older WebViews
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const ok = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  if (!ok) throw new Error("Clipboard copy is unavailable in this environment");
+}
+
 type ReleaseAsset = {
   name: string;
   browser_download_url: string;
@@ -169,7 +217,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-const APP_VERSION = "2.1.0";
+const APP_VERSION = "2.2.0";
 const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
@@ -177,6 +225,7 @@ const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "codex", label: "Codex", detail: "ChatGPT / Codex OAuth" },
   { id: "xai", label: "Grok", detail: "Grok Build OAuth" },
   { id: "kimi", label: "Kimi", detail: "Kimi Code OAuth" },
+  { id: "deepseek", label: "DeepSeek", detail: "DeepSeek API key" },
 ];
 
 function messageFrom(error: unknown) {
@@ -336,6 +385,11 @@ export default function App() {
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [preparedUpdate, setPreparedUpdate] = useState<PreparedBasiliskosUpdate | null>(null);
   const handledLogin = useRef<string | null>(null);
+  const [pendingAuth, setPendingAuth] = useState<PendingAuthLaunch | null>(null);
+  const [authCopyFeedback, setAuthCopyFeedback] = useState<string | null>(null);
+  // DeepSeek API-key entry. Held only until the key is handed to the backend.
+  const [apiKeyPrompt, setApiKeyPrompt] = useState(false);
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [accountSwitchConfirm, setAccountSwitchConfirm] = useState<{
     open: boolean;
     account: Account | null;
@@ -446,6 +500,17 @@ export default function App() {
 
   useEffect(() => {
     const login = snapshot?.login;
+    // Drop the manual-auth card when this session leaves "waiting". Do not clear when
+    // login is still null right after launch — refresh may not have landed yet.
+    if (
+      pendingAuth &&
+      login &&
+      login.sessionId === pendingAuth.sessionId &&
+      login.state !== "waiting"
+    ) {
+      setPendingAuth(null);
+      setAuthCopyFeedback(null);
+    }
     if (!login || handledLogin.current === login.sessionId || login.state === "waiting") return;
     handledLogin.current = login.sessionId;
     if (login.state !== "completed" || !login.resultFileName) {
@@ -464,6 +529,8 @@ export default function App() {
           : await invoke<Snapshot>("launch_hydra_claude");
         setSnapshot(next);
         setProvider(login.provider);
+        setPendingAuth(null);
+        setAuthCopyFeedback(null);
         setMessage("Account authorized and selected. The isolated Basiliskos Claude window is ready.");
         setIsError(false);
       } catch (error) {
@@ -473,7 +540,7 @@ export default function App() {
         setBusy(null);
       }
     })();
-  }, [snapshot?.login]);
+  }, [snapshot?.login, pendingAuth]);
 
   const accounts = useMemo(
     () => snapshot?.accounts.filter((account) => account.provider === provider) ?? [],
@@ -492,6 +559,28 @@ export default function App() {
     ...item,
     count: snapshot?.accounts.filter((account) => account.provider === item.id).length ?? 0,
   }));
+
+  const getPrimaryUsagePercent = useCallback((fileName?: string) => {
+    if (!fileName) return undefined;
+    const windows = usageByAccount[fileName]?.data?.windows;
+    if (!windows || windows.length === 0) return undefined;
+    const knownWindows = windows.filter((w) => w.known);
+    if (knownWindows.length === 0) return undefined;
+    return knownWindows[0].remainingPercent;
+  }, [usageByAccount]);
+
+  const activeUsagePercent = getPrimaryUsagePercent(active?.fileName);
+  const codexUsagePercent = getPrimaryUsagePercent(codexCliAccount?.fileName);
+  const grokUsagePercent = getPrimaryUsagePercent(grokCliAccount?.fileName);
+
+  useEffect(() => {
+    const unlistenPromise = getCurrentWindow().listen("tauri://focus", () => {
+      setView("console");
+    });
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
   const refreshUsage = useCallback(async (fileNames: string[]) => {
     if (fileNames.length === 0) return;
     setUsageByAccount((current) => {
@@ -795,23 +884,97 @@ export default function App() {
     setAccountSwitchConfirm((prev) => ({ ...prev, open: false }));
   }
 
+  async function presentProviderLogin(
+    login: ProviderLoginLaunch,
+    loginProvider: Provider,
+    options?: { accountLabel?: string },
+  ) {
+    const providerLabel = PROVIDERS.find((item) => item.id === loginProvider)?.label ?? loginProvider;
+    const codeMessage = login.userCode ? ` Enter code ${login.userCode} if asked.` : "";
+    const pending: PendingAuthLaunch = {
+      sessionId: login.sessionId,
+      provider: loginProvider,
+      authorizationUrl: login.authorizationUrl,
+      userCode: login.userCode,
+      accountLabel: options?.accountLabel,
+    };
+    setPendingAuth(pending);
+    setAuthCopyFeedback(null);
+
+    // Manual path: never hand the URL to the default browser (cookie jar often
+    // auto-completes the wrong account when adding a second Grok/Kimi credential).
+    if (prefersManualAuthBrowser(loginProvider)) {
+      const target = options?.accountLabel ? ` for "${options.accountLabel}"` : "";
+      setMessage(
+        `Finish the official ${providerLabel} login${target} in a private window or dedicated browser profile — use Copy URL below.${codeMessage}`,
+      );
+      setIsError(false);
+      return;
+    }
+
+    try {
+      await openUrl(login.authorizationUrl);
+      const target = options?.accountLabel ? ` to refresh "${options.accountLabel}"` : "";
+      setMessage(`Finish the official ${providerLabel} login in your browser${target}…${codeMessage}`);
+      setIsError(false);
+    } catch (openError) {
+      setMessage(
+        `Login started, but the browser did not open automatically (${messageFrom(openError)}). Use Copy URL below, or open this URL manually: ${login.authorizationUrl}.${codeMessage}`,
+      );
+      setIsError(true);
+    }
+  }
+
   async function addAccount() {
+    // API-key providers have no browser login to launch — collect the key first.
+    if (usesApiKeyAuth(provider)) {
+      setApiKeyDraft("");
+      setApiKeyPrompt(true);
+      setMessage("Paste a DeepSeek API key from platform.deepseek.com to authorize it.");
+      setIsError(false);
+      return;
+    }
     setBusy("login");
     try {
       const login = await invoke<ProviderLoginLaunch>("launch_provider_login", { provider });
-      const providerLabel = PROVIDERS.find((item) => item.id === provider)?.label ?? provider;
-      const codeMessage = login.userCode ? ` Enter code ${login.userCode} if asked.` : "";
-      try {
-        await openUrl(login.authorizationUrl);
-        setMessage(`Finish the official ${providerLabel} login in your browser…${codeMessage}`);
-        setIsError(false);
-      } catch (openError) {
-        setMessage(
-          `Login started, but the browser did not open automatically (${messageFrom(openError)}). Open this URL manually: ${login.authorizationUrl}.${codeMessage}`,
-        );
-        setIsError(true);
-      }
+      await presentProviderLogin(login, provider);
       await refresh(true);
+    } catch (error) {
+      setPendingAuth(null);
+      setMessage(messageFrom(error));
+      setIsError(true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function submitApiKey() {
+    const key = apiKeyDraft.trim();
+    if (!key) {
+      setMessage("Enter a DeepSeek API key first.");
+      setIsError(true);
+      return;
+    }
+    setBusy("api-key");
+    try {
+      // The backend verifies the key against DeepSeek before saving it, so a
+      // bad key fails here rather than during a later relay request.
+      const added = await invoke<DeepseekAccountAdded>("add_deepseek_account", { apiKey: key });
+      setSnapshot(added);
+      setApiKeyPrompt(false);
+      setApiKeyDraft("");
+      setIsError(false);
+      // A newly added account is stored disabled, so adding alone would not
+      // change what Claude is talking to. Switch to it immediately through the
+      // normal selection path, which also restarts the Basiliskos Claude window
+      // when its configuration changes.
+      const account = added.accounts.find((item) => item.fileName === added.fileName);
+      if (account) {
+        await selectAccount(account);
+      } else {
+        setMessage("DeepSeek API key saved. Select the account to route through it.");
+        await refresh(true);
+      }
     } catch (error) {
       setMessage(messageFrom(error));
       setIsError(true);
@@ -820,28 +983,60 @@ export default function App() {
     }
   }
 
+  function cancelApiKeyPrompt() {
+    setApiKeyPrompt(false);
+    setApiKeyDraft("");
+  }
+
   async function relogin(account: Account) {
+    // Re-authorizing an API-key account means replacing the key, not re-running
+    // a login the provider does not have.
+    if (usesApiKeyAuth(account.provider)) {
+      setProvider(account.provider);
+      setApiKeyDraft("");
+      setApiKeyPrompt(true);
+      setMessage(`Paste a new DeepSeek API key to replace the one on "${account.label}".`);
+      setIsError(false);
+      return;
+    }
     setBusy(`relogin-${account.fileName}`);
     try {
       const login = await invoke<ProviderLoginLaunch>("launch_provider_login", { provider: account.provider });
-      const providerLabel = PROVIDERS.find((item) => item.id === account.provider)?.label ?? account.provider;
-      const codeMessage = login.userCode ? ` Enter code ${login.userCode} if asked.` : "";
-      try {
-        await openUrl(login.authorizationUrl);
-        setMessage(`Finish the official ${providerLabel} login in your browser to refresh "${account.label}"…${codeMessage}`);
-        setIsError(false);
-      } catch (openError) {
-        setMessage(
-          `Login started, but the browser did not open automatically (${messageFrom(openError)}). Open this URL manually: ${login.authorizationUrl}.${codeMessage}`,
-        );
-        setIsError(true);
-      }
+      await presentProviderLogin(login, account.provider, { accountLabel: account.label });
       await refresh(true);
     } catch (error) {
+      setPendingAuth(null);
       setMessage(messageFrom(error));
       setIsError(true);
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function copyAuthField(kind: "url" | "code") {
+    if (!pendingAuth) return;
+    const value = kind === "url" ? pendingAuth.authorizationUrl : pendingAuth.userCode;
+    if (!value) return;
+    try {
+      await copyTextToClipboard(value);
+      setAuthCopyFeedback(kind === "url" ? "URL copied" : "Code copied");
+      setIsError(false);
+    } catch (error) {
+      setAuthCopyFeedback(null);
+      setMessage(`Could not copy to clipboard: ${messageFrom(error)}`);
+      setIsError(true);
+    }
+  }
+
+  async function openAuthUrlManually() {
+    if (!pendingAuth) return;
+    try {
+      await openUrl(pendingAuth.authorizationUrl);
+      setMessage("Opened the authorization URL in your default browser. Prefer a private window if the wrong account is signed in.");
+      setIsError(false);
+    } catch (error) {
+      setMessage(`Could not open the browser (${messageFrom(error)}). Use Copy URL and paste it yourself.`);
+      setIsError(true);
     }
   }
 
@@ -849,6 +1044,8 @@ export default function App() {
     setBusy("cancel-login");
     try {
       setSnapshot(await invoke<Snapshot>("cancel_provider_login"));
+      setPendingAuth(null);
+      setAuthCopyFeedback(null);
       setMessage("Provider login cancelled. Live credentials were not changed.");
       setIsError(false);
     } catch (error) {
@@ -982,16 +1179,46 @@ export default function App() {
                 ? `${active.label} · Thinking ${thinkingLabel(activeRoute.thinking)}${contextWindowLabel(activeRoute.contextWindow) ? ` · ${contextWindowLabel(activeRoute.contextWindow)}` : ""}`
                 : "Serve an account below"}
             </p>
+            {activeUsagePercent !== undefined ? (
+              <div className="hero-fuel">
+                <QuotaBar percent={activeUsagePercent} />
+                <span>{Math.round(activeUsagePercent)}% fuel left</span>
+              </div>
+            ) : (
+              <div className="hero-fuel unrecorded">
+                <span>Usage unrecorded</span>
+              </div>
+            )}
           </div>
           <div className="hero-service">
             <span className="eyebrow">Codex CLI</span>
             <h3>{codexCliAccount ? codexCliAccount.label : "Not set"}</h3>
             <p>{codexCliAccount ? codexCliAccount.email ?? "Real codex command" : "Serve an account below"}</p>
+            {codexUsagePercent !== undefined ? (
+              <div className="hero-fuel">
+                <QuotaBar percent={codexUsagePercent} />
+                <span>{Math.round(codexUsagePercent)}% fuel left</span>
+              </div>
+            ) : (
+              <div className="hero-fuel unrecorded">
+                <span>Usage unrecorded</span>
+              </div>
+            )}
           </div>
           <div className="hero-service">
             <span className="eyebrow">Grok CLI</span>
             <h3>{grokCliAccount ? grokCliAccount.label : "Not set"}</h3>
             <p>{grokCliAccount ? grokCliAccount.email ?? "Real grok command" : "Serve an account below"}</p>
+            {grokUsagePercent !== undefined ? (
+              <div className="hero-fuel">
+                <QuotaBar percent={grokUsagePercent} />
+                <span>{Math.round(grokUsagePercent)}% fuel left</span>
+              </div>
+            ) : (
+              <div className="hero-fuel unrecorded">
+                <span>Usage unrecorded</span>
+              </div>
+            )}
           </div>
         </div>
         <div className="hero-actions">
@@ -1016,18 +1243,87 @@ export default function App() {
                 </button>
               ) : (
                 <button className="add-button" onClick={() => void addAccount()} disabled={busy !== null}>
-                  {busy === "login" ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />} Add account
+                  {busy === "login" ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />}{" "}
+                  {usesApiKeyAuth(provider) ? "Add API key" : "Add account"}
                 </button>
               )}
             </div>
           </div>
           <div className="provider-tabs" role="tablist" aria-label="Account provider">
             {PROVIDERS.map((item) => (
-              <button key={item.id} role="tab" aria-selected={provider === item.id} className={provider === item.id ? "selected" : ""} onClick={() => setProvider(item.id)}>
+              <button key={item.id} role="tab" aria-selected={provider === item.id} className={provider === item.id ? "selected" : ""} onClick={() => { setProvider(item.id); cancelApiKeyPrompt(); }}>
                 {item.label}
               </button>
             ))}
           </div>
+          {apiKeyPrompt && (
+            <div className="auth-wait-card" role="group" aria-label="DeepSeek API key">
+              <div className="auth-wait-head">
+                <span className="zone-label">API KEY</span>
+                <strong>DeepSeek</strong>
+                <p>
+                  DeepSeek authorizes with an API key instead of a browser login. Create one at
+                  platform.deepseek.com, then paste it here. It is stored locally and verified with
+                  DeepSeek before it is saved.
+                </p>
+              </div>
+              <div className="auth-wait-url-row">
+                <input
+                  className="auth-wait-url"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-label="DeepSeek API key"
+                  placeholder="sk-…"
+                  value={apiKeyDraft}
+                  onChange={(event) => setApiKeyDraft(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === "Enter") void submitApiKey(); }}
+                  disabled={busy !== null}
+                />
+                <button type="button" className="auth-wait-action" onClick={() => void submitApiKey()} disabled={busy !== null || !apiKeyDraft.trim()}>
+                  {busy === "api-key" ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} aria-hidden="true" />} Verify and save
+                </button>
+                <button type="button" className="auth-wait-action" onClick={cancelApiKeyPrompt} disabled={busy !== null}>
+                  <X size={14} aria-hidden="true" /> Cancel
+                </button>
+              </div>
+            </div>
+          )}
+          {pendingAuth && (
+            <div className="auth-wait-card" role="status" aria-live="polite">
+              <div className="auth-wait-head">
+                <span className="zone-label">AUTHORIZATION</span>
+                <strong>
+                  {PROVIDERS.find((item) => item.id === pendingAuth.provider)?.label ?? pendingAuth.provider}
+                  {pendingAuth.accountLabel ? ` · ${pendingAuth.accountLabel}` : ""}
+                </strong>
+                <p>
+                  {prefersManualAuthBrowser(pendingAuth.provider)
+                    ? "Open this URL in a private window or a dedicated browser profile so the right account is chosen. The default browser often auto-completes the wrong one."
+                    : "Finish the official provider login in your browser. You can also copy the URL if auto-open failed."}
+                </p>
+              </div>
+              <div className="auth-wait-url-row">
+                <code className="auth-wait-url" title={pendingAuth.authorizationUrl}>{pendingAuth.authorizationUrl}</code>
+                <button type="button" className="auth-wait-action" onClick={() => void copyAuthField("url")} disabled={busy !== null}>
+                  <Copy size={14} aria-hidden="true" /> Copy URL
+                </button>
+                <button type="button" className="auth-wait-action" onClick={() => void openAuthUrlManually()} disabled={busy !== null}>
+                  <ExternalLink size={14} aria-hidden="true" /> Open browser
+                </button>
+              </div>
+              {pendingAuth.userCode && (
+                <div className="auth-wait-code-row">
+                  <span className="auth-wait-code-label">Code</span>
+                  <code className="auth-wait-code">{pendingAuth.userCode}</code>
+                  <button type="button" className="auth-wait-action" onClick={() => void copyAuthField("code")} disabled={busy !== null}>
+                    <Copy size={14} aria-hidden="true" /> Copy code
+                  </button>
+                </div>
+              )}
+              {authCopyFeedback && <p className="auth-wait-feedback">{authCopyFeedback}</p>}
+            </div>
+          )}
           <div className="account-list" role="tabpanel">
             {accounts.length === 0 ? (
               <div className="empty-state"><ShieldCheck size={26} /><h3>No {PROVIDERS.find((item) => item.id === provider)?.label} account yet</h3><p>Add one using the official browser login.</p></div>
