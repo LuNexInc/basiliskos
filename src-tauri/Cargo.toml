@@ -1,6 +1,6 @@
 [package]
 name = "hydra-gateway"
-version = "2.2.3"
+version = "2.2.4"
 description = "Local backend and account controller for Claude Code Desktop"
 authors = ["Charles 3Ready"]
 license = "MIT"
