@@ -2,7 +2,7 @@
 
 > Navigation index: where things live / what to open first. NOT behavior docs (that's AGENTS.md).
 > Size cap ~45 lines. Update in the same commit that moves/renames a module.
-> Last verified: 2026-07-25
+> Last verified: 2026-08-02
 
 ## Open first
 - `AGENTS.md` — Basiliskos contract + the **canonical-vs-publish-repo** rules. Read before ANY work here.

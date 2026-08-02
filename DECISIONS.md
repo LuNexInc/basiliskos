@@ -3,6 +3,13 @@
 > What is intentionally settled + why + reverse-if. HANDOFF = history; this = standing state.
 > Newest on top. Extracted from AGENTS.md 2026-07-25 — keep in sync when a call changes.
 
+## 2026-08-02 — DeepSeek V4 effort uses adaptive thinking, not numeric budgets
+- **Decision:** route DeepSeek V4 through Anthropic adaptive thinking (`thinking.type=adaptive` + `output_config.effort`) so CLIProxyAPI emits the OpenAI-compatible `reasoning_effort`. Flash exposes `low`, `high`, and `max`; Pro exposes `high` and `max` because its upstream maps `low` to `high`.
+- **Why:** the previous `thinking.budget_tokens` bridge saturated at `high`, making V4 Flash `max` impossible despite DeepSeek supporting it. DeepSeek sampling settings have no effect while thinking is enabled, so Basiliskos removes `temperature`, `top_p`, and frequency/presence penalties for an explicit thinking route, while leaving them unchanged in auto mode.
+- **Provider isolation:** generate the compatibility provider as `basiliskos-deepseek`, not `deepseek`. The selected account remains a `deepseek-*.json` file for Basiliskos' account UI, but CLIProxyAPI otherwise selects that stored file (which has no `base_url`) before the generated compatibility client and rejects requests with `missing provider baseURL`.
+- **Thinking off:** advertise `Off` for both V4 models. It sends `thinking.type=disabled` and removes the selected effort, so DeepSeek receives a true non-thinking request and honours caller-provided temperature and sampling settings.
+- **Reverse if:** a future CLIProxyAPI release directly supports the DeepSeek provider contract and makes the adaptive bridge unnecessary; re-verify every advertised effort level against the pinned runtime before changing this path.
+
 ## 2026-07-24 — This monorepo folder is canonical; `LuNexInc/basiliskos` is publish-only
 - **Decision:** implement here; the release repo is a one-way publish target, NOT auto-synced. Before any session, compare versions (`grep version package.json` vs `gh release list --repo LuNexInc/basiliskos`); if the release repo is ahead, backport to dev FIRST.
 - **Why:** on 2026-07-24 the two silently diverged — Claude released 2.0.0 from dev while Codex released 2.0.1–2.0.3 from the release repo, neither aware of the other. Cost ~a day.

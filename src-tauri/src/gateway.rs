@@ -72,24 +72,14 @@ const KIMI_RELOGIN_REQUIRED: &str =
 // block (verified against the pinned 7.2.83 binary — the key must sit under
 // `api-key-entries`, not `api-keys`, or the provider loads zero clients).
 // Credentials are stored as normal `deepseek-*.json` auth files so every
-// existing account operation (label / activate / disable / remove) applies;
-// CLIProxyAPI itself ignores that file type and advertises no models from it.
+// existing account operation (label / activate / disable / remove) applies.
+// Its generated compatibility provider must use a separate internal name: the
+// stored `type: deepseek` file has no base_url and would otherwise be selected
+// before the generated client, causing "missing provider baseURL" at runtime.
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
-const DEEPSEEK_COMPAT_NAME: &str = "deepseek";
+const DEEPSEEK_COMPAT_NAME: &str = "basiliskos-deepseek";
 const MAX_DEEPSEEK_API_KEY_LEN: usize = 200;
-// DeepSeek effort travels as an Anthropic `thinking` budget, which CLIProxyAPI
-// translates into `reasoning_effort` for the OpenAI-shaped upstream. Measured
-// against the pinned 7.2.83 runtime by reading the logged upstream payload:
-//   budget <= 1024 -> "low" · 2048..8192 -> "medium" · >= 12288 -> "high"
-// DeepSeek only accepts low/high/max, so the middle band must never be emitted.
-// These two budgets sit inside the low and high bands with margin on each side.
-// ("max" is unreachable this way — the translator saturates at "high".)
-const DEEPSEEK_LOW_EFFORT_BUDGET: u64 = 1024;
-const DEEPSEEK_HIGH_EFFORT_BUDGET: u64 = 12288;
-// Anthropic requires budget_tokens < max_tokens; this is the headroom added when
-// a client's max_tokens is too small to hold the budget we need.
-const DEEPSEEK_EFFORT_MAX_TOKENS_HEADROOM: u64 = 4096;
 #[derive(Clone, Copy)]
 struct ModelSpec {
     id: &'static str,
@@ -258,23 +248,20 @@ const KIMI_MODELS: &[ModelSpec] = &[
 // `deepseek-chat` / `deepseek-reasoner` were fully retired on 2026-07-24 and now
 // return errors, so V4 is the only routable generation.
 //
-// Thinking is delivered via the `thinking` budget (see the DEEPSEEK_*_BUDGET
-// constants), NOT the `model(effort)` suffix used for the OAuth providers — that
-// suffix breaks credential selection on the openai-compatibility path.
-//
-// Only the levels Basiliskos can actually deliver are advertised: "max" is
-// omitted because the translator saturates at "high", and V4 Pro lists only
-// "high" because DeepSeek documents it as treating "low" as "high".
+// Thinking is delivered through Anthropic adaptive thinking, which CLIProxyAPI
+// translates to the OpenAI-compatible upstream's `reasoning_effort`. Do not use
+// the `model(effort)` suffix used for OAuth providers: it breaks credential
+// selection on the openai-compatibility path.
 const DEEPSEEK_MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: "deepseek-v4-flash",
         label: "DeepSeek V4 Flash",
-        thinking_levels: &["low", "high"],
+        thinking_levels: &["none", "low", "high", "max"],
     },
     ModelSpec {
         id: "deepseek-v4-pro",
         label: "DeepSeek V4 Pro",
-        thinking_levels: &["high"],
+        thinking_levels: &["none", "high", "max"],
     },
 ];
 
@@ -763,35 +750,47 @@ fn routed_model(
     }
 }
 
-/// Expresses the selected DeepSeek thinking level as an Anthropic `thinking`
-/// budget, which CLIProxyAPI converts into `reasoning_effort` upstream.
+/// Expresses the selected DeepSeek thinking level as Anthropic adaptive thinking,
+/// which CLIProxyAPI converts to DeepSeek's OpenAI-compatible `reasoning_effort`.
 ///
-/// The budget is chosen to land in the "low" or "high" band and never the
-/// "medium" band, which DeepSeek rejects. On "auto" the client's own thinking
-/// request is left untouched.
+/// DeepSeek V4 accepts off, low, high, and max. The old numeric-budget bridge
+/// could not represent max because its budget conversion saturated at high.
+/// Sampling controls do not affect a thinking request, so remove them rather
+/// than implying that they tune the selected reasoning level. `none` explicitly
+/// disables thinking and leaves sampling controls intact. On auto, keep the
+/// client request unchanged for a non-thinking or client-managed request.
 fn apply_deepseek_thinking(object: &mut serde_json::Map<String, Value>, state: &ControllerState) {
     let route = normalized_route(state, "deepseek");
-    let budget = match route.thinking.as_str() {
-        "low" => DEEPSEEK_LOW_EFFORT_BUDGET,
-        "high" => DEEPSEEK_HIGH_EFFORT_BUDGET,
+    if route.thinking == "none" {
+        object.insert("thinking".into(), serde_json::json!({ "type": "disabled" }));
+        if let Some(output_config) = object
+            .get_mut("output_config")
+            .and_then(Value::as_object_mut)
+        {
+            output_config.remove("effort");
+            if output_config.is_empty() {
+                object.remove("output_config");
+            }
+        }
+        return;
+    }
+    let effort = match route.thinking.as_str() {
+        "low" | "high" | "max" => route.thinking,
         _ => return,
     };
-    // Anthropic requires budget_tokens < max_tokens. Raise a too-small cap so the
-    // budget stays in its intended band; never lower one the client asked for.
-    let max_tokens = object
-        .get("max_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    if max_tokens <= budget {
-        object.insert(
-            "max_tokens".into(),
-            Value::from(budget + DEEPSEEK_EFFORT_MAX_TOKENS_HEADROOM),
-        );
-    }
+    object.insert("thinking".into(), serde_json::json!({ "type": "adaptive" }));
     object.insert(
-        "thinking".into(),
-        serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
+        "output_config".into(),
+        serde_json::json!({ "effort": effort }),
     );
+    for parameter in [
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+    ] {
+        object.remove(parameter);
+    }
 }
 
 /// Claude Desktop's high-context routing aliases expose effort levels that do
@@ -6683,6 +6682,7 @@ mod tests {
         assert!(config.contains("openai-compatibility:"));
         assert!(config.contains("api-key-entries:"));
         assert!(config.contains("- api-key: \"sk-active-key\""));
+        assert!(config.contains("- name: \"basiliskos-deepseek\""));
         assert!(config.contains("base-url: \"https://api.deepseek.com/v1\""));
         assert!(config.contains("- name: \"deepseek-v4-flash\""));
         assert!(config.contains("- name: \"deepseek-v4-pro\""));
@@ -6790,15 +6790,15 @@ mod tests {
         assert_eq!(model_specs("deepseek").len(), DEEPSEEK_MODELS.len());
         assert!(provider_login_flag("deepseek").is_err());
 
-        // The retired 2026-07-24 model IDs must never come back, and only levels
-        // Basiliskos can actually deliver may be advertised ("max" saturates to
-        // "high" in translation, so offering it would be a lie).
+        // The retired 2026-07-24 model IDs must never come back, and every
+        // advertised level must either disable thinking or be expressible
+        // through adaptive thinking.
         for spec in DEEPSEEK_MODELS {
             assert!(spec.id != "deepseek-chat" && spec.id != "deepseek-reasoner");
             for level in spec.thinking_levels {
                 assert!(
-                    matches!(*level, "low" | "high"),
-                    "{} advertises {level}, which cannot be delivered through the thinking budget",
+                    matches!(*level, "none" | "low" | "high" | "max"),
+                    "{} advertises an unsupported thinking level: {level}",
                     spec.id
                 );
             }
@@ -6870,7 +6870,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_effort_uses_a_thinking_budget_and_never_the_medium_band() {
+    fn deepseek_effort_uses_adaptive_thinking_and_strips_ineffective_sampling() {
         fn rewrite(thinking: &str, max_tokens: u64) -> serde_json::Map<String, Value> {
             let mut state = state_with_active("deepseek-aaa.json");
             state.routes.insert(
@@ -6883,6 +6883,10 @@ mod tests {
             let mut body = serde_json::json!({
                 "model": "claude-sonnet-4-5-20250929",
                 "max_tokens": max_tokens,
+                "temperature": 0.2,
+                "top_p": 0.8,
+                "presence_penalty": 0.4,
+                "frequency_penalty": 0.6,
                 "messages": [{"role": "user", "content": "hi"}],
             });
             rewrite_claude_request(&mut body, &state, "deepseek", false).unwrap();
@@ -6891,37 +6895,49 @@ mod tests {
 
         // The plain model id must survive — a `model(effort)` suffix breaks
         // credential selection on the openai-compatibility path.
-        let high = rewrite("high", 200_000);
-        assert_eq!(high["model"], Value::String("deepseek-v4-flash".into()));
-        assert_eq!(high["thinking"]["budget_tokens"], Value::from(12288u64));
-        assert_eq!(high["thinking"]["type"], Value::String("enabled".into()));
-
-        let low = rewrite("low", 200_000);
-        assert_eq!(low["thinking"]["budget_tokens"], Value::from(1024u64));
-
-        // Measured translator bands: <=1024 low, 2048..8192 medium, >=12288 high.
-        // DeepSeek rejects "medium", so no configured level may land in between.
-        for level in ["low", "high"] {
-            let budget = rewrite(level, 200_000)["thinking"]["budget_tokens"]
-                .as_u64()
-                .unwrap();
-            assert!(
-                budget <= 1024 || budget >= 12288,
-                "{level} produced budget {budget}, which translates to the rejected \"medium\""
+        for level in ["low", "high", "max"] {
+            let request = rewrite(level, 4_096);
+            assert_eq!(request["model"], Value::String("deepseek-v4-flash".into()));
+            assert_eq!(
+                request["thinking"]["type"],
+                Value::String("adaptive".into())
             );
+            assert_eq!(
+                request["output_config"]["effort"],
+                Value::String(level.into())
+            );
+            assert_eq!(request["max_tokens"], Value::from(4_096u64));
+            for parameter in [
+                "temperature",
+                "top_p",
+                "presence_penalty",
+                "frequency_penalty",
+            ] {
+                assert!(
+                    !request.contains_key(parameter),
+                    "{parameter} must be removed while DeepSeek thinking is enabled"
+                );
+            }
         }
 
-        // A client cap too small for the budget is raised, never lowered.
-        let cramped = rewrite("high", 4096);
-        assert_eq!(cramped["thinking"]["budget_tokens"], Value::from(12288u64));
-        assert!(cramped["max_tokens"].as_u64().unwrap() > 12288);
+        // Off has to override Claude Desktop's thinking metadata so DeepSeek
+        // actually runs a non-thinking request and honours sampling controls.
+        let disabled = rewrite("none", 4_096);
         assert_eq!(
-            rewrite("high", 200_000)["max_tokens"],
-            Value::from(200_000u64)
+            disabled["thinking"]["type"],
+            Value::String("disabled".into())
         );
+        assert!(!disabled.contains_key("output_config"));
+        assert_eq!(disabled["temperature"], Value::from(0.2));
+        assert_eq!(disabled["top_p"], Value::from(0.8));
+        assert_eq!(disabled["presence_penalty"], Value::from(0.4));
+        assert_eq!(disabled["frequency_penalty"], Value::from(0.6));
 
-        // "auto" leaves the client's own request alone.
-        assert!(!rewrite("auto", 200_000).contains_key("thinking"));
+        // "auto" leaves the client's own thinking and sampling configuration alone.
+        let automatic = rewrite("auto", 200_000);
+        assert!(!automatic.contains_key("thinking"));
+        assert_eq!(automatic["temperature"], Value::from(0.2));
+        assert_eq!(automatic["top_p"], Value::from(0.8));
     }
 
     #[test]
