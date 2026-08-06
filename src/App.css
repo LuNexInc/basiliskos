@@ -267,6 +267,7 @@ button.secondary:hover:not(:disabled) { border-color: rgba(238, 229, 207, 0.55);
 .usage-window { display: grid; grid-template-columns: auto auto auto; align-items: center; gap: 6px; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 9.5px; }
 .usage-window > span { color: var(--muted-strong); font-weight: 700; }
 .usage-window > strong { color: #9fe0b4; font-size: 9.5px; font-weight: 650; }
+.usage-window > small { grid-column: 1 / -1; color: var(--muted-strong); font-size: 9px; }
 .usage-window.low > strong { color: #f0a06f; }
 .quota-track { display: flex; align-items: center; gap: 2px; padding: 0 6px; }
 .quota-track::before, .quota-track::after { content: ""; width: 2px; height: 14px; flex: none; background: var(--choice); }

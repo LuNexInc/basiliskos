@@ -56,6 +56,7 @@ type UsageWindow = {
   label: string;
   usedPercent: number;
   remainingPercent: number;
+  resetsAtMs?: number;
   known: boolean;
 };
 
@@ -217,7 +218,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-const APP_VERSION = "2.2.5";
+const APP_VERSION = "2.2.6";
 const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
@@ -337,20 +338,27 @@ export function credentialExpiry(account: Account, now: number) {
     return { label: "Sign in again", tone: "relogin" };
   }
   if (!account.expiresAtMs) {
-    return { label: "Expiry unavailable", tone: "unknown" };
+    return { label: "Login-token expiry unavailable", tone: "unknown" };
   }
   const expiry = new Date(account.expiresAtMs);
   if (Number.isNaN(expiry.getTime())) {
-    return { label: "Expiry unavailable", tone: "unknown" };
+    return { label: "Login-token expiry unavailable", tone: "unknown" };
   }
   const time = expiry.toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
   if (account.credentialStatus === "renewal_due") {
-    return { label: `Refresh due · ${time}`, tone: "renewal" };
+    return { label: `Login refresh due · ${time}`, tone: "renewal" };
   }
   if (account.credentialStatus === "expired" || account.expiresAtMs <= now) {
-    return { label: `Expired · ${time}`, tone: "expired" };
+    return { label: `Login token expired · ${time}`, tone: "expired" };
   }
-  return { label: `Expires · ${time}`, tone: "active" };
+  return { label: `Login token · ${time}`, tone: "active" };
+}
+
+export function usageResetLabel(resetsAtMs: number | undefined) {
+  if (!resetsAtMs) return undefined;
+  const reset = new Date(resetsAtMs);
+  if (Number.isNaN(reset.getTime())) return undefined;
+  return `Renews ${reset.toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}`;
 }
 
 export function accountNeedsRelogin(
@@ -1386,7 +1394,7 @@ export default function App() {
                       </div>
                     )}
                     <p>{account.email ?? "Authorized account"}</p>
-                    <div className={`credential-expiry ${expiry.tone}`} title={account.expiresAtMs ? `Credential expiry: ${new Date(account.expiresAtMs).toLocaleString()}` : "This provider did not expose an expiry time"}>
+                    <div className={`credential-expiry ${expiry.tone}`} title={account.expiresAtMs ? `OAuth login-token expiry: ${new Date(account.expiresAtMs).toLocaleString()}. This is not the usage renewal time.` : "This provider did not expose a login-token expiry time"}>
                       <Timer size={11} aria-hidden="true" /> {expiry.label}
                     </div>
                     <div className="usage-summary">
@@ -1395,11 +1403,13 @@ export default function App() {
                           <span>{window.label}</span>
                           <QuotaBar percent={window.remainingPercent} />
                           <strong>{Math.round(window.remainingPercent)}% left</strong>
+                          {usageResetLabel(window.resetsAtMs) && <small>{usageResetLabel(window.resetsAtMs)}</small>}
                         </div>
                       ) : (
                         <div className="usage-window unrecorded" key={window.label} title="The provider returned a billing period but did not report a usage percentage.">
                           <span>{window.label}</span>
                           <span className="usage-unrecorded">Not reported</span>
+                          {usageResetLabel(window.resetsAtMs) && <small>{usageResetLabel(window.resetsAtMs)}</small>}
                         </div>
                       )) : usage?.loading ? (
                         <span className="usage-state"><LoaderCircle className="spin" size={11} /> Checking usage…</span>

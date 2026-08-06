@@ -8,6 +8,7 @@ import {
   prefersManualAuthBrowser,
   StatusBadge,
   usageAccountFiles,
+  usageResetLabel,
   usesApiKeyAuth,
 } from "./App";
 
@@ -70,12 +71,12 @@ describe("truthful Basiliskos status components", () => {
       credentialStatus: "relogin_required" as const,
     };
     expect(credentialExpiry(base, Date.now())).toEqual({ label: "Sign in again", tone: "relogin" });
-    expect(credentialExpiry({ ...base, credentialStatus: "unknown" }, Date.now())).toEqual({ label: "Expiry unavailable", tone: "unknown" });
+    expect(credentialExpiry({ ...base, credentialStatus: "unknown" }, Date.now())).toEqual({ label: "Login-token expiry unavailable", tone: "unknown" });
     expect(credentialExpiry({
       ...base,
       credentialStatus: "renewal_due",
       expiresAtMs: Date.now() + 60_000,
-    }, Date.now())).toMatchObject({ tone: "renewal", label: expect.stringMatching(/^Refresh due/) });
+    }, Date.now())).toMatchObject({ tone: "renewal", label: expect.stringMatching(/^Login refresh due/) });
     expect(accountNeedsRelogin(base)).toBe(true);
     expect(accountNeedsRelogin({ credentialStatus: "active" })).toBe(false);
     expect(accountNeedsRelogin(
@@ -86,6 +87,12 @@ describe("truthful Basiliskos status components", () => {
       { credentialStatus: "active" },
       "Codex refresh grant was revoked. Re-login once to restore automatic refresh.",
     )).toBe(true);
+  });
+
+  it("keeps provider renewal time separate from login-token expiry", () => {
+    const renewal = new Date(2026, 7, 7, 23, 36, 28).getTime();
+    expect(usageResetLabel(renewal)).toMatch(/^Renews .*Aug.*7.*11:36.*PM$/i);
+    expect(usageResetLabel(undefined)).toBeUndefined();
   });
 
   it("prefers manual browser open for multi-account cookie-prone providers only", () => {

@@ -592,6 +592,9 @@ pub struct GatewayUsageWindow {
     pub label: String,
     pub used_percent: f64,
     pub remaining_percent: f64,
+    /// Provider-reported end of this quota window. This is intentionally
+    /// separate from the OAuth credential expiry shown on the account.
+    pub resets_at_ms: Option<i64>,
     /// False when the provider's billing config is real (proving the account
     /// isn't broken/unreachable) but reported no usage figure at all for this
     /// window — e.g. xAI omits usage fields entirely once an account has
@@ -4415,7 +4418,19 @@ fn usage_window(label: &str, used_percent: f64) -> GatewayUsageWindow {
         label: label.into(),
         used_percent,
         remaining_percent: 100.0 - used_percent,
+        resets_at_ms: None,
         known: true,
+    }
+}
+
+fn usage_window_with_reset(
+    label: &str,
+    used_percent: f64,
+    resets_at_ms: Option<i64>,
+) -> GatewayUsageWindow {
+    GatewayUsageWindow {
+        resets_at_ms,
+        ..usage_window(label, used_percent)
     }
 }
 
@@ -4426,7 +4441,18 @@ fn unrecorded_usage_window(label: &str) -> GatewayUsageWindow {
         label: label.into(),
         used_percent: 0.0,
         remaining_percent: 100.0,
+        resets_at_ms: None,
         known: false,
+    }
+}
+
+fn unrecorded_usage_window_with_reset(
+    label: &str,
+    resets_at_ms: Option<i64>,
+) -> GatewayUsageWindow {
+    GatewayUsageWindow {
+        resets_at_ms,
+        ..unrecorded_usage_window(label)
     }
 }
 
@@ -4449,6 +4475,12 @@ fn codex_window_label(window: &Value, fallback: &str) -> String {
     }
 }
 
+fn codex_window_reset_ms(window: &Value) -> Option<i64> {
+    number_at(window, &["reset_at"])
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| (value * 1000.0) as i64)
+}
+
 fn parse_codex_usage(value: &Value) -> Vec<GatewayUsageWindow> {
     let mut windows = Vec::new();
     let Some(rate_limit) = value.get("rate_limit") else {
@@ -4459,13 +4491,27 @@ fn parse_codex_usage(value: &Value) -> Vec<GatewayUsageWindow> {
             continue;
         };
         if let Some(used) = number_at(window, &["used_percent"]) {
-            windows.push(usage_window(&codex_window_label(window, fallback), used));
+            windows.push(usage_window_with_reset(
+                &codex_window_label(window, fallback),
+                used,
+                codex_window_reset_ms(window),
+            ));
         }
     }
     windows
 }
 
 fn parse_xai_usage(value: &Value) -> Vec<GatewayUsageWindow> {
+    let resets_at_ms = value
+        .pointer("/config/currentPeriod/end")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/config/billingPeriodEnd")
+                .and_then(Value::as_str)
+        })
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis());
     let product_usage = value
         .get("config")
         .and_then(|config| config.get("productUsage"))
@@ -4487,7 +4533,7 @@ fn parse_xai_usage(value: &Value) -> Vec<GatewayUsageWindow> {
         .or_else(|| number_at(value, &["config", "creditUsagePercent"]))
         .or_else(|| number_at(value, &["creditUsagePercent"]))
     {
-        return vec![usage_window("Week", used)];
+        return vec![usage_window_with_reset("Week", used, resets_at_ms)];
     }
     // xAI omits every usage field once an account has recorded zero usage in
     // the current billing period, which is indistinguishable at this point
@@ -4501,7 +4547,7 @@ fn parse_xai_usage(value: &Value) -> Vec<GatewayUsageWindow> {
         .and_then(|config| config.get("currentPeriod"))
         .is_some();
     if has_real_billing_config {
-        vec![unrecorded_usage_window("Week")]
+        vec![unrecorded_usage_window_with_reset("Week", resets_at_ms)]
     } else {
         Vec::new()
     }
@@ -7780,16 +7826,22 @@ mod tests {
             "rate_limit": {
                 "primary_window": {
                     "used_percent": 12.0,
-                    "limit_window_seconds": 18000
+                    "limit_window_seconds": 18000,
+                    "reset_at": 1786642233
                 },
                 "secondary_window": {
                     "used_percent": 44.0,
-                    "limit_window_seconds": 604800
+                    "limit_window_seconds": 604800,
+                    "reset_at": "1787159999"
                 }
             }
         }));
-        assert_eq!(codex[0], usage_window("5h", 12.0));
-        assert_eq!(codex[1], usage_window("Week", 44.0));
+        assert_eq!(codex[0].label, "5h");
+        assert_eq!(codex[0].used_percent, 12.0);
+        assert_eq!(codex[0].resets_at_ms, Some(1_786_642_233_000));
+        assert_eq!(codex[1].label, "Week");
+        assert_eq!(codex[1].used_percent, 44.0);
+        assert_eq!(codex[1].resets_at_ms, Some(1_787_159_999_000));
 
         let xai = parse_xai_usage(&serde_json::json!({
             "config": {
@@ -7802,13 +7854,46 @@ mod tests {
         let xai_product_specific = parse_xai_usage(&serde_json::json!({
             "config": {
                 "creditUsagePercent": 100.0,
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "end": "2026-08-07T23:36:28.124325+08:00"
+                },
                 "productUsage": [
                     {"product": "GrokBuild", "usagePercent": 99.0},
                     {"product": "GrokChat", "usagePercent": 1.0}
                 ]
             }
         }));
-        assert_eq!(xai_product_specific[0], usage_window("Week", 99.0));
+        assert_eq!(xai_product_specific[0].used_percent, 99.0);
+        assert_eq!(
+            xai_product_specific[0].resets_at_ms,
+            Some(
+                DateTime::parse_from_rfc3339("2026-08-07T23:36:28.124325+08:00")
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
+
+        let xai_charles_3ready = parse_xai_usage(&serde_json::json!({
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "end": "2026-08-11T21:56:01.29535+08:00"
+                },
+                "productUsage": [
+                    {"product": "GrokBuild", "usagePercent": 99.0},
+                    {"product": "GrokChat", "usagePercent": 1.0}
+                ]
+            }
+        }));
+        assert_eq!(
+            xai_charles_3ready[0].resets_at_ms,
+            Some(
+                DateTime::parse_from_rfc3339("2026-08-11T21:56:01.29535+08:00")
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
 
         // A real billing config (proven by `currentPeriod`) with no usage
         // fields means "hasn't used anything yet this period", not "broken" —

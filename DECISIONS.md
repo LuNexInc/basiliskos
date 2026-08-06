@@ -3,6 +3,11 @@
 > What is intentionally settled + why + reverse-if. HANDOFF = history; this = standing state.
 > Newest on top. Extracted from AGENTS.md 2026-07-25 — keep in sync when a call changes.
 
+## 2026-08-07 — Usage renewal and login-token expiry are different clocks
+- **Decision:** quota renewal timestamps must come from each provider's usage/billing window. Basiliskos reads xAI's `currentPeriod.end` and Codex's per-window `reset_at`. OAuth access-token expiry is labelled as a login-token timestamp and must never be presented or implied as usage renewal.
+- **Why:** xAI reported marcjanin's weekly period ending 2026-08-07 23:36 Asia/Manila and charles.3ready's ending 2026-08-11 21:56, while the nearby OAuth token expiry made Basiliskos appear to claim 2026-08-07 07:00 as renewal. Codex likewise provides exact quota-window resets independently of token expiry.
+- **Reverse if:** never conflate the clocks; if a provider stops reporting its window end, show renewal as unavailable instead of substituting credential expiry.
+
 ## 2026-08-07 — Every patched installer gets a new version
 - **Decision:** never finalize or distribute changed Basiliskos code under an already-published version number. The crash cleanup and refresh corrections are version 2.2.5, not another 2.2.4 build. Rebuilding an unreleased patch during its verification loop does not consume another version.
 - **Why:** reusing 2.2.4 made the installed build indistinguishable from the published GitHub release and broke update/debug provenance.
