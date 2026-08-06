@@ -217,7 +217,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-const APP_VERSION = "2.2.4";
+const APP_VERSION = "2.2.5";
 const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
@@ -345,12 +345,25 @@ export function credentialExpiry(account: Account, now: number) {
   }
   const time = expiry.toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
   if (account.credentialStatus === "renewal_due") {
-    return { label: `Renewing now · ${time}`, tone: "renewal" };
+    return { label: `Refresh due · ${time}`, tone: "renewal" };
   }
   if (account.credentialStatus === "expired" || account.expiresAtMs <= now) {
     return { label: `Expired · ${time}`, tone: "expired" };
   }
   return { label: `Expires · ${time}`, tone: "active" };
+}
+
+export function accountNeedsRelogin(
+  account: Pick<Account, "credentialStatus">,
+  usageError?: string,
+): boolean {
+  return account.credentialStatus === "relogin_required" || usageError?.includes("Re-login once") === true;
+}
+
+export function usageAccountFiles(accounts: Array<Pick<Account, "fileName" | "provider">>): string[] {
+  return accounts
+    .filter((account) => account.provider !== "deepseek")
+    .map((account) => account.fileName);
 }
 
 function ClaudeCodeMark({ className }: { className?: string }) {
@@ -546,7 +559,12 @@ export default function App() {
     () => snapshot?.accounts.filter((account) => account.provider === provider) ?? [],
     [provider, snapshot],
   );
-  const accountFilesKey = accounts.map((account) => account.fileName).join("\u0000");
+  const allUsageFiles = usageAccountFiles(snapshot?.accounts ?? []);
+  const allUsageKey = snapshot?.accounts
+    .filter((account) => account.provider !== "deepseek")
+    .map((account) => `${account.fileName}|${account.expiresAtMs ?? ""}|${account.credentialStatus}`)
+    .join("\u0000") ?? "";
+  const allUsageLoading = allUsageFiles.some((fileName) => usageByAccount[fileName]?.loading === true);
   const active = snapshot?.accounts.find((account) => account.active);
   const activeRoute = snapshot?.routes.find((route) => route.provider === active?.provider);
   const selectedModel = activeRoute?.modelOptions.find(
@@ -607,11 +625,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const fileNames = accountFilesKey ? accountFilesKey.split("\u0000") : [];
-    void refreshUsage(fileNames);
-    const interval = window.setInterval(() => void refreshUsage(fileNames), 5 * 60_000);
+    void refreshUsage(allUsageFiles);
+    const interval = window.setInterval(() => void refreshUsage(allUsageFiles), 5 * 60_000);
     return () => window.clearInterval(interval);
-  }, [accountFilesKey, refreshUsage]);
+  }, [allUsageKey, refreshUsage]);
 
   async function startOrStop() {
     const action = snapshot?.running ? "stop_gateway" : "start_gateway";
@@ -1237,6 +1254,14 @@ export default function App() {
           <div className="panel-head">
             <div><span className="zone-label">CHOOSE ACCOUNT</span><h2>Authorized subscriptions</h2></div>
             <div style={{ display: "flex", gap: 8 }}>
+              <button
+                className="add-button"
+                onClick={() => void refreshUsage(allUsageFiles)}
+                disabled={allUsageFiles.length === 0 || allUsageLoading}
+                title="Refresh usage for every account now. Basiliskos also refreshes automatically every five minutes."
+              >
+                <RefreshCw className={allUsageLoading ? "spin" : undefined} size={15} /> Refresh usage
+              </button>
               {loginWaiting ? (
                 <button className="add-button cancel-login" onClick={() => void cancelLogin()} disabled={busy !== null}>
                   {busy === "cancel-login" ? <LoaderCircle className="spin" size={15} /> : <X size={15} />} Cancel login
@@ -1372,9 +1397,9 @@ export default function App() {
                           <strong>{Math.round(window.remainingPercent)}% left</strong>
                         </div>
                       ) : (
-                        <div className="usage-window unrecorded" key={window.label} title="This account hasn't recorded any usage yet this billing period — or may not have an active subscription. Basiliskos can't tell which from here.">
+                        <div className="usage-window unrecorded" key={window.label} title="The provider returned a billing period but did not report a usage percentage.">
                           <span>{window.label}</span>
-                          <span className="usage-unrecorded">Not yet used</span>
+                          <span className="usage-unrecorded">Not reported</span>
                         </div>
                       )) : usage?.loading ? (
                         <span className="usage-state"><LoaderCircle className="spin" size={11} /> Checking usage…</span>
@@ -1386,7 +1411,7 @@ export default function App() {
                     </div>
                   </div>
                   <div className="account-actions">
-                    {(account.credentialStatus === "relogin_required" || usage?.error?.includes("Sign in again")) && (
+                    {accountNeedsRelogin(account, usage?.error) && (
                       <button
                         className="icon-button warn"
                         aria-label={`Re-login ${account.label}`}

@@ -3,6 +3,17 @@
 > What is intentionally settled + why + reverse-if. HANDOFF = history; this = standing state.
 > Newest on top. Extracted from AGENTS.md 2026-07-25 — keep in sync when a call changes.
 
+## 2026-08-07 — Every patched installer gets a new version
+- **Decision:** never finalize or distribute changed Basiliskos code under an already-published version number. The crash cleanup and refresh corrections are version 2.2.5, not another 2.2.4 build. Rebuilding an unreleased patch during its verification loop does not consume another version.
+- **Why:** reusing 2.2.4 made the installed build indistinguishable from the published GitHub release and broke update/debug provenance.
+- **Reverse if:** never; version identity must remain unique.
+
+## 2026-08-07 — OAuth hardening scope is crash recovery and truthful status
+- **Decision:** harden the existing local credential store by cleaning stale login/vision workspaces after crashes, refreshing saved OAuth grants before they become unusable, and reporting provider-specific usage truthfully. Do not start a DPAPI vault migration from the earlier audit without a separate explicit request.
+- **Why:** Charles clarified that “strengthen my OAuth vault” meant crash cleanup plus inaccurate usage/refresh reporting, not a storage-format redesign.
+- **Accuracy rules:** prefer GrokBuild usage over combined Grok billing; label Kimi's unscoped total as `Plan`, not `Week`; say `Not reported` when a provider omits a percentage; never claim “Renewing now” unless a refresh is actually in progress; refresh all OAuth usage automatically and expose only one universal manual refresh control. A usage-endpoint denial must never be presented as proof that the saved login expired.
+- **Reverse if:** Charles explicitly asks for encrypted-at-rest credential migration and approves its compatibility/recovery tradeoffs.
+
 ## 2026-08-02 — DeepSeek V4 effort uses adaptive thinking, not numeric budgets
 - **Decision:** route DeepSeek V4 through Anthropic adaptive thinking (`thinking.type=adaptive` + `output_config.effort`) so CLIProxyAPI emits the OpenAI-compatible `reasoning_effort`. Flash exposes `low`, `high`, and `max`; Pro exposes `high` and `max` because its upstream maps `low` to `high`.
 - **Why:** the previous `thinking.budget_tokens` bridge saturated at `high`, making V4 Flash `max` impossible despite DeepSeek supporting it. DeepSeek sampling settings have no effect while thinking is enabled, so Basiliskos removes `temperature`, `top_p`, and frequency/presence penalties for an explicit thinking route, while leaving them unchanged in auto mode.

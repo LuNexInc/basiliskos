@@ -1,11 +1,13 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
+  accountNeedsRelogin,
   credentialExpiry,
   DiagnosticEventList,
   isNewerVersion,
   prefersManualAuthBrowser,
   StatusBadge,
+  usageAccountFiles,
   usesApiKeyAuth,
 } from "./App";
 
@@ -69,6 +71,21 @@ describe("truthful Basiliskos status components", () => {
     };
     expect(credentialExpiry(base, Date.now())).toEqual({ label: "Sign in again", tone: "relogin" });
     expect(credentialExpiry({ ...base, credentialStatus: "unknown" }, Date.now())).toEqual({ label: "Expiry unavailable", tone: "unknown" });
+    expect(credentialExpiry({
+      ...base,
+      credentialStatus: "renewal_due",
+      expiresAtMs: Date.now() + 60_000,
+    }, Date.now())).toMatchObject({ tone: "renewal", label: expect.stringMatching(/^Refresh due/) });
+    expect(accountNeedsRelogin(base)).toBe(true);
+    expect(accountNeedsRelogin({ credentialStatus: "active" })).toBe(false);
+    expect(accountNeedsRelogin(
+      { credentialStatus: "active" },
+      "Usage check unavailable — saved login is active. Auto-retry in 5 min or use Refresh usage.",
+    )).toBe(false);
+    expect(accountNeedsRelogin(
+      { credentialStatus: "active" },
+      "Codex refresh grant was revoked. Re-login once to restore automatic refresh.",
+    )).toBe(true);
   });
 
   it("prefers manual browser open for multi-account cookie-prone providers only", () => {
@@ -87,5 +104,14 @@ describe("truthful Basiliskos status components", () => {
     // DeepSeek has no OAuth URL at all, so it must never reach the
     // manual-browser path that exists for cookie-prone OAuth providers.
     expect(prefersManualAuthBrowser("deepseek")).toBe(false);
+  });
+
+  it("refreshes usage for every OAuth account through one global action", () => {
+    expect(usageAccountFiles([
+      { fileName: "codex-a.json", provider: "codex" },
+      { fileName: "xai-b.json", provider: "xai" },
+      { fileName: "deepseek-c.json", provider: "deepseek" },
+      { fileName: "kimi-d.json", provider: "kimi" },
+    ])).toEqual(["codex-a.json", "xai-b.json", "kimi-d.json"]);
   });
 });

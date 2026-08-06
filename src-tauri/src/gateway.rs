@@ -62,6 +62,12 @@ const MAX_CONTEXT_COUNT_RESPONSE_BYTES: usize = 64 * 1024;
 const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: i64 = 60;
 const XAI_CREDENTIAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const XAI_DEFAULT_TOKEN_LIFETIME_SECS: i64 = 6 * 60 * 60;
+const OAUTH_CREDENTIAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2 * 60);
+const OAUTH_REFRESH_SKEW_SECS: i64 = 5 * 60;
+const CODEX_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CLAUDE_TOKEN_ENDPOINT: &str = "https://api.anthropic.com/v1/oauth/token";
+const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const XAI_RELOGIN_REQUIRED: &str =
     "This saved Grok authorization was revoked. Sign in again to renew it.";
 const KIMI_CREDENTIAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2 * 60);
@@ -354,14 +360,16 @@ struct ControllerManager {
 
 static CONTROLLER: OnceLock<ControllerManager> = OnceLock::new();
 static PREPARED_UPDATE_INSTALLERS: OnceLock<Mutex<BTreeMap<String, PathBuf>>> = OnceLock::new();
+type AccountRefreshLocks = OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 // Refresh grants may rotate. Keep one refresh exchange per relay account so a
 // simultaneous selection and "Serve Grok CLI" cannot overwrite a newer grant.
-static XAI_REFRESH_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
+static XAI_REFRESH_LOCKS: AccountRefreshLocks = OnceLock::new();
 static XAI_REFRESH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static XAI_CREDENTIAL_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
-static KIMI_REFRESH_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
+static CODEX_REFRESH_LOCKS: AccountRefreshLocks = OnceLock::new();
+static CLAUDE_REFRESH_LOCKS: AccountRefreshLocks = OnceLock::new();
+static OAUTH_CREDENTIAL_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
+static KIMI_REFRESH_LOCKS: AccountRefreshLocks = OnceLock::new();
 static KIMI_REFRESH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static KIMI_CREDENTIAL_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
 static VISION_SIDECAR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -389,6 +397,21 @@ fn xai_refresh_lock(file_name: &str) -> Result<Arc<tokio::sync::Mutex<()>>, Stri
     let mut locks = locks
         .lock()
         .map_err(|_| "Basiliskos Grok refresh coordination is locked".to_string())?;
+    Ok(locks
+        .entry(file_name.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
+}
+
+fn oauth_refresh_lock(
+    locks: &'static AccountRefreshLocks,
+    file_name: &str,
+    provider: &str,
+) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    let locks = locks.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut locks = locks
+        .lock()
+        .map_err(|_| format!("Basiliskos {provider} refresh coordination is locked"))?;
     Ok(locks
         .entry(file_name.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -1046,12 +1069,54 @@ fn secure_files_in(directory: &Path, extension: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn remove_private_child_directories(root: &Path) -> Result<usize, String> {
+    secure_create_dir_all(root)?;
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| format!("Could not verify {}: {error}", root.display()))?;
+    let mut removed = 0;
+    for entry in fs::read_dir(&canonical_root)
+        .map_err(|error| format!("Could not inspect {}: {error}", canonical_root.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("Could not inspect a stale workspace: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("Could not inspect a stale workspace type: {error}"))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let path = fs::canonicalize(entry.path())
+            .map_err(|error| format!("Could not verify a stale workspace: {error}"))?;
+        let relative = path
+            .strip_prefix(&canonical_root)
+            .map_err(|_| "Refusing to clean a workspace outside Basiliskos")?;
+        if relative.components().count() != 1 || path.parent() != Some(canonical_root.as_path()) {
+            return Err(format!(
+                "Refusing to clean an unexpected workspace path: {}",
+                path.display()
+            ));
+        }
+        fs::remove_dir_all(&path)
+            .map_err(|error| format!("Could not clean {}: {error}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn cleanup_stale_secret_workspaces() -> Result<usize, String> {
+    let login_removed = remove_private_child_directories(&login_staging_root()?)?;
+    let vision_removed = remove_private_child_directories(&gateway_dir()?.join("vision-sidecars"))?;
+    Ok(login_removed + vision_removed)
+}
+
 pub fn initialize_controller_storage() -> Result<(), String> {
     let _mutation = mutation_lock()?;
     let root = root_dir()?;
     let gateway = gateway_dir()?;
     let auth = auth_dir()?;
     let controller_logs = gateway.join("controller-logs");
+    let login_staging = login_staging_root()?;
+    let vision_sidecars = gateway.join("vision-sidecars");
     let claude_profile = isolated_claude_profile_dir()?;
     let claude_logs = claude_profile.join("Basiliskos Logs");
     for directory in [
@@ -1059,12 +1124,15 @@ pub fn initialize_controller_storage() -> Result<(), String> {
         &gateway,
         &auth,
         &controller_logs,
+        &login_staging,
+        &vision_sidecars,
         &claude_profile,
         &claude_logs,
     ] {
         secure_create_dir_all(directory)?;
     }
     recover_pending_transactions(&root)?;
+    cleanup_stale_secret_workspaces()?;
     let state_file = controller_path()?;
     let labels_file = account_labels_path()?;
     let config_file = config_path()?;
@@ -1099,6 +1167,7 @@ pub fn initialize_controller_storage() -> Result<(), String> {
     secure_files_in(&claude_logs, "log")?;
     start_xai_credential_maintenance();
     start_kimi_credential_maintenance();
+    start_oauth_credential_maintenance();
     Ok(())
 }
 
@@ -3662,6 +3731,7 @@ fn credential_status(
     let renewal_window = match provider {
         "xai" => XAI_REFRESH_SKEW_SECS,
         "kimi" => KIMI_REFRESH_SKEW_SECS,
+        "codex" | "claude" => OAUTH_REFRESH_SKEW_SECS,
         _ => 0,
     };
     match expiry {
@@ -4411,9 +4481,11 @@ fn parse_xai_usage(value: &Value) -> Vec<GatewayUsageWindow> {
                     .flatten()
             })
         });
-    if let Some(used) = number_at(value, &["config", "creditUsagePercent"])
+    // The billing endpoint can report a combined GrokBuild + GrokChat total.
+    // Basiliskos routes GrokBuild, so prefer its product-specific percentage.
+    if let Some(used) = product_usage
+        .or_else(|| number_at(value, &["config", "creditUsagePercent"]))
         .or_else(|| number_at(value, &["creditUsagePercent"]))
-        .or(product_usage)
     {
         return vec![usage_window("Week", used)];
     }
@@ -4500,7 +4572,7 @@ fn parse_kimi_usage(value: &Value) -> Vec<GatewayUsageWindow> {
                 .or_else(|| summary.get("title"))
                 .and_then(Value::as_str)
                 .filter(|label| !label.is_empty())
-                .unwrap_or("Week");
+                .unwrap_or("Plan");
             windows.push(usage_window(label, used));
         }
     }
@@ -4521,22 +4593,46 @@ fn parse_kimi_usage(value: &Value) -> Vec<GatewayUsageWindow> {
 fn usage_http_error_message(provider: &str, status: reqwest::StatusCode) -> String {
     match (provider, status.as_u16()) {
         ("kimi", 402 | 403) => "No active Kimi Code subscription".into(),
-        ("kimi", 401) => "Sign in again to refresh usage".into(),
-        (_, 401 | 403) => "Sign in again to refresh usage".into(),
-        (_, code) => format!("Usage service returned {code}"),
+        (_, 401 | 403) => {
+            "Usage check unavailable — saved login is active. Auto-retry in 5 min or use Refresh usage."
+                .into()
+        }
+        (_, code) => format!(
+            "Usage service returned {code}. Auto-retry in 5 min or use Refresh usage."
+        ),
     }
+}
+
+fn should_refresh_after_usage_denial(provider: &str, status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED && matches!(provider, "codex" | "claude")
+}
+
+fn usage_refresh_failure_message(provider: &str, refresh_error: &str) -> String {
+    if refresh_error.starts_with("Sign in again") {
+        format!("{provider} refresh grant was revoked. Re-login once to restore automatic refresh.")
+    } else {
+        "Usage refresh failed temporarily. Auto-retry in 5 min or use Refresh usage.".into()
+    }
+}
+
+struct UsageFetchError {
+    status: Option<reqwest::StatusCode>,
+    message: String,
 }
 
 async fn fetch_usage_json(
     provider: &str,
     token: &str,
     account_id: Option<&str>,
-) -> Result<Value, String> {
+) -> Result<Value, UsageFetchError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .user_agent("Basiliskos/1.1")
         .build()
-        .map_err(|error| format!("Could not prepare usage request: {error}"))?;
+        .map_err(|error| UsageFetchError {
+            status: None,
+            message: format!("Could not prepare usage request: {error}"),
+        })?;
     let mut request = match provider {
         "claude" => client
             .get(CLAUDE_USAGE_URL)
@@ -4552,51 +4648,86 @@ async fn fetch_usage_json(
         }
         "xai" => client.get(XAI_USAGE_URL).bearer_auth(token),
         "kimi" => client.get(KIMI_USAGE_URL).bearer_auth(token),
-        _ => return Err("Unsupported usage provider".into()),
+        _ => {
+            return Err(UsageFetchError {
+                status: None,
+                message: "Unsupported usage provider".into(),
+            })
+        }
     };
     request = request.header("Accept", "application/json");
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("Usage request failed: {error}"))?;
+    let response = request.send().await.map_err(|error| UsageFetchError {
+        status: None,
+        message: format!("Usage request failed; Basiliskos will retry automatically: {error}"),
+    })?;
     if !response.status().is_success() {
-        return Err(usage_http_error_message(provider, response.status()));
+        return Err(UsageFetchError {
+            status: Some(response.status()),
+            message: usage_http_error_message(provider, response.status()),
+        });
     }
-    response
-        .json()
-        .await
-        .map_err(|error| format!("Usage response was invalid: {error}"))
+    response.json().await.map_err(|error| UsageFetchError {
+        status: None,
+        message: format!(
+            "Usage response was invalid; Basiliskos will retry automatically: {error}"
+        ),
+    })
+}
+
+fn load_usage_credential(
+    file_name: &str,
+) -> Result<(GatewayAccount, String, Option<String>), String> {
+    let _mutation = mutation_lock()?;
+    let path = exact_auth_path(file_name)?;
+    let state = load_state()?;
+    let account = list_accounts_inner(&state)?
+        .into_iter()
+        .find(|account| account.file_name == file_name)
+        .ok_or("Account not found")?;
+    if account.provider == "deepseek" {
+        return Err(
+            "DeepSeek bills a prepaid balance, not a usage quota. Check your balance at platform.deepseek.com."
+                .into(),
+        );
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read account credentials: {error}"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("Account credentials are invalid: {error}"))?;
+    let token = nested_string(&value, &["access_token"]).ok_or("Sign in again to refresh usage")?;
+    let account_id = nested_string(&value, &["account_id"]);
+    Ok((account, token, account_id))
 }
 
 #[tauri::command]
 pub async fn get_gateway_account_usage(file_name: String) -> Result<GatewayAccountUsage, String> {
-    let (account, token, account_id) = {
-        let _mutation = mutation_lock()?;
-        let path = exact_auth_path(&file_name)?;
-        let state = load_state()?;
-        let account = list_accounts_inner(&state)?
-            .into_iter()
-            .find(|account| account.file_name == file_name)
-            .ok_or("Account not found")?;
-        // DeepSeek bills a prepaid balance rather than a quota window, so there
-        // is no percentage to report. Say that plainly instead of inventing a
-        // denominator to fill the usage bars with.
-        if account.provider == "deepseek" {
-            return Err(
-                "DeepSeek bills a prepaid balance, not a usage quota. Check your balance at platform.deepseek.com."
-                    .into(),
-            );
+    let (mut account, token, account_id) = load_usage_credential(&file_name)?;
+    let usage = match fetch_usage_json(&account.provider, &token, account_id.as_deref()).await {
+        Ok(usage) => usage,
+        Err(error)
+            if error.status.is_some_and(|status| {
+                should_refresh_after_usage_denial(&account.provider, status)
+            }) =>
+        {
+            let refresh_result = match account.provider.as_str() {
+                "codex" => refresh_codex_credential(&file_name, true).await,
+                "claude" => refresh_claude_credential(&file_name, true).await,
+                _ => unreachable!(),
+            };
+            if let Err(refresh_error) = refresh_result {
+                return Err(usage_refresh_failure_message(
+                    &account.provider,
+                    &refresh_error,
+                ));
+            }
+            let refreshed = load_usage_credential(&file_name)?;
+            account = refreshed.0;
+            fetch_usage_json(&account.provider, &refreshed.1, refreshed.2.as_deref())
+                .await
+                .map_err(|error| error.message)?
         }
-        let raw = fs::read_to_string(&path)
-            .map_err(|error| format!("Could not read account credentials: {error}"))?;
-        let value: Value = serde_json::from_str(&raw)
-            .map_err(|error| format!("Account credentials are invalid: {error}"))?;
-        let token =
-            nested_string(&value, &["access_token"]).ok_or("Sign in again to refresh usage")?;
-        let account_id = nested_string(&value, &["account_id"]);
-        (account, token, account_id)
+        Err(error) => return Err(error.message),
     };
-    let usage = fetch_usage_json(&account.provider, &token, account_id.as_deref()).await?;
     let windows = match account.provider.as_str() {
         "claude" => parse_claude_usage(&usage),
         "codex" => parse_codex_usage(&usage),
@@ -4605,7 +4736,9 @@ pub async fn get_gateway_account_usage(file_name: String) -> Result<GatewayAccou
         _ => Vec::new(),
     };
     if windows.is_empty() {
-        return Err("Usage remaining is not available for this profile".into());
+        return Err(
+            "Provider did not report usage. Auto-retry in 5 min or use Refresh usage.".into(),
+        );
     }
     Ok(GatewayAccountUsage {
         file_name,
@@ -4657,6 +4790,163 @@ fn account_bytes_with_disabled(path: &Path, disabled: bool) -> Result<Vec<u8>, S
     object.insert("disabled".into(), Value::Bool(disabled));
     serde_json::to_vec_pretty(&value)
         .map_err(|error| format!("Could not serialize account: {error}"))
+}
+
+fn oauth_refresh_required(credential: &Value, now: DateTime<Utc>) -> bool {
+    credential_expiry(credential)
+        .is_none_or(|expiry| expiry <= now + ChronoDuration::seconds(OAUTH_REFRESH_SKEW_SECS))
+}
+
+fn apply_oauth_refresh(
+    credential: &mut Value,
+    refreshed: &Value,
+    provider: &str,
+) -> Result<(), String> {
+    let access_token = refreshed
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| format!("{provider} credential refresh returned no access token"))?;
+    let object = credential
+        .as_object_mut()
+        .ok_or_else(|| format!("{provider} credential is invalid"))?;
+    object.insert(
+        "access_token".into(),
+        Value::String(access_token.to_string()),
+    );
+    for key in ["refresh_token", "id_token", "token_type"] {
+        if let Some(value) = refreshed
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            object.insert(key.into(), Value::String(value.to_string()));
+        }
+    }
+    let expires_in = refreshed
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(60 * 60);
+    let now = Utc::now();
+    object.insert(
+        "expired".into(),
+        Value::String((now + ChronoDuration::seconds(expires_in)).to_rfc3339()),
+    );
+    object.insert("last_refresh".into(), Value::String(now.to_rfc3339()));
+    Ok(())
+}
+
+fn oauth_refresh_http_error(provider: &str, status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        400 | 401 | 403 => format!("Sign in again to renew this {provider} authorization"),
+        429 => format!("{provider} credential refresh is temporarily rate-limited"),
+        code => format!("{provider} credential refresh returned {code}"),
+    }
+}
+
+async fn refresh_codex_credential(file_name: &str, force: bool) -> Result<bool, String> {
+    let path = exact_auth_path(file_name)?;
+    let refresh_lock = oauth_refresh_lock(&CODEX_REFRESH_LOCKS, file_name, "Codex")?;
+    let _refresh = refresh_lock.lock().await;
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read Codex credential: {error}"))?;
+    let mut credential: Value =
+        serde_json::from_str(&raw).map_err(|_| "Codex credential is invalid")?;
+    if account_provider(&credential, file_name).as_deref() != Some("codex")
+        || (!force && !oauth_refresh_required(&credential, Utc::now()))
+    {
+        return Ok(false);
+    }
+    let refresh_token = credential
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or("Sign in again to renew this Codex authorization")?;
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("client_id", CODEX_CLIENT_ID)
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", refresh_token)
+        .append_pair("scope", "openid profile email")
+        .finish();
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("Basiliskos/2.2")
+        .build()
+        .map_err(|_| "Could not prepare Codex credential refresh")?
+        .post(CODEX_TOKEN_ENDPOINT)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(reqwest::header::ACCEPT, "application/json")
+        .body(form)
+        .send()
+        .await
+        .map_err(|_| "Codex credential refresh could not reach OpenAI")?;
+    if !response.status().is_success() {
+        return Err(oauth_refresh_http_error("Codex", response.status()));
+    }
+    let refreshed: Value = response
+        .json()
+        .await
+        .map_err(|_| "Codex credential refresh returned an invalid response")?;
+    apply_oauth_refresh(&mut credential, &refreshed, "Codex")?;
+    durable_write(
+        &path,
+        &serde_json::to_vec_pretty(&credential)
+            .map_err(|_| "Could not save refreshed Codex credential")?,
+    )?;
+    Ok(true)
+}
+
+async fn refresh_claude_credential(file_name: &str, force: bool) -> Result<bool, String> {
+    let path = exact_auth_path(file_name)?;
+    let refresh_lock = oauth_refresh_lock(&CLAUDE_REFRESH_LOCKS, file_name, "Claude")?;
+    let _refresh = refresh_lock.lock().await;
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read Claude credential: {error}"))?;
+    let mut credential: Value =
+        serde_json::from_str(&raw).map_err(|_| "Claude credential is invalid")?;
+    if account_provider(&credential, file_name).as_deref() != Some("claude")
+        || (!force && !oauth_refresh_required(&credential, Utc::now()))
+    {
+        return Ok(false);
+    }
+    let refresh_token = credential
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or("Sign in again to renew this Claude authorization")?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("Basiliskos/2.2")
+        .build()
+        .map_err(|_| "Could not prepare Claude credential refresh")?
+        .post(CLAUDE_TOKEN_ENDPOINT)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&serde_json::json!({
+            "client_id": CLAUDE_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }))
+        .send()
+        .await
+        .map_err(|_| "Claude credential refresh could not reach Anthropic")?;
+    if !response.status().is_success() {
+        return Err(oauth_refresh_http_error("Claude", response.status()));
+    }
+    let refreshed: Value = response
+        .json()
+        .await
+        .map_err(|_| "Claude credential refresh returned an invalid response")?;
+    apply_oauth_refresh(&mut credential, &refreshed, "Claude")?;
+    durable_write(
+        &path,
+        &serde_json::to_vec_pretty(&credential)
+            .map_err(|_| "Could not save refreshed Claude credential")?,
+    )?;
+    Ok(true)
 }
 
 const XAI_REFRESH_SKEW_SECS: i64 = 5 * 60;
@@ -5063,6 +5353,75 @@ fn start_kimi_credential_maintenance() {
         loop {
             maintain_saved_kimi_credentials_once().await;
             tokio::time::sleep(KIMI_CREDENTIAL_MAINTENANCE_INTERVAL).await;
+        }
+    });
+}
+
+fn saved_provider_credential_file_names(provider: &str) -> Result<Vec<String>, String> {
+    let directory = auth_dir()?;
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&directory)
+        .map_err(|error| format!("Could not inspect saved {provider} credentials: {error}"))?
+    {
+        let entry = entry
+            .map_err(|error| format!("Could not inspect a saved {provider} credential: {error}"))?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let is_provider = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| account_provider(&value, name))
+            .as_deref()
+            == Some(provider);
+        if is_provider {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+async fn maintain_saved_oauth_credentials_once() {
+    for provider in ["codex", "claude"] {
+        let Ok(names) = saved_provider_credential_file_names(provider) else {
+            continue;
+        };
+        for name in names {
+            let result = match provider {
+                "codex" => refresh_codex_credential(&name, false).await,
+                "claude" => refresh_claude_credential(&name, false).await,
+                _ => unreachable!(),
+            };
+            if let Err(error) = result {
+                diagnostics::record(
+                    ErrorCode::ProviderAuthFailed,
+                    "warning",
+                    if error.starts_with("Sign in again") {
+                        "A saved OAuth authorization was rejected and needs one re-login."
+                    } else {
+                        "A saved OAuth authorization refresh failed temporarily and will retry automatically."
+                    },
+                    None,
+                    None,
+                    Some(provider),
+                );
+            }
+        }
+    }
+}
+
+fn start_oauth_credential_maintenance() {
+    if OAUTH_CREDENTIAL_MAINTENANCE_STARTED.set(()).is_err() {
+        return;
+    }
+    tauri::async_runtime::spawn(async {
+        loop {
+            maintain_saved_oauth_credentials_once().await;
+            tokio::time::sleep(OAUTH_CREDENTIAL_MAINTENANCE_INTERVAL).await;
         }
     });
 }
@@ -6043,6 +6402,7 @@ fn launch_provider_login_blocking(
     let prepared = (|| -> Result<(PathBuf, ControllerState), String> {
         let _mutation = mutation_lock()?;
         let state = prepare_config()?;
+        secure_create_dir_all(&staging_dir)?;
         secure_create_dir_all(&staged_auth)?;
         durable_write(
             &staged_config,
@@ -7439,6 +7799,17 @@ mod tests {
         }));
         assert_eq!(xai[0], usage_window("Week", 23.0));
 
+        let xai_product_specific = parse_xai_usage(&serde_json::json!({
+            "config": {
+                "creditUsagePercent": 100.0,
+                "productUsage": [
+                    {"product": "GrokBuild", "usagePercent": 99.0},
+                    {"product": "GrokChat", "usagePercent": 1.0}
+                ]
+            }
+        }));
+        assert_eq!(xai_product_specific[0], usage_window("Week", 99.0));
+
         // A real billing config (proven by `currentPeriod`) with no usage
         // fields means "hasn't used anything yet this period", not "broken" —
         // a fresh/idle account, distinct from a genuine 0%-used reading.
@@ -7459,9 +7830,94 @@ mod tests {
                 {"window": {"duration": 7, "timeUnit": "DAY"}, "detail": {"limit": 500, "remaining": 100}}
             ]
         }));
-        assert_eq!(kimi[0], usage_window("Week", 35.0));
+        assert_eq!(kimi[0], usage_window("Plan", 35.0));
         assert_eq!(kimi[1], usage_window("5h", 25.0));
         assert_eq!(kimi[2], usage_window("Week", 80.0));
+    }
+
+    #[test]
+    fn usage_denial_does_not_claim_the_saved_login_expired() {
+        for provider in ["codex", "claude", "xai"] {
+            let message = usage_http_error_message(provider, reqwest::StatusCode::UNAUTHORIZED);
+            assert!(message.contains("saved login is active"));
+            assert!(message.contains("Auto-retry"));
+            assert!(!message.contains("Sign in again"));
+        }
+        assert!(should_refresh_after_usage_denial(
+            "codex",
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(should_refresh_after_usage_denial(
+            "claude",
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!should_refresh_after_usage_denial(
+            "xai",
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert_eq!(
+            usage_refresh_failure_message(
+                "Codex",
+                "Sign in again to renew this Codex authorization"
+            ),
+            "Codex refresh grant was revoked. Re-login once to restore automatic refresh."
+        );
+        assert!(!usage_refresh_failure_message(
+            "Codex",
+            "Codex credential refresh is temporarily rate-limited"
+        )
+        .contains("Re-login"));
+    }
+
+    #[test]
+    fn oauth_refresh_rotates_returned_tokens_and_preserves_omitted_refresh_grant() {
+        let mut credential = serde_json::json!({
+            "access_token": "old-access",
+            "refresh_token": "keep-refresh",
+            "disabled": true
+        });
+        apply_oauth_refresh(
+            &mut credential,
+            &serde_json::json!({
+                "access_token": "new-access",
+                "id_token": "new-id",
+                "expires_in": 3600
+            }),
+            "Codex",
+        )
+        .unwrap();
+        assert_eq!(
+            credential.get("access_token").and_then(Value::as_str),
+            Some("new-access")
+        );
+        assert_eq!(
+            credential.get("refresh_token").and_then(Value::as_str),
+            Some("keep-refresh")
+        );
+        assert_eq!(
+            credential.get("id_token").and_then(Value::as_str),
+            Some("new-id")
+        );
+        assert_eq!(credential.get("disabled"), Some(&Value::Bool(true)));
+        assert!(credential_expiry(&credential).is_some());
+    }
+
+    #[test]
+    fn crash_cleanup_removes_only_direct_stale_workspace_directories() {
+        let root = temp_dir("stale-secret-workspaces");
+        for name in ["login-session", "vision-sidecar"] {
+            let child = root.join(name);
+            secure_create_dir_all(&child).unwrap();
+            durable_write(&child.join("credential.json"), br#"{"private":true}"#).unwrap();
+        }
+        let sentinel = root.join("keep.txt");
+        fs::write(&sentinel, "not a workspace directory").unwrap();
+
+        assert_eq!(remove_private_child_directories(&root).unwrap(), 2);
+        assert!(sentinel.is_file());
+        assert!(!root.join("login-session").exists());
+        assert!(!root.join("vision-sidecar").exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn deepseek_auth_file(auth: &Path, file_name: &str, api_key: &str, disabled: bool) {
@@ -9231,15 +9687,15 @@ mod tests {
         );
         assert_eq!(
             usage_http_error_message("kimi", reqwest::StatusCode::UNAUTHORIZED),
-            "Sign in again to refresh usage"
+            "Usage check unavailable — saved login is active. Auto-retry in 5 min or use Refresh usage."
         );
         assert_eq!(
             usage_http_error_message("codex", reqwest::StatusCode::FORBIDDEN),
-            "Sign in again to refresh usage"
+            "Usage check unavailable — saved login is active. Auto-retry in 5 min or use Refresh usage."
         );
         assert_eq!(
             usage_http_error_message("xai", reqwest::StatusCode::from_u16(500).unwrap()),
-            "Usage service returned 500"
+            "Usage service returned 500. Auto-retry in 5 min or use Refresh usage."
         );
     }
 
@@ -9378,7 +9834,7 @@ mod tests {
                 Some(now - ChronoDuration::seconds(1)),
                 now
             ),
-            "expired"
+            "renewal_due"
         );
         assert_eq!(
             credential_status("codex", "codex-test.json", None, now),
