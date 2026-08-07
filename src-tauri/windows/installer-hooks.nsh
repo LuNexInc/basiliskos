@@ -68,4 +68,11 @@
     CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\${MAINBINARYNAME}.exe" 0
     !insertmacro SetLnkAppUserModelId "$DESKTOP\${PRODUCTNAME}.lnk"
   ${EndIf}
+
+  ; The GUI finish page re-runs CreateOrUpdateDesktopShortcut after this hook,
+  ; and that template function recreates the desktop .lnk WITHOUT an explicit
+  ; icon path, wiping the binding above (silent/passive installs skip the finish
+  ; page, which is why the icon was only broken in interactive installs). Mark
+  ; shortcuts as handled so the finish page skips its icon-less re-creation.
+  StrCpy $NoShortcutMode 1
 !macroend

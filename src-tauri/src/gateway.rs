@@ -3436,6 +3436,104 @@ fn supervise_backend(app: &AppHandle) {
     }
 }
 
+fn restart_backend_for_provider_config(
+    app: &AppHandle,
+    state: &ControllerState,
+) -> Result<(), String> {
+    let (child, job) = {
+        let mut runtime = runtime_lock()?;
+        if runtime.front_proxy.is_none()
+            || !matches!(
+                runtime.phase,
+                GatewayPhase::Starting | GatewayPhase::Running | GatewayPhase::Degraded
+            )
+        {
+            return Ok(());
+        }
+        runtime.phase = GatewayPhase::Starting;
+        runtime.backend_exit_reason =
+            Some("Backend restart is applying provider configuration".into());
+        runtime.backend_restart_attempts = 0;
+        runtime.backend_next_restart = None;
+        let child = runtime.gateway_child.take();
+        #[cfg(target_os = "windows")]
+        let job = runtime.gateway_job.take();
+        #[cfg(not(target_os = "windows"))]
+        let job = None;
+        (child, job)
+    };
+
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    close_gateway_job(job);
+
+    let (child, job) = match spawn_backend_process(app, true) {
+        Ok(process) => process,
+        Err(error) => {
+            if let Ok(mut runtime) = runtime_lock() {
+                runtime.phase = GatewayPhase::Degraded;
+                runtime.backend_restart_attempts = 1;
+                runtime.backend_next_restart = Some(Instant::now() + Duration::from_secs(2));
+                runtime.backend_exit_reason =
+                    Some("Backend restart failed while applying provider configuration".into());
+            }
+            diagnostics::record(
+                ErrorCode::BackendRestartFailed,
+                "error",
+                "The managed backend could not apply a changed provider configuration.",
+                None,
+                None,
+                None,
+            );
+            return Err(error);
+        }
+    };
+    {
+        let mut runtime = runtime_lock()?;
+        runtime.gateway_child = Some(child);
+        #[cfg(target_os = "windows")]
+        {
+            runtime.gateway_job = job;
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if backend_health_check(&state.api_key) {
+            let mut runtime = runtime_lock()?;
+            runtime.phase = GatewayPhase::Running;
+            runtime.backend_exit_reason = None;
+            runtime.backend_restart_attempts = 0;
+            runtime.backend_next_restart = None;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    let (child, job) = {
+        let mut runtime = runtime_lock()?;
+        let child = runtime.gateway_child.take();
+        #[cfg(target_os = "windows")]
+        let job = runtime.gateway_job.take();
+        #[cfg(not(target_os = "windows"))]
+        let job = None;
+        runtime.phase = GatewayPhase::Degraded;
+        runtime.backend_restart_attempts = 1;
+        runtime.backend_next_restart = Some(Instant::now() + Duration::from_secs(2));
+        runtime.backend_exit_reason =
+            Some("Backend did not become ready after applying provider configuration".into());
+        (child, job)
+    };
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    close_gateway_job(job);
+    Err("Basiliskos could not apply the selected provider configuration.".into())
+}
+
 fn stop_hydra_claude_runtime() {
     let (child, job, pid, executable, profile) = match runtime_lock() {
         Ok(mut runtime) => {
@@ -5579,6 +5677,24 @@ fn selection_transaction(
     Ok((mutations, after_state))
 }
 
+fn selection_requires_backend_restart(
+    accounts: &[GatewayAccount],
+    previous_file_name: Option<&str>,
+    next_file_name: &str,
+) -> bool {
+    if previous_file_name == Some(next_file_name) {
+        return false;
+    }
+    let provider_for = |file_name: &str| {
+        accounts
+            .iter()
+            .find(|account| account.file_name == file_name)
+            .map(|account| account.provider.as_str())
+    };
+    previous_file_name.and_then(provider_for) == Some("deepseek")
+        || provider_for(next_file_name) == Some("deepseek")
+}
+
 #[derive(Clone, Copy)]
 struct AccountPaths<'a> {
     root: &'a Path,
@@ -5727,7 +5843,10 @@ fn attempt_same_provider_failover(rate_limited_account: &str, provider: &str) {
 }
 
 #[tauri::command]
-pub async fn select_gateway_account(file_name: String) -> Result<AccountSelectionResult, String> {
+pub async fn select_gateway_account(
+    app: AppHandle,
+    file_name: String,
+) -> Result<AccountSelectionResult, String> {
     let refreshed = refresh_xai_relay_credential_if_needed(&file_name).await?;
     if refreshed {
         // Keep a previously served Grok CLI account current, but never alter
@@ -5750,6 +5869,8 @@ pub async fn select_gateway_account(file_name: String) -> Result<AccountSelectio
     let root = root_dir()?;
     let directory = auth_dir()?;
     let state_path = controller_path()?;
+    let restart_backend =
+        selection_requires_backend_restart(&accounts, state.active_account.as_deref(), &file_name);
     let (mutations, state) = selection_transaction(
         &root,
         &directory,
@@ -5763,6 +5884,9 @@ pub async fn select_gateway_account(file_name: String) -> Result<AccountSelectio
     })?;
     runtime_lock()?.last_known_good_models.clear();
     prepare_config()?;
+    if restart_backend {
+        restart_backend_for_provider_config(&app, &state)?;
+    }
     let claude_config_changed =
         write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
     if let Some(newly_active_provider) = accounts
@@ -8829,6 +8953,53 @@ mod tests {
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert_eq!(selected.active_account.as_deref(), Some("xai-b.json"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deepseek_account_switch_requires_backend_config_reload() {
+        let account = |file_name: &str, provider: &str| GatewayAccount {
+            file_name: file_name.into(),
+            provider: provider.into(),
+            email: None,
+            label: provider.into(),
+            disabled: true,
+            active: false,
+            cooldown_until_ms: None,
+            expires_at_ms: None,
+            credential_status: "unknown".into(),
+        };
+        let accounts = vec![
+            account("xai-a.json", "xai"),
+            account("codex-b.json", "codex"),
+            account("deepseek-c.json", "deepseek"),
+            account("deepseek-d.json", "deepseek"),
+        ];
+
+        assert!(selection_requires_backend_restart(
+            &accounts,
+            Some("xai-a.json"),
+            "deepseek-c.json"
+        ));
+        assert!(selection_requires_backend_restart(
+            &accounts,
+            Some("deepseek-c.json"),
+            "xai-a.json"
+        ));
+        assert!(selection_requires_backend_restart(
+            &accounts,
+            Some("deepseek-c.json"),
+            "deepseek-d.json"
+        ));
+        assert!(!selection_requires_backend_restart(
+            &accounts,
+            Some("xai-a.json"),
+            "codex-b.json"
+        ));
+        assert!(!selection_requires_backend_restart(
+            &accounts,
+            Some("deepseek-c.json"),
+            "deepseek-c.json"
+        ));
     }
 
     #[test]
