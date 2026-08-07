@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   accountNeedsRelogin,
-  credentialExpiry,
+  credentialAlert,
   DiagnosticEventList,
   isNewerVersion,
   prefersManualAuthBrowser,
@@ -61,7 +61,7 @@ describe("truthful Basiliskos status components", () => {
     expect(document.body.textContent).not.toMatch(/token|prompt|bearer/i);
   });
 
-  it("makes confirmed re-login and unknown expiry visible without exposing credentials", () => {
+  it("shows actionable login warnings without displaying token-expiry timestamps", () => {
     const base = {
       fileName: "kimi-account.json",
       provider: "kimi" as const,
@@ -70,13 +70,18 @@ describe("truthful Basiliskos status components", () => {
       active: false,
       credentialStatus: "relogin_required" as const,
     };
-    expect(credentialExpiry(base, Date.now())).toEqual({ label: "Sign in again", tone: "relogin" });
-    expect(credentialExpiry({ ...base, credentialStatus: "unknown" }, Date.now())).toEqual({ label: "Login-token expiry unavailable", tone: "unknown" });
-    expect(credentialExpiry({
+    expect(credentialAlert(base, Date.now())).toEqual({ label: "Sign in again", tone: "relogin" });
+    expect(credentialAlert({ ...base, credentialStatus: "unknown" }, Date.now())).toBeUndefined();
+    expect(credentialAlert({
       ...base,
       credentialStatus: "renewal_due",
       expiresAtMs: Date.now() + 60_000,
-    }, Date.now())).toMatchObject({ tone: "renewal", label: expect.stringMatching(/^Login refresh due/) });
+    }, Date.now())).toEqual({ tone: "renewal", label: "Login refresh needed" });
+    expect(credentialAlert({
+      ...base,
+      credentialStatus: "active",
+      expiresAtMs: Date.now() + 60_000,
+    }, Date.now())).toBeUndefined();
     expect(accountNeedsRelogin(base)).toBe(true);
     expect(accountNeedsRelogin({ credentialStatus: "active" })).toBe(false);
     expect(accountNeedsRelogin(

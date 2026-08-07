@@ -45,8 +45,10 @@ $postInstallBody = $postInstallMatch.Groups['body'].Value
 foreach ($required in @(
     '${If} $NoShortcutMode = 0',
     'CreateDirectory "$SMPROGRAMS\$AppStartMenuFolder"',
-    'CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"',
-    '!insertmacro SetLnkAppUserModelId'
+    'CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\${MAINBINARYNAME}.exe" 0',
+    '!insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"',
+    'CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\${MAINBINARYNAME}.exe" 0',
+    '!insertmacro SetLnkAppUserModelId "$DESKTOP\${PRODUCTNAME}.lnk"'
 )) {
     if ($postInstallBody.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
         throw "The installer post-install hook is missing shortcut repair behavior: $required"

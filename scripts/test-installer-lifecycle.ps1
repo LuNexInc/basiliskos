@@ -10,6 +10,7 @@ $legacyUser = Join-Path $env:LOCALAPPDATA 'Basiliskos'
 $sentinelDir = Join-Path $env:USERPROFILE '.hydra-gateway'
 $sentinel = Join-Path $sentinelDir 'installer-ci-sentinel.txt'
 $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\3ReadyLab\Basiliskos.lnk'
+$desktopShortcut = Join-Path $env:PUBLIC 'Desktop\Basiliskos.lnk'
 
 function Invoke-Installer([string]$Path, [switch]$ExpectFailure) {
     $process = Start-Process -FilePath $Path -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
@@ -62,6 +63,21 @@ if (-not $shortcutTarget.Equals($currentExe, [StringComparison]::OrdinalIgnoreCa
 if (-not $shortcutObject.WorkingDirectory.Equals($target, [StringComparison]::OrdinalIgnoreCase)) {
     throw "The Start Menu shortcut has an unexpected working directory: $($shortcutObject.WorkingDirectory)"
 }
+$shortcutIcon = ($shortcutObject.IconLocation -split ',')[0].Trim('"')
+if (-not $shortcutIcon.Equals($currentExe, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "The Start Menu shortcut has no explicit Basiliskos icon: $($shortcutObject.IconLocation)"
+}
+if (-not (Test-Path -LiteralPath $desktopShortcut -PathType Leaf)) {
+    throw 'The Basiliskos desktop shortcut was not created.'
+}
+$desktopShortcutObject = $shell.CreateShortcut($desktopShortcut)
+if (-not $desktopShortcutObject.TargetPath.Equals($currentExe, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "The desktop shortcut points to an unexpected target: $($desktopShortcutObject.TargetPath)"
+}
+$desktopIcon = ($desktopShortcutObject.IconLocation -split ',')[0].Trim('"')
+if (-not $desktopIcon.Equals($currentExe, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "The desktop shortcut has no explicit Basiliskos icon: $($desktopShortcutObject.IconLocation)"
+}
 
 $beforeRepair = (Get-FileHash -LiteralPath $currentExe -Algorithm SHA256).Hash
 Invoke-Installer $CurrentInstaller
@@ -93,6 +109,7 @@ $process = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassTh
 if ($process.ExitCode -ne 0) { throw "Uninstall failed with exit code $($process.ExitCode)." }
 if (Test-Path -LiteralPath $currentExe) { throw 'The installed executable survived uninstall.' }
 if (Test-Path -LiteralPath $shortcut) { throw 'The Start Menu shortcut survived uninstall.' }
+if (Test-Path -LiteralPath $desktopShortcut) { throw 'The desktop shortcut survived uninstall.' }
 if (-not (Test-Path -LiteralPath $sentinel)) { throw 'Uninstall removed retained profile data.' }
 
 Write-Output 'Clean install, 1.1.5 upgrade/migration, repair, rejected rollback, shortcut, profile preservation, and uninstall checks passed.'

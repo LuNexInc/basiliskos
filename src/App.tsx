@@ -218,7 +218,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-const APP_VERSION = "2.2.6";
+const APP_VERSION = "2.2.7";
 const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
@@ -333,25 +333,17 @@ function cooldownLabel(remainingMs: number) {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
-export function credentialExpiry(account: Account, now: number) {
+export function credentialAlert(account: Account, now: number) {
   if (account.credentialStatus === "relogin_required") {
     return { label: "Sign in again", tone: "relogin" };
   }
-  if (!account.expiresAtMs) {
-    return { label: "Login-token expiry unavailable", tone: "unknown" };
-  }
-  const expiry = new Date(account.expiresAtMs);
-  if (Number.isNaN(expiry.getTime())) {
-    return { label: "Login-token expiry unavailable", tone: "unknown" };
-  }
-  const time = expiry.toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
   if (account.credentialStatus === "renewal_due") {
-    return { label: `Login refresh due · ${time}`, tone: "renewal" };
+    return { label: "Login refresh needed", tone: "renewal" };
   }
-  if (account.credentialStatus === "expired" || account.expiresAtMs <= now) {
-    return { label: `Login token expired · ${time}`, tone: "expired" };
+  if (account.credentialStatus === "expired" || (account.expiresAtMs && account.expiresAtMs <= now)) {
+    return { label: "Login expired", tone: "expired" };
   }
-  return { label: `Login token · ${time}`, tone: "active" };
+  return undefined;
 }
 
 export function usageResetLabel(resetsAtMs: number | undefined) {
@@ -1364,7 +1356,7 @@ export default function App() {
               const usage = usageByAccount[account.fileName];
               const isEditing = editingAccount === account.fileName;
               const cooling = cooldownRemaining(account.cooldownUntilMs, now);
-              const expiry = credentialExpiry(account, now);
+              const credentialWarning = credentialAlert(account, now);
               return (
                 <article className={`account-row ${account.active ? "active" : ""}`} key={account.fileName}>
                   <div className="account-avatar">{account.label.slice(0, 1).toUpperCase()}</div>
@@ -1394,9 +1386,11 @@ export default function App() {
                       </div>
                     )}
                     <p>{account.email ?? "Authorized account"}</p>
-                    <div className={`credential-expiry ${expiry.tone}`} title={account.expiresAtMs ? `OAuth login-token expiry: ${new Date(account.expiresAtMs).toLocaleString()}. This is not the usage renewal time.` : "This provider did not expose a login-token expiry time"}>
-                      <Timer size={11} aria-hidden="true" /> {expiry.label}
-                    </div>
+                    {credentialWarning && (
+                      <div className={`credential-expiry ${credentialWarning.tone}`}>
+                        <Timer size={11} aria-hidden="true" /> {credentialWarning.label}
+                      </div>
+                    )}
                     <div className="usage-summary">
                       {usage?.data ? usage.data.windows.map((window) => window.known ? (
                         <div className={`usage-window ${window.remainingPercent < 20 ? "low" : ""}`} key={window.label} title={`${Math.round(window.usedPercent)}% used`}>
