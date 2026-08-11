@@ -294,6 +294,8 @@ button.secondary:hover:not(:disabled) { border-color: rgba(238, 229, 207, 0.55);
 .claude-foot > svg { flex: none; color: #52656e; }
 .claude-foot > div { min-width: 0; flex: 1; }
 .claude-foot button { flex: none; }
+.settings-row { display: flex; align-items: center; gap: 8px; padding: 0 24px 12px; margin-top: -6px; color: var(--muted); font-size: 11px; cursor: pointer; }
+.settings-row input { accent-color: var(--accent, #7fb069); }
 .running-dot { color: var(--success); }
 .stopped-dot { color: var(--muted); }
 

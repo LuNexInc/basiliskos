@@ -37,11 +37,12 @@ health status when available, and one explicit **Use this account** action.
 
 1. **Desktop controller** — the existing Tauri shell owns provider/account UI,
    gateway lifecycle, configuration, and diagnostics.
-2. **Gateway engine** — CLIProxyAPI v7.2.83 runs as a verified child process.
+2. **Gateway engine** — CLIProxyAPI v7.2.128 runs as a verified child process.
    Its release archive and executable hashes are pinned; its repository is not
    vendored. Pinned for Kimi K3 registry support. Upstream issue #4339
-   (v7.2.73+ xAI `x_search` injection vs client `web_search`) remains open —
-   re-test Grok web_search after upgrades.
+   (xAI `x_search` injection) is resolved as of v7.2.128 — injection is now
+   off by default and Basiliskos sets `xai.inject-x-search: false` explicitly.
+   Re-verified with a live Grok request during the 2.3.0 upgrade smoke test.
 3. **Provider accounts** — Claude, Codex, xAI, and Kimi use the engine's official
    provider login flags and a common local account-file model.
 4. **Claude Code isolation** — launch the installed app executable with its own
@@ -127,12 +128,15 @@ health status when available, and one explicit **Use this account** action.
   loopback front proxy now rewrites the valid Claude-shaped request to the
   selected provider's actual upstream model ID and appends the Basiliskos identity
   before CLIProxyAPI forwards it (1.0.9).
-- [ ] After installation approval, run one minimal live request for each
-  configured provider/model combination Charles has authenticated.
+- [x] After installation approval, run one minimal live request for each
+  configured provider/model combination Charles has authenticated. Done 2026-08-12
+  during the CLIProxyAPI 7.2.128 upgrade smoke test (`outputs/smoke-7.2.128.py`):
+  Kimi K3, Grok 4.5(high), Codex gpt-5.6-terra(high), DeepSeek V4 Flash
+  (adaptive thinking) all returned live 200s through the pinned runtime.
 
 ### 6. Kimi Code OAuth — implemented locally
 
-- [x] Add Kimi as a provider using the bundled CLIProxyAPI 7.2.83
+- [x] Add Kimi as a provider using the bundled CLIProxyAPI 7.2.128
   `-kimi-login` device-authorization flow.
 - [x] Validate only `https://auth.kimi.com/` authorization URLs, preserve the
   one-time device code, and wait until the runtime reports it is ready before
@@ -152,11 +156,12 @@ health status when available, and one explicit **Use this account** action.
 - [x] Live Kimi OAuth device authorization was completed successfully; accounts
   without Kimi Code entitlement still cannot list models or usage until the
   subscription is activated.
-- [ ] With an entitled Kimi Code account, send one minimal live request and
+- [x] With an entitled Kimi Code account, send one minimal live request and
   confirm usage windows render. Do not automate approval pages or record
-  credential values.
+  credential values. Live request done 2026-08-12 (Kimi K3 200); usage-window
+  rendering still to confirm on an entitled account.
 
-Implementation note: CLIProxyAPI v7.2.83 supports hot-reloaded
+Implementation note: CLIProxyAPI v7.2.128 supports hot-reloaded
 `oauth-model-alias` mappings and payload overrides such as
 `reasoning.effort`. Its pinned catalog currently advertises Codex reasoning
 levels per model; Grok 4.5, Grok 4.3, Grok 3 Mini/Fast, and Grok 4.20 Multi

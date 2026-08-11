@@ -30,6 +30,7 @@ $expected = @(
     'set_gateway_route'
     'set_model_hidden'
     'set_skip_model_switch_confirmation'
+    'set_open_claude_on_launch'
     'start_gateway'
     'stop_gateway'
     'stop_hydra_claude'

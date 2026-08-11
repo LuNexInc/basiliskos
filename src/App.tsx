@@ -3,6 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  contextWindowLabel,
+  messageFrom,
+  statusTone,
+  thinkingLabel,
+} from "./ui";
+import {
   AppWindow,
   AlertTriangle,
   BellDot,
@@ -80,6 +86,7 @@ type Snapshot = {
   accounts: Account[];
   activeAccount?: string;
   routes: ProviderRoute[];
+  autoFailover?: { fromLabel: string; toLabel: string; atMs: number };
   controller: ComponentStatus;
   relay: ComponentStatus;
   backend: ComponentStatus;
@@ -92,9 +99,11 @@ type Snapshot = {
   diagnostics: DiagnosticEvent[];
   login?: ProviderLoginStatus;
   skipModelSwitchConfirmation: boolean;
+  openClaudeOnLaunch: boolean;
 };
 
 type AccountSelectionResult = Snapshot & { claudeConfigChanged: boolean };
+type RouteUpdateResult = Snapshot & { routeVerified: boolean };
 type DeepseekAccountAdded = Snapshot & { fileName: string };
 
 export type ComponentStatus = {
@@ -191,11 +200,6 @@ export async function copyTextToClipboard(text: string): Promise<void> {
   if (!ok) throw new Error("Clipboard copy is unavailable in this environment");
 }
 
-type ReleaseAsset = {
-  name: string;
-  browser_download_url: string;
-};
-
 type Release = {
   tagName: string;
   name: string;
@@ -207,7 +211,11 @@ type Release = {
 
 type LatestPublishedRelease = {
   tagName: string;
+  name: string;
+  body: string;
+  publishedAt: string;
   releaseUrl: string;
+  installerUrl?: string;
 };
 
 type PreparedBasiliskosUpdate = {
@@ -218,8 +226,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-const APP_VERSION = "2.2.9";
-const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
+export const APP_VERSION = "2.3.0";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },
@@ -228,24 +235,6 @@ const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "kimi", label: "Kimi", detail: "Kimi Code OAuth" },
   { id: "deepseek", label: "DeepSeek", detail: "DeepSeek API key" },
 ];
-
-function messageFrom(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function thinkingLabel(value: string) {
-  const labels: Record<string, string> = {
-    auto: "Auto",
-    none: "Off",
-    low: "Low",
-    medium: "Medium",
-    high: "High",
-    xhigh: "Extra high",
-    max: "Maximum",
-    ultra: "Ultra",
-  };
-  return labels[value] ?? value;
-}
 
 const THINKING_LEVELS = ["auto", "none", "low", "medium", "high", "xhigh", "max", "ultra"];
 
@@ -258,11 +247,6 @@ function QuotaBar({ segments = 16, percent }: { segments?: number; percent: numb
       ))}
     </div>
   );
-}
-
-function contextWindowLabel(tokens?: number) {
-  if (!tokens) return null;
-  return `${Math.round(tokens / 1000)}K context`;
 }
 
 export function isNewerVersion(candidate: string, current: string) {
@@ -278,33 +262,7 @@ export function isNewerVersion(candidate: string, current: string) {
   return false;
 }
 
-function parseReleases(payload: unknown): Release[] {
-  if (!Array.isArray(payload)) return [];
-  return payload.flatMap((item) => {
-    if (!item || typeof item !== "object") return [];
-    const record = item as Record<string, unknown>;
-    if (record.draft === true || record.prerelease === true || typeof record.tag_name !== "string") return [];
-    const assets = Array.isArray(record.assets) ? record.assets as ReleaseAsset[] : [];
-    const installerUrl = assets.find((asset) => asset?.name?.endsWith("_x64-setup.exe"))?.browser_download_url;
-    return [{
-      tagName: record.tag_name,
-      name: typeof record.name === "string" ? record.name : record.tag_name,
-      publishedAt: typeof record.published_at === "string" ? record.published_at : "",
-      body: typeof record.body === "string" ? record.body : "No release notes were provided.",
-      installerUrl,
-    }];
-  });
-}
-
-export function statusTone(status?: ComponentStatus) {
-  if (!status) return "offline";
-  if (["running", "healthy", "selected", "ready", "completed"].includes(status.state)) {
-    return "healthy";
-  }
-  if (["starting", "waiting"].includes(status.state)) return "pending";
-  if (["degraded", "failed"].includes(status.state)) return "degraded";
-  return "offline";
-}
+export { statusTone } from "./ui";
 
 export function StatusBadge({ label, status }: { label: string; status?: ComponentStatus }) {
   return <span className={statusTone(status)} title={status?.detail}><i aria-hidden="true" />{label} · {status?.state ?? "unknown"}</span>;
@@ -398,6 +356,7 @@ export default function App() {
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [preparedUpdate, setPreparedUpdate] = useState<PreparedBasiliskosUpdate | null>(null);
   const handledLogin = useRef<string | null>(null);
+  const lastFailoverAtMs = useRef<number | null>(null);
   const [pendingAuth, setPendingAuth] = useState<PendingAuthLaunch | null>(null);
   const [authCopyFeedback, setAuthCopyFeedback] = useState<string | null>(null);
   // DeepSeek API-key entry. Held only until the key is handed to the backend.
@@ -442,16 +401,17 @@ export default function App() {
   const checkForUpdates = useCallback(async (quiet = false) => {
     setCheckingUpdates(true);
     try {
-      const response = await fetch(RELEASES_URL, { headers: { Accept: "application/vnd.github+json" } });
-      const next = response.ok
-        ? parseReleases(await response.json())
-        : await invoke<LatestPublishedRelease>("latest_basiliskos_release").then((release) => [{
-          tagName: release.tagName,
-          name: `Basiliskos ${release.tagName}`,
-          publishedAt: "",
-          body: "Release details are available on GitHub.",
-          releaseUrl: release.releaseUrl,
-        }]);
+      // Routed through the backend command: server-side fetch (no CORS, no
+      // webview rate-limit exposure) with the full release metadata attached.
+      const release = await invoke<LatestPublishedRelease>("latest_basiliskos_release");
+      const next: Release[] = [{
+        tagName: release.tagName,
+        name: release.name || `Basiliskos ${release.tagName}`,
+        publishedAt: release.publishedAt,
+        body: release.body || "Release details are available on GitHub.",
+        releaseUrl: release.releaseUrl,
+        installerUrl: release.installerUrl,
+      }];
       setReleases(next);
       setUpdateError(null);
       const latest = next.find((release) => isNewerVersion(release.tagName, APP_VERSION));
@@ -479,13 +439,17 @@ export default function App() {
       setBusy("start");
       try {
         const next = await invoke<Snapshot>("start_gateway");
-        if (next.activeAccount) {
+        if (next.activeAccount && next.openClaudeOnLaunch !== false) {
           const launched = await invoke<Snapshot>("launch_hydra_claude");
           setSnapshot(launched);
           setMessage("Relay ready. Opened the separate Basiliskos Claude window.");
         } else {
           setSnapshot(next);
-          setMessage("Relay ready. Add or choose an account.");
+          setMessage(
+            next.activeAccount
+              ? "Relay ready. Choose Open Basiliskos Claude when you want the window."
+              : "Relay ready. Add or choose an account.",
+          );
         }
         setIsError(false);
       } catch (error) {
@@ -505,6 +469,17 @@ export default function App() {
     const interval = window.setInterval(() => void refresh(true), 3000);
     return () => window.clearInterval(interval);
   }, [refresh]);
+
+  useEffect(() => {
+    const failover = snapshot?.autoFailover;
+    if (!failover) return;
+    if (lastFailoverAtMs.current === failover.atMs) return;
+    lastFailoverAtMs.current = failover.atMs;
+    setMessage(
+      `${failover.fromLabel} was rate-limited; Basiliskos switched to ${failover.toLabel}.`,
+    );
+    setIsError(false);
+  }, [snapshot?.autoFailover]);
 
   useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 1000);
@@ -745,7 +720,7 @@ export default function App() {
     setMessage("Updating the Basiliskos route…");
     setIsError(false);
     try {
-      const next = await invoke<Snapshot>("set_gateway_route", {
+      const next = await invoke<RouteUpdateResult>("set_gateway_route", {
         provider: active.provider,
         model,
         thinking,
@@ -753,9 +728,11 @@ export default function App() {
       setSnapshot(next);
       const route = next.routes.find((item) => item.provider === active.provider);
       setMessage(
-        route
-          ? `Basiliskos now routes to ${route.selectedModelLabel} · ${thinkingLabel(route.thinking)}. Applies to the next request.`
-          : "Basiliskos route updated",
+        next.routeVerified
+          ? (route
+              ? `Basiliskos now routes to ${route.selectedModelLabel} · ${thinkingLabel(route.thinking)}. Applies to the next request.`
+              : "Basiliskos route updated")
+          : "Route saved, but the backend was unreachable so it could not be verified. It will be checked on the next request.",
       );
       setIsError(false);
     } catch (error) {
@@ -1093,6 +1070,51 @@ export default function App() {
     } catch (error) {
       setMessage(messageFrom(error));
       setIsError(true);
+    }
+  }
+
+  async function copyDiagnostics() {
+    if (!snapshot) return;
+    const zones = ["controller", "relay", "backend", "credentials", "route", "oauth", "claude"] as const;
+    const lines = [
+      `Basiliskos ${APP_VERSION} · ${new Date().toISOString()}`,
+      "",
+      ...zones.map((zone) => {
+        const status = snapshot[zone];
+        return `${zone}: ${status?.state ?? "unknown"} — ${status?.detail ?? ""}`;
+      }),
+    ];
+    if (snapshot.activeAccount) lines.push(`activeAccount: ${snapshot.activeAccount}`);
+    lines.push("");
+    for (const event of snapshot.diagnostics ?? []) {
+      lines.push(
+        `[${event.code} ${event.severity}] ${event.timestamp}`
+          + (event.httpStatus ? ` HTTP ${event.httpStatus}` : "")
+          + (event.provider ? ` (${event.provider})` : "")
+          + ` ${event.message}`,
+      );
+    }
+    try {
+      await copyTextToClipboard(lines.join("\n"));
+      setMessage("Diagnostics copied to clipboard");
+      setIsError(false);
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
+    }
+  }
+
+  async function setOpenClaudeOnLaunch(open: boolean) {
+    setBusy("settings");
+    try {
+      setSnapshot(await invoke<Snapshot>("set_open_claude_on_launch", { open }));
+      setMessage(open ? "Basiliskos will reopen the Claude window at launch" : "Basiliskos will not auto-open the Claude window at launch");
+      setIsError(false);
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -1568,6 +1590,10 @@ export default function App() {
             <p className="route-note">Changes apply to the next request from the Basiliskos Claude window. Thinking levels depend on the selected model.</p>
           </div>
           <div className="panel-foot claude-foot"><ShieldCheck size={16} /><div><strong>Basiliskos Claude window</strong> · <span className={snapshot?.claudeRunning ? "running-dot" : "stopped-dot"}>● {snapshot?.claude.state ?? "unknown"}</span><br />{snapshot?.claude.detail ?? "Waiting for controller status"}</div>{snapshot?.claudeRunning ? <button onClick={() => void closeBasiliskosClaude()} disabled={busy !== null}>Close window</button> : <button onClick={() => void openBasiliskosClaude()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}><AppWindow size={15} /> Open window</button>}</div>
+          <label className="settings-row">
+            <input type="checkbox" checked={snapshot?.openClaudeOnLaunch !== false} onChange={(event) => void setOpenClaudeOnLaunch(event.target.checked)} disabled={busy !== null} />
+            <span>Reopen the Basiliskos Claude window when Basiliskos starts</span>
+          </label>
         </section>
       </div>
 
@@ -1578,6 +1604,7 @@ export default function App() {
             <div className="diagnostics-actions">
               <button onClick={() => void refresh()}><RefreshCw size={15} /> Refresh</button>
               <button onClick={() => void openDiagnosticsFolder()}><FolderOpen size={15} /> Open logs</button>
+              <button onClick={() => void copyDiagnostics()}><Copy size={15} /> Copy</button>
               <button aria-label="Close diagnostics" onClick={() => setShowDiagnostics(false)}><X size={15} /></button>
             </div>
           </div>

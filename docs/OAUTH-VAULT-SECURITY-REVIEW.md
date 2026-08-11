@@ -131,6 +131,12 @@ when available; and clean crash remnants before any provider process starts.
 
 This milestone is low-risk and independently releasable.
 
+**Status: shipped across 2.2.x (2026-08).** Startup sweep (`cleanup_stale_secret_workspaces`),
+login/vision staging cleanup, saved-OAuth refresh maintenance, per-account refresh locks,
+relogin-required flags, truthful usage windows, and the command-surface / secret-scan gates
+all landed. Milestone 2 (encrypted canonical vault) remains the standing, Charles-gated
+follow-up.
+
 ### Milestone 2 — Encrypted canonical vault
 
 1. Add `vault.rs` with a versioned DPAPI current-user envelope, integrity failure

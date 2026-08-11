@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AppWindow,
@@ -10,6 +10,8 @@ import {
   X,
 } from "lucide-react";
 import brandArt from "./assets/basiliskos-mark.png";
+import { contextWindowLabel, messageFrom, statusTone, thinkingLabel } from "./ui";
+import { APP_VERSION } from "./App";
 
 type Provider = "claude" | "codex" | "xai" | "kimi";
 
@@ -53,6 +55,7 @@ type Snapshot = {
   claudeRunning: boolean;
   accounts: Account[];
   routes: ProviderRoute[];
+  autoFailover?: { fromLabel: string; toLabel: string; atMs: number };
   relay: ComponentStatus;
   backend: ComponentStatus;
   claude: ComponentStatus;
@@ -66,7 +69,6 @@ type ActiveServiceIdentities = {
 
 type FuelTone = "full" | "mid" | "low" | "critical" | "unknown";
 
-const APP_VERSION = "2.2.2";
 const CORE_SEGMENTS = 18;
 const PREVIEW_TRAY =
   typeof window !== "undefined" &&
@@ -137,29 +139,6 @@ const PREVIEW_USAGE: Record<string, AccountUsage> = {
   },
 };
 
-function messageFrom(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function thinkingLabel(value: string) {
-  const labels: Record<string, string> = {
-    auto: "Auto",
-    none: "Off",
-    low: "Low",
-    medium: "Medium",
-    high: "High",
-    xhigh: "Extra high",
-    max: "Maximum",
-    ultra: "Ultra",
-  };
-  return labels[value] ?? value;
-}
-
-function contextWindowLabel(tokens?: number) {
-  if (!tokens) return null;
-  return `${Math.round(tokens / 1000)}K context`;
-}
-
 function fuelTone(percent?: number): FuelTone {
   if (percent === undefined || Number.isNaN(percent)) return "unknown";
   if (percent <= 12) return "critical";
@@ -204,16 +183,6 @@ function ReactorCore({
   );
 }
 
-function statusTone(status?: ComponentStatus) {
-  if (!status) return "offline";
-  if (["running", "healthy", "selected", "ready", "completed"].includes(status.state)) {
-    return "healthy";
-  }
-  if (["starting", "waiting"].includes(status.state)) return "pending";
-  if (["degraded", "failed"].includes(status.state)) return "degraded";
-  return "offline";
-}
-
 function primaryUsagePercent(usage?: AccountUsage) {
   if (!usage?.windows?.length) return undefined;
   const known = usage.windows.filter((window) => window.known);
@@ -228,6 +197,7 @@ export default function TrayDashboard() {
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState("Loading…");
   const [isError, setIsError] = useState(false);
+  const lastFailoverAtMs = useRef<number | null>(null);
 
   useEffect(() => {
     document.documentElement.classList.add("tray-dashboard");
@@ -292,6 +262,15 @@ export default function TrayDashboard() {
     const interval = window.setInterval(() => void refresh(), 3000);
     return () => window.clearInterval(interval);
   }, [refresh]);
+
+  useEffect(() => {
+    const failover = snapshot?.autoFailover;
+    if (!failover) return;
+    if (lastFailoverAtMs.current === failover.atMs) return;
+    lastFailoverAtMs.current = failover.atMs;
+    setMessage(`${failover.fromLabel} was rate-limited; switched to ${failover.toLabel}.`);
+    setIsError(false);
+  }, [snapshot?.autoFailover]);
 
   useEffect(() => {
     if (!snapshot) return;
