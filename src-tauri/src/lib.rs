@@ -4,6 +4,8 @@ use tauri::{
     AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WindowEvent,
 };
 
+mod catalog;
+mod claude_window;
 mod codex_cli;
 mod codex_switcher_import;
 mod diagnostics;
@@ -12,6 +14,8 @@ mod grok_cli;
 mod persistence;
 #[cfg(test)]
 mod test_support;
+mod usage;
+mod vision;
 
 const TRAY_DASHBOARD_LABEL: &str = "tray-dashboard";
 const TRAY_DASHBOARD_WIDTH: f64 = 392.0;
@@ -197,6 +201,10 @@ pub fn run() {
             // Pre-create the tray dashboard so the first right-click is instant.
             let _ = ensure_tray_dashboard(app.handle());
 
+            // Backend crash recovery runs on a fixed timer (not only on idle
+            // relay ticks), so a crash is detected even during a request burst.
+            gateway::start_backend_supervision(app.handle().clone());
+
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().cloned().expect("app icon"))
                 .tooltip("Basiliskos")
@@ -249,6 +257,7 @@ pub fn run() {
             gateway::cancel_provider_login,
             gateway::add_deepseek_account,
             gateway::set_skip_model_switch_confirmation,
+            gateway::set_open_claude_on_launch,
             gateway::get_model_catalog,
             gateway::set_model_hidden,
             gateway::latest_basiliskos_release,
