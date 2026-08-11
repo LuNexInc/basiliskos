@@ -2,7 +2,7 @@
 
 > Navigation index: where things live / what to open first. NOT behavior docs (that's AGENTS.md).
 > Size cap ~45 lines. Update in the same commit that moves/renames a module.
-> Last verified: 2026-08-02
+> Last verified: 2026-08-11
 
 ## Open first
 - `AGENTS.md` — Basiliskos contract + the **canonical-vs-publish-repo** rules. Read before ANY work here.
@@ -28,7 +28,7 @@
 `package.json` · `src-tauri/Cargo.toml` · `src-tauri/Cargo.lock` · `src-tauri/tauri.conf.json` · `src/App.tsx` (`APP_VERSION`).
 
 ## Specs / docs
-`PLAN.md` · `CLEAN_ROOM_SPEC.md` · `docs/OPENCODEX-SCAFFOLD.md` · `docs/RELEASE-CHECKLIST.md`.
+`PLAN.md` · `CLEAN_ROOM_SPEC.md` · `docs/OPENCODEX-SCAFFOLD.md` · `docs/DEEPSEEK-VISION.md` · `docs/RELEASE-CHECKLIST.md` · `docs/OAUTH-VAULT-SECURITY-REVIEW.md`.
 
 ## Don't touch
 `outputs/` (dated session scratch) · `node_modules/`, `dist/` (build) · `.agents/`, `.claude/` (dev-only — excluded from the release-repo sync).

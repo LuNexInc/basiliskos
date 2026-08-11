@@ -97,10 +97,11 @@ in the `LuNexInc/basiliskos` repo (workflow already wired for them).
 
 ## OpenCodex scaffold (2026-07-23)
 
-- Basiliskos embeds an **OpenCodex-shaped multi-provider catalog** under
-  `src-tauri/src/opencodex.rs` and an **OpenCodex** UI tab.
-- Live request routing still uses only Claude / Codex / Grok / Kimi / DeepSeek
-  via the pinned CLIProxyAPI path. Do **not** reinstall `@bitkyc08/opencodex` or
+- The OpenCodex-shaped multi-provider catalog is **designed but not shipped**.
+  There is no `opencodex.rs` and no OpenCodex UI tab in the code — do not rely
+  on either until a later milestone lands them. `MAP.md` also flags this.
+- Live request routing uses only Claude / Codex / Grok / Kimi / DeepSeek via
+  the pinned CLIProxyAPI path. Do **not** reinstall `@bitkyc08/opencodex` or
   rewrite `~/.codex/config.toml` for this product.
 - Design + next milestones: `docs/OPENCODEX-SCAFFOLD.md`. Get Charles's approval
   before enabling live catalog routing or storing API keys.

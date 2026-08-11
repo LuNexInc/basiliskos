@@ -56,12 +56,6 @@ request.
    account card shows **No active Kimi Code subscription** instead of a
    misleading re-auth error. DeepSeek bills a prepaid balance rather than a
    quota window, so it reports no usage percentage.
-8. Open the **OpenCodex** tab for the multi-provider catalog scaffold
-   (OpenRouter, Ollama, DeepSeek, Gemini, Azure, custom OpenAI-compatible).
-   It stores preference intent only; live Claude Code traffic still uses the
-   backends above until a later milestone turns catalog routing on. (DeepSeek is
-   no longer scaffold-only — it routes live via the API-key path in step 3.)
-   See [docs/OPENCODEX-SCAFFOLD.md](docs/OPENCODEX-SCAFFOLD.md).
 
 Basiliskos never applies its relay to `%LOCALAPPDATA%\Claude-3p`. Version 1.0.1
 also detects and restores a shared configuration left applied by version 1.0.0.
@@ -107,6 +101,14 @@ evidence. Windows will show `Unknown publisher` for unsigned installers.
 This fork is isolated from `../grok-hydra`; the original project remains
 unchanged. Basiliskos is MIT licensed and is not affiliated with Anthropic,
 OpenAI, xAI, Moonshot AI, DeepSeek, or CLIProxyAPI.
+
+## Roadmap
+
+A multi-provider catalog scaffold (OpenRouter, Ollama, Gemini, Azure, and
+custom OpenAI-compatible providers) is designed but not shipped. Its spec
+lives in [docs/OPENCODEX-SCAFFOLD.md](docs/OPENCODEX-SCAFFOLD.md). Live
+requests use only the five backends above until a later milestone enables
+catalog routing.
 
 ## Support
 

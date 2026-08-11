@@ -218,7 +218,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-const APP_VERSION = "2.2.8";
+const APP_VERSION = "2.2.9";
 const RELEASES_URL = "https://api.github.com/repos/LuNexInc/basiliskos/releases?per_page=12";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
@@ -534,18 +534,31 @@ export default function App() {
     void (async () => {
       setBusy("complete-login");
       try {
-        const selected = await invoke<AccountSelectionResult>("select_gateway_account", {
-          fileName: login.resultFileName,
-        });
-        const next = selected.claudeRunning
-          ? selected
-          : await invoke<Snapshot>("launch_hydra_claude");
-        setSnapshot(next);
-        setProvider(login.provider);
         setPendingAuth(null);
         setAuthCopyFeedback(null);
-        setMessage("Account authorized and selected. The isolated Basiliskos Claude window is ready.");
-        setIsError(false);
+        const activeAccount = snapshot?.accounts.find((account) => account.active);
+        if (activeAccount) {
+          // Signing in or renewing a login must not disturb the active route.
+          // The credential is already committed; the user chooses when to
+          // switch with "Use account".
+          setProvider(login.provider);
+          setMessage(
+            "Account authorized. Choose Use account to route the Basiliskos window to it.",
+          );
+          setIsError(false);
+        } else {
+          // First account on this machine: make it active and open the window.
+          const selected = await invoke<AccountSelectionResult>("select_gateway_account", {
+            fileName: login.resultFileName,
+          });
+          const next = selected.claudeRunning
+            ? selected
+            : await invoke<Snapshot>("launch_hydra_claude");
+          setSnapshot(next);
+          setProvider(login.provider);
+          setMessage("Account authorized and selected. The isolated Basiliskos Claude window is ready.");
+          setIsError(false);
+        }
       } catch (error) {
         setMessage(messageFrom(error));
         setIsError(true);
@@ -981,12 +994,13 @@ export default function App() {
       setApiKeyPrompt(false);
       setApiKeyDraft("");
       setIsError(false);
-      // A newly added account is stored disabled, so adding alone would not
-      // change what Claude is talking to. Switch to it immediately through the
-      // normal selection path, which also restarts the Basiliskos Claude window
-      // when its configuration changes.
+      // A newly added account is stored disabled, so adding alone never
+      // changes what Claude is talking to. Only the first account on this
+      // machine is activated automatically; later accounts wait for an
+      // explicit "Use account" so adding a key never disturbs an active route.
       const account = added.accounts.find((item) => item.fileName === added.fileName);
-      if (account) {
+      const activeAccount = added.accounts.find((item) => item.active);
+      if (account && !activeAccount) {
         await selectAccount(account);
       } else {
         setMessage("DeepSeek API key saved. Select the account to route through it.");
