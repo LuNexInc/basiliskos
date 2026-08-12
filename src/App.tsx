@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -83,6 +83,7 @@ type Snapshot = {
   baseUrl: string;
   version: string;
   claudeRunning: boolean;
+  codexRunning: boolean;
   accounts: Account[];
   activeAccount?: string;
   routes: ProviderRoute[];
@@ -94,6 +95,7 @@ type Snapshot = {
   route: ComponentStatus;
   oauth: ComponentStatus;
   claude: ComponentStatus;
+  codex: ComponentStatus;
   backendExitReason?: string;
   activeRequests: number;
   diagnostics: DiagnosticEvent[];
@@ -226,7 +228,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-export const APP_VERSION = "2.3.4";
+export const APP_VERSION = "2.4.21";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },
@@ -335,6 +337,29 @@ function ClaudeCodeMark({ className }: { className?: string }) {
   );
 }
 
+/// The official Codex wordmark (zonalogo.com colored variant), inlined so the
+/// isolated Codex affordance carries the real brand. Each instance gets a
+/// unique gradient id so multiple buttons on one page never share a def.
+function CodexMark({ className }: { className?: string }) {
+  const uid = useId().replace(/[^a-zA-Z0-9]/g, "");
+  const grad = `codex-g-${uid}`;
+  return (
+    <svg className={className} viewBox="0 0 250 250" aria-hidden="true" focusable="false">
+      <defs>
+        <linearGradient id={grad} x2="1" gradientTransform="matrix(0,249.335,-249.128,0,125,.332)">
+          <stop stopColor="#b1a7ff" />
+          <stop offset=".5" stopColor="#7a9dff" />
+          <stop offset="1" stopColor="#3941ff" />
+        </linearGradient>
+      </defs>
+      <path
+        fill={`url(#${grad})`}
+        d="m84.3 5.1q3.7-1.5 7.7-2.6 3.9-1 7.9-1.6 4-0.5 8.1-0.6 4 0 8 0.5 20.7 2.4 37.1 17.7 0.1 0.1 0.4 0.3 0.1 0 0.2 0 0 0 0.2 0 0 0 0.1 0 0 0 0.1 0 5.2-1.4 10.7-1.9 5.4-0.4 10.7 0.1 5.5 0.4 10.7 1.9 5.2 1.3 10.1 3.6l0.6 0.4 1.6 0.8q5.2 2.5 9.7 6.1 4.7 3.4 8.6 7.7 3.8 4.3 6.9 9.2 3 4.8 5.2 10.2 4.3 10.5 4.3 22.1 0.2 2.1 0 4.2-0.1 2.2-0.2 4.3-0.3 2.1-0.7 4.3-0.4 2.1-0.9 4.1 0 0.2 0 0.4 0 0.2 0 0.5 0 0.1 0.1 0.4 0.1 0.1 0.3 0.3 12.3 12.6 16.3 30 6 29.7-12.2 53.5l-1.9 2.2q-3 3.5-6.5 6.4-3.4 3.1-7.3 5.5-3.8 2.4-8.1 4.2-4.1 1.9-8.5 3.2-0.3 0-0.4 0.2-0.3 0-0.4 0.1-0.1 0.1-0.3 0.4 0 0.1-0.1 0.3c-2.7 7.7-5.3 14.2-10.2 20.7-12.5 16.5-30.8 25.5-51.5 25.5q-24.6-0.1-43.6-18.1-0.2-0.1-0.4-0.2-0.2-0.1-0.4-0.1-0.2 0-0.3 0-0.3 0-0.4 0c-5.4 1.7-10.9 1.9-16.7 1.9q-3.5 0-7-0.5-3.4-0.4-6.9-1.2-3.3-0.8-6.6-2-3.3-1.2-6.4-2.8-3.3-1.6-6.4-3.6-3-2-5.8-4.3-3-2.3-5.5-5-2.5-2.6-4.6-5.6c-2.2-2.7-4.3-5.4-5.8-8.5q-0.8-1.6-1.6-3.2-0.6-1.7-1.3-3.3-0.7-1.7-1.2-3.4-0.5-1.6-1-3.4-1.1-4-1.6-7.9-0.6-4-0.6-8 0-4 0.6-8 0.4-4 1.4-8 0 0 0-0.1 0-0.1 0-0.1 0.2-0.2 0.2-0.3 0-0.1-0.2-0.1 0-0.2 0-0.3 0-0.1-0.1-0.1 0-0.2 0-0.2-0.1-0.1-0.1-0.1-2.4-2.5-4.6-5.2-2.1-2.7-4-5.4-1.7-3-3.2-6-1.5-3.1-2.6-6.3-0.8-2-1.3-4.1-0.7-2-1.1-4-0.4-2.1-0.7-4.2-0.2-2.2-0.4-4.3-0.2-2.8-0.1-5.6 0-2.8 0.3-5.4 0.1-2.8 0.6-5.6 0.4-2.8 1.1-5.5 7-23.1 26.9-36.3 4.3-2.9 8.2-4.5 4.5-1.9 9-3.2 0.2 0 0.3-0.1 0.1-0.2 0.3-0.3 0.1 0 0.1-0.3 0.1-0.1 0.1-0.2 1-3.1 2.2-6 1-2.9 2.5-5.7 1.5-3 3.2-5.6 1.7-2.7 3.7-5.1 2.5-3.2 5.3-5.9 3-2.8 6.1-5.4 3.2-2.4 6.8-4.4 3.5-2 7.2-3.5zm48.3 146.4c-2.3 0.1-4.4 1-6 2.8-1.5 1.6-2.4 3.7-2.4 5.9 0 2.3 0.9 4.4 2.4 6.2 1.6 1.6 3.7 2.5 6 2.6h50.4c2.4 0.1 4.8-0.6 6.5-2.4 1.7-1.6 2.8-4 2.8-6.4 0-2.4-1.1-4.7-2.8-6.3-1.7-1.8-4.1-2.6-6.5-2.4zm-56.7-64.9c-1.2-1.9-3-3.4-5.3-3.9-2.2-0.5-4.5-0.3-6.5 0.9-2 1.1-3.5 3-4.1 5.2-0.7 2.2-0.4 4.6 0.6 6.5l17.7 30.9-17.5 29.5c-1.2 2-1.6 4.5-1.1 6.8 0.7 2.3 2.1 4.1 4.1 5.3 2 1.2 4.4 1.6 6.7 0.9 2.2-0.5 4.2-1.9 5.4-3.9l20.1-34.1q0.7-0.9 0.9-2.1 0.3-1.1 0.3-2.3 0-1.2-0.3-2.2-0.2-1.2-0.8-2.2z"
+      />
+    </svg>
+  );
+}
+
 export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -366,7 +391,8 @@ export default function App() {
     open: boolean;
     account: Account | null;
     dontShowAgain: boolean;
-  }>({ open: false, account: null, dontShowAgain: false });
+    surface: "claude" | "codex";
+  }>({ open: false, account: null, dontShowAgain: false, surface: "claude" });
   const [pendingConfirm, setPendingConfirm] = useState<{ message: string; resolve: (value: boolean) => void } | null>(null);
 
   const confirmDialog = useCallback((message: string) => {
@@ -660,6 +686,34 @@ export default function App() {
     }
   }
 
+  /// "Use for Basiliskos Codex": select the account AND ensure the isolated
+  /// Codex window runs on it (relaunch if already open so the new route
+  /// applies). Mirrors `selectAccount` for the Codex surface.
+  async function useAccountForCodex(account: Account) {
+    const wasRunning = snapshot?.codexRunning === true;
+    setBusy(`codex-${account.fileName}`);
+    try {
+      const result = await invoke<AccountSelectionResult>("select_gateway_account", {
+        fileName: account.fileName,
+      });
+      let next: Snapshot = result;
+      if (wasRunning) {
+        await invoke<Snapshot>("stop_hydra_codex_app");
+        next = await invoke<Snapshot>("launch_hydra_codex_app");
+      } else if (!next.codexRunning) {
+        next = await invoke<Snapshot>("launch_hydra_codex_app");
+      }
+      setSnapshot(next);
+      setMessage(`${account.label} is now serving the separate Basiliskos Codex window`);
+      setIsError(false);
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function removeAccount(account: Account) {
     if (!(await confirmDialog(`Remove ${account.label} from Basiliskos?`))) return;
     setBusy(account.fileName);
@@ -863,16 +917,38 @@ export default function App() {
     }
   }
 
+  async function launchOpencode() {
+    setBusy("opencode");
+    try {
+      await invoke("launch_opencode");
+      setMessage("Opencode is opening — it uses the active Basiliskos route.");
+      setIsError(false);
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function requestAccountSelection(account: Account) {
     if (snapshot?.claudeRunning && !snapshot.skipModelSwitchConfirmation) {
-      setAccountSwitchConfirm({ open: true, account, dontShowAgain: false });
+      setAccountSwitchConfirm({ open: true, account, dontShowAgain: false, surface: "claude" });
       return;
     }
     void selectAccount(account);
   }
 
+  function requestCodexAccountSelection(account: Account) {
+    if (snapshot?.codexRunning && !snapshot.skipModelSwitchConfirmation) {
+      setAccountSwitchConfirm({ open: true, account, dontShowAgain: false, surface: "codex" });
+      return;
+    }
+    void useAccountForCodex(account);
+  }
+
   async function confirmAccountSwitch() {
-    const { account, dontShowAgain } = accountSwitchConfirm;
+    const { account, dontShowAgain, surface } = accountSwitchConfirm;
     setAccountSwitchConfirm((prev) => ({ ...prev, open: false }));
     if (!account) return;
     if (dontShowAgain) {
@@ -884,7 +960,11 @@ export default function App() {
         return;
       }
     }
-    void selectAccount(account);
+    if (surface === "codex") {
+      void useAccountForCodex(account);
+    } else {
+      void selectAccount(account);
+    }
   }
 
   function cancelAccountSwitch() {
@@ -1146,6 +1226,34 @@ export default function App() {
     }
   }
 
+  async function openBasiliskosCodex() {
+    setBusy("open-codex");
+    try {
+      setSnapshot(await invoke<Snapshot>("launch_hydra_codex_app"));
+      setMessage("Opened the separate Basiliskos Codex window. Your normal Codex app is untouched.");
+      setIsError(false);
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function closeBasiliskosCodex() {
+    setBusy("close-codex");
+    try {
+      setSnapshot(await invoke<Snapshot>("stop_hydra_codex_app"));
+      setMessage("Closed only the Basiliskos Codex window");
+      setIsError(false);
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function minimizeWindow() {
     await getCurrentWindow().minimize();
   }
@@ -1272,6 +1380,15 @@ export default function App() {
                 <span>Usage unrecorded</span>
               </div>
             )}
+          </div>
+          <div className="hero-service">
+            <span className="eyebrow">Opencode</span>
+            <h3>Basiliskos relay</h3>
+            <p>Go coding agent · inherits the active route</p>
+            <button className="secondary" onClick={() => void launchOpencode()} disabled={busy !== null}>
+              {busy === "opencode" ? <LoaderCircle className="spin" size={17} /> : <Terminal size={17} />}
+              Open Opencode
+            </button>
           </div>
         </div>
         <div className="hero-actions">
@@ -1477,6 +1594,21 @@ export default function App() {
                         </span>
                       </span>
                     </button>
+                    <button
+                      className={`icon-button serve-toggle codex ${account.active ? "active" : ""}`}
+                      aria-label={account.active ? `${account.label} is serving Basiliskos Codex` : `Serve Basiliskos Codex with ${account.label}`}
+                      onClick={() => requestCodexAccountSelection(account)}
+                      disabled={busy !== null || cooling > 0 || account.active}
+                    >
+                      <span className="serve-toggle-fill">
+                        <span className="serve-toggle-icon">
+                          {busy === `codex-${account.fileName}` ? <LoaderCircle className="spin" size={15} /> : <CodexMark className="codex-mark-icon" />}
+                        </span>
+                        <span className="serve-toggle-label">
+                          {account.active ? "Serving Basiliskos Codex" : cooling > 0 ? `Cooling down ${cooldownLabel(cooling)}` : "Use for Basiliskos Codex"}
+                        </span>
+                      </span>
+                    </button>
                     {account.provider === "codex" && (
                       <button
                         className={`icon-button serve-toggle cli ${account.email === activeIdentities?.codexCliEmail ? "active" : ""}`}
@@ -1590,6 +1722,7 @@ export default function App() {
             <p className="route-note">Changes apply to the next request from the Basiliskos Claude window. Thinking levels depend on the selected model.</p>
           </div>
           <div className="panel-foot claude-foot"><ShieldCheck size={16} /><div><strong>Basiliskos Claude window</strong> · <span className={snapshot?.claudeRunning ? "running-dot" : "stopped-dot"}>● {snapshot?.claude.state ?? "unknown"}</span><br />{snapshot?.claude.detail ?? "Waiting for controller status"}</div>{snapshot?.claudeRunning ? <button onClick={() => void closeBasiliskosClaude()} disabled={busy !== null}>Close window</button> : <button onClick={() => void openBasiliskosClaude()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}><AppWindow size={15} /> Open window</button>}</div>
+          <div className="panel-foot claude-foot"><AppWindow size={16} /><div><strong>Basiliskos Codex window</strong> · <span className={snapshot?.codexRunning ? "running-dot" : "stopped-dot"}>● {snapshot?.codex?.state ?? "unknown"}</span><br />{snapshot?.codex?.detail ?? "Waiting for controller status"}<br /><span className="route-note">Runs on {active ? `${active.label} · ${activeRoute?.selectedModelLabel ?? activeRoute?.selectedModel ?? "—"}` : "no account selected"} · effort {(activeRoute?.thinking ?? "auto") === "auto" ? "high" : (activeRoute?.thinking ?? "—")} — applied when the window opens; restart Codex after changing the route</span></div>{snapshot?.codexRunning ? <button onClick={() => void closeBasiliskosCodex()} disabled={busy !== null}>Close window</button> : <button onClick={() => void openBasiliskosCodex()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}><AppWindow size={15} /> Open window</button>}</div>
           <label className="settings-row">
             <input type="checkbox" checked={snapshot?.openClaudeOnLaunch !== false} onChange={(event) => void setOpenClaudeOnLaunch(event.target.checked)} disabled={busy !== null} />
             <span>Reopen the Basiliskos Claude window when Basiliskos starts</span>
@@ -1645,7 +1778,9 @@ export default function App() {
         <div className="modal-backdrop" role="presentation" onClick={cancelAccountSwitch}>
           <div className="modal" role="alertdialog" aria-modal="true" aria-labelledby="account-switch-title" onClick={(event) => event.stopPropagation()}>
             <h3 id="account-switch-title">Switch account?</h3>
-            <p>This will close and reopen the Basiliskos Claude window. Any in-progress request in that window will be interrupted.</p>
+            <p>{accountSwitchConfirm.surface === "codex"
+              ? "This will close and reopen the Basiliskos Codex window. Any in-progress request in that window will be interrupted."
+              : "This will close and reopen the Basiliskos Claude window. Any in-progress request in that window will be interrupted."}</p>
             <label className="modal-checkbox">
               <input
                 type="checkbox"

@@ -57,11 +57,6 @@ pub(crate) const CLAUDE_MODELS: &[ModelSpec] = &[
 
 pub(crate) const CODEX_MODELS: &[ModelSpec] = &[
     ModelSpec {
-        id: "gpt-5.5",
-        label: "GPT-5.5",
-        thinking_levels: &["low", "medium", "high", "xhigh"],
-    },
-    ModelSpec {
         id: "gpt-5.6-sol",
         label: "GPT-5.6 Sol",
         thinking_levels: &["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -76,57 +71,17 @@ pub(crate) const CODEX_MODELS: &[ModelSpec] = &[
         label: "GPT-5.6 Luna",
         thinking_levels: &["low", "medium", "high", "xhigh", "max"],
     },
-    ModelSpec {
-        id: "gpt-5.4",
-        label: "GPT-5.4",
-        thinking_levels: &["low", "medium", "high", "xhigh"],
-    },
-    ModelSpec {
-        id: "gpt-5.4-mini",
-        label: "GPT-5.4 Mini",
-        thinking_levels: &["low", "medium", "high", "xhigh"],
-    },
 ];
 
 pub(crate) const XAI_MODELS: &[ModelSpec] = &[
     ModelSpec {
-        id: "grok-build-0.1",
-        label: "Grok Build 0.1",
-        thinking_levels: &[],
+        id: "grok-4.6",
+        label: "Grok 4.6",
+        thinking_levels: &["low", "medium", "high"],
     },
     ModelSpec {
         id: "grok-4.5",
         label: "Grok 4.5",
-        thinking_levels: &["low", "medium", "high"],
-    },
-    ModelSpec {
-        id: "grok-4.3",
-        label: "Grok 4.3",
-        thinking_levels: &["none", "low", "medium", "high"],
-    },
-    ModelSpec {
-        id: "grok-4.20-0309-reasoning",
-        label: "Grok 4.20 Reasoning",
-        thinking_levels: &[],
-    },
-    ModelSpec {
-        id: "grok-4.20-0309-non-reasoning",
-        label: "Grok 4.20 Non-Reasoning",
-        thinking_levels: &[],
-    },
-    ModelSpec {
-        id: "grok-4.20-multi-agent-0309",
-        label: "Grok 4.20 Multi-Agent",
-        thinking_levels: &["low", "medium", "high"],
-    },
-    ModelSpec {
-        id: "grok-3-mini",
-        label: "Grok 3 Mini",
-        thinking_levels: &["low", "medium", "high"],
-    },
-    ModelSpec {
-        id: "grok-3-mini-fast",
-        label: "Grok 3 Mini Fast",
         thinking_levels: &["low", "medium", "high"],
     },
     ModelSpec {
@@ -209,8 +164,8 @@ pub(crate) fn model_specs(provider: &str) -> &'static [ModelSpec] {
 pub(crate) fn default_model(provider: &str) -> &'static str {
     match provider {
         "claude" => "claude-sonnet-4-5-20250929",
-        "codex" => "gpt-5.5",
-        "xai" => "grok-build-0.1",
+        "codex" => "gpt-5.6-terra",
+        "xai" => "grok-4.5",
         "kimi" => "kimi-k3",
         "deepseek" => "deepseek-v4-flash",
         _ => "",

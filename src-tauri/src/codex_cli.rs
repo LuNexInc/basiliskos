@@ -173,7 +173,7 @@ fn save_codex_cli_store(store: &CodexCliStore) -> Result<(), String> {
 /// verified against the real `codex` CLI (`codex login status` /
 /// `codex doctor`) during planning — this is a proven-correct translation,
 /// not a guess.
-fn translate_codex_cred(cliproxy: &Value) -> Result<Value, String> {
+pub(crate) fn translate_codex_cred(cliproxy: &Value) -> Result<Value, String> {
     let id_token = cliproxy
         .get("id_token")
         .and_then(Value::as_str)

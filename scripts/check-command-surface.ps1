@@ -21,6 +21,7 @@ $expected = @(
     'install_basiliskos_update'
     'latest_basiliskos_release'
     'launch_hydra_claude'
+    'launch_hydra_codex_app'
     'launch_provider_login'
     'open_diagnostics_folder'
     'prepare_basiliskos_update'
@@ -34,6 +35,7 @@ $expected = @(
     'start_gateway'
     'stop_gateway'
     'stop_hydra_claude'
+    'stop_hydra_codex_app'
 ) | Sort-Object -Unique
 
 $handler = [regex]::Match(

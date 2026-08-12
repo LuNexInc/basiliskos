@@ -23,12 +23,16 @@ use crate::diagnostics::{self, DiagnosticEvent, ErrorCode};
 
 use crate::catalog::{
     alias_to_picker_entry, context_budget_for_request, context_window_for_route, default_model,
-    default_routes, model_specs, picker_entries, ModelSpec, CLAUDE_MODELS, DEEPSEEK_MODELS,
-    SUPPORTED_PROVIDERS,
+    default_routes, model_specs, picker_entries, thinking_level_label, ModelSpec, CLAUDE_MODELS,
+    DEEPSEEK_MODELS, SUPPORTED_PROVIDERS,
 };
 use crate::claude_window::{
     claude_icon_path, enum_claude_hwnds_for_pid, log_icon_line, spawn_claude_icon_reapply,
     ClaudeIconKind,
+};
+use crate::codex_window::{
+    codex_icon_path, enum_codex_hwnds_for_pid, log_icon_line as codex_log_icon_line,
+    spawn_codex_icon_reapply, CodexIconKind,
 };
 use crate::usage::{
     parse_claude_usage, parse_codex_usage, parse_kimi_usage, parse_xai_usage, GatewayAccountUsage,
@@ -109,6 +113,13 @@ const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 const DEEPSEEK_COMPAT_NAME: &str = "basiliskos-deepseek";
 const MAX_DEEPSEEK_API_KEY_LEN: usize = 200;
 
+/// The relay codex account that anchors the isolated Basiliskos Codex window's
+/// login. It is EXCLUDED from the relay's automatic refresh (one-refresher
+/// rule — the isolated app owns it), so the normal app's or the relay's
+/// refreshes can never rotate away the seeded credential. The account must be
+/// one the user's normal Codex app does NOT use.
+const CODEX_ANCHOR_FILE_NAME: &str = "codex-charles.3ready@gmail.com.json";
+
 #[derive(Default)]
 struct WorkerTracker {
     active: Mutex<usize>,
@@ -172,6 +183,12 @@ struct ControllerRuntime {
     claude_root_pid: Option<u32>,
     claude_executable: Option<PathBuf>,
     claude_profile: Option<PathBuf>,
+    codex_child: Option<Child>,
+    #[cfg(target_os = "windows")]
+    codex_job: Option<usize>,
+    codex_root_pid: Option<u32>,
+    codex_executable: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
     front_proxy: Option<FrontProxy>,
     backend_exit_reason: Option<String>,
     backend_restart_attempts: u32,
@@ -371,6 +388,7 @@ pub struct GatewaySnapshot {
     pub base_url: String,
     pub version: String,
     pub claude_running: bool,
+    pub codex_running: bool,
     pub accounts: Vec<GatewayAccount>,
     pub active_account: Option<String>,
     pub routes: Vec<ProviderRoute>,
@@ -385,6 +403,7 @@ pub struct GatewaySnapshot {
     pub route: ComponentStatus,
     pub oauth: ComponentStatus,
     pub claude: ComponentStatus,
+    pub codex: ComponentStatus,
     pub backend_exit_reason: Option<String>,
     pub active_requests: usize,
     pub diagnostics: Vec<DiagnosticEvent>,
@@ -1116,6 +1135,13 @@ fn save_state(state: &ControllerState) -> Result<(), String> {
     durable_write(&controller_path()?, &bytes)
 }
 
+/// The relay's own API key (the `hydra-...` credential clients use to
+/// authenticate against the front proxy). Shared by client integrations that
+/// point third-party tools at `127.0.0.1:8317/v1`.
+pub(crate) fn relay_api_key() -> Result<String, String> {
+    Ok(load_state()?.api_key)
+}
+
 fn load_account_labels() -> Result<BTreeMap<String, String>, String> {
     let path = account_labels_path()?;
     if !path.exists() && !crate::persistence::backup_path(&path)?.exists() {
@@ -1217,6 +1243,42 @@ pub(crate) fn yaml_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "/").replace('"', "\\\""))
 }
 
+fn runtime_plugins_dir() -> Result<PathBuf, String> {
+    Ok(gateway_dir()?.join("plugins"))
+}
+
+/// Installs the bundled Codex compaction plugin next to the gateway runtime so
+/// CLIProxyAPI can load it (remote-compaction-v2 for routed models).
+fn prepare_codex_compaction_plugin(app: &AppHandle) -> Result<(), String> {
+    let dir = runtime_plugins_dir()?;
+    secure_create_dir_all(&dir)?;
+    let destination = dir.join("basiliskos-codex-compaction.dll");
+    if destination.exists() {
+        // Simple size sanity; the plugin is not a security boundary.
+        if fs::metadata(&destination).map(|m| m.len()).unwrap_or(0) > 100_000 {
+            return Ok(());
+        }
+    }
+    let mut candidates = Vec::new();
+    if let Ok(resource) = app.path().resource_dir() {
+        candidates.push(resource.join("resources/gateway/plugins/basiliskos-codex-compaction.dll"));
+        candidates.push(resource.join("gateway/plugins/basiliskos-codex-compaction.dll"));
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/gateway/plugins/basiliskos-codex-compaction.dll"),
+    );
+    let source = candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| "The bundled Codex compaction plugin is missing.".to_string())?;
+    let bytes = fs::read(&source)
+        .map_err(|error| format!("Could not read the bundled Codex compaction plugin: {error}"))?;
+    durable_write(&destination, &bytes)
+        .map_err(|error| format!("Could not install the Codex compaction plugin: {error}"))?;
+    Ok(())
+}
+
 fn active_provider_from_auth(auth: &Path, state: &ControllerState) -> Option<String> {
     let file_name = state.active_account.as_deref()?;
     let raw = fs::read_to_string(auth.join(file_name)).ok()?;
@@ -1252,16 +1314,34 @@ fn active_deepseek_api_key(auth: &Path, state: &ControllerState) -> Option<Strin
 ///
 /// The key belongs under `api-key-entries`; `api-keys` parses without error but
 /// yields zero loaded clients (verified against the pinned 7.2.128 runtime).
+///
+/// Only DeepSeek model ids are registered as aliases. Other providers' models
+/// (grok-4.x, gpt-5.6-*, kimi-k*) route through CLIProxyAPI's native provider
+/// catalog instead, so the isolated Codex window's model switcher is real: the
+/// picked model runs its own provider (credentials permitting) instead of
+/// being hijacked to the active route.
 fn deepseek_compat_block(auth: &Path, state: &ControllerState) -> String {
     let Some(api_key) = active_deepseek_api_key(auth, state) else {
         return String::new();
     };
-    let models = DEEPSEEK_MODELS
+    let route_model = state
+        .routes
+        .get("deepseek")
+        .map(|route| route.model.clone())
+        .unwrap_or_else(|| default_model("deepseek").to_string());
+    let mut aliases: Vec<&str> = Vec::new();
+    for spec in DEEPSEEK_MODELS {
+        if !aliases.contains(&spec.id) {
+            aliases.push(spec.id);
+        }
+    }
+    let models = aliases
         .iter()
-        .map(|spec| {
+        .map(|alias| {
             format!(
-                "      - name: {name}\n        alias: {name}\n",
-                name = yaml_quote(spec.id)
+                "      - name: {name}\n        alias: {alias}\n",
+                name = yaml_quote(&route_model),
+                alias = yaml_quote(alias)
             )
         })
         .collect::<String>();
@@ -1315,12 +1395,21 @@ streaming:
   keepalive-seconds: 15
   bootstrap-retries: 0
 plugins:
-  enabled: false
+  enabled: true
+  dir: "~/.hydra-gateway/gateway/plugins"
+  configs:
+    basiliskos-codex-compaction:
+      enabled: true
 # Explicit: upstream default since v7.2.128; keeps it fixed even if the
 # upstream default flips. Prevents native x_search injection into Grok
 # requests (issue #4339) regardless of client tool declarations.
 xai:
   inject-x-search: false
+# The Codex Desktop app encrypts Responses request bodies; this switch makes
+# CLIProxyAPI remove the message-parameter encryption and normalize the
+# requests for upstream providers (verified 7.2.128 behavior).
+codex:
+  optimize-multi-agent-v2: true
 {deepseek}"#,
         auth_dir = yaml_quote(&auth.to_string_lossy()),
         api_key = yaml_quote(&state.api_key),
@@ -1733,15 +1822,34 @@ pub(crate) fn secure_eq(left: &str, right: &str) -> bool {
 }
 
 fn request_is_authorized(request: &tiny_http::Request, api_key: &str) -> bool {
+    let anchor_token = anchor_codex_access_token();
     request.headers().iter().any(|header| {
         let name = header.field.as_str().as_str();
         let value = header.value.as_str().trim();
         (name.eq_ignore_ascii_case("x-api-key") && secure_eq(value, api_key))
             || (name.eq_ignore_ascii_case("authorization")
-                && value
-                    .strip_prefix("Bearer ")
-                    .is_some_and(|token| secure_eq(token, api_key)))
+                && value.strip_prefix("Bearer ").is_some_and(|token| {
+                    secure_eq(token, api_key)
+                        || anchor_token
+                            .as_ref()
+                            .is_some_and(|anchor| secure_eq(token, anchor))
+                }))
     })
+}
+
+/// The isolated Codex window authenticates to the relay with its anchored
+/// ChatGPT access token (the bearer the app sends for the built-in openai
+/// provider redirected via `openai_base_url`). Accept it alongside the
+/// Basiliskos key so the app's requests pass the listener gate. Read per check;
+/// the file is local and tiny.
+fn anchor_codex_access_token() -> Option<String> {
+    let auth = auth_dir().ok()?;
+    let raw = fs::read_to_string(auth.join(CODEX_ANCHOR_FILE_NAME)).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn request_headers_within_budget(request: &tiny_http::Request) -> bool {
@@ -2070,7 +2178,7 @@ fn handle_front_proxy_request(
     mut request: tiny_http::Request,
     client: &reqwest::Client,
     async_runtime: &tokio::runtime::Handle,
-    _api_key: &str,
+    api_key: &str,
     correlation_id: &str,
 ) {
     let request_url = request.url().to_string();
@@ -2078,6 +2186,35 @@ fn handle_front_proxy_request(
         .split('?')
         .next()
         .unwrap_or(request_url.as_str());
+
+    // Codex Desktop prefers the Responses WebSocket transport. The Basiliskos
+    // relay is HTTP/SSE only, so a WebSocket upgrade would hang forever in
+    // retries. Return 426 Upgrade Required so the client falls back to
+    // HTTP/SSE — the same signal opencodex uses for the Codex app.
+    let is_websocket_upgrade = request.method() == &tiny_http::Method::Get
+        && request.headers().iter().any(|header| {
+            header
+                .field
+                .as_str()
+                .as_str()
+                .eq_ignore_ascii_case("upgrade")
+                && header.value.as_str().eq_ignore_ascii_case("websocket")
+        });
+    if is_websocket_upgrade && request_path.starts_with("/v1/responses") {
+        diagnostics::record(
+            ErrorCode::RequestInvalid,
+            "info",
+            "Codex WebSocket upgrade refused (426); client falls back to HTTP/SSE.",
+            Some(correlation_id),
+            Some(426),
+            None,
+        );
+        let _ = request.respond(
+            tiny_http::Response::from_string("Upgrade Required - use HTTP/SSE".to_string())
+                .with_status_code(tiny_http::StatusCode(426)),
+        );
+        return;
+    }
     let method = match reqwest::Method::from_bytes(request.method().as_str().as_bytes()) {
         Ok(method) => method,
         Err(error) => {
@@ -2215,6 +2352,7 @@ fn handle_front_proxy_request(
                     // Regenerate the Claude config so the picker follows the
                     // new selected model's thinking variants.
                     let _ = write_isolated_claude_config(&isolated_claude_profile_dir()?, &state);
+                    let _ = write_isolated_codex_config(&isolated_codex_home()?, &state);
                 }
             }
             rewrite_claude_request(&mut json, &state, &provider, request_path == "/v1/messages")?;
@@ -2236,13 +2374,98 @@ fn handle_front_proxy_request(
         }
     }
 
+    // Codex dial: the isolated Codex window talks to the built-in `openai`
+    // provider redirected at this relay (`openai_base_url`). Enforce the active
+    // Basiliskos route by rewriting the request model to the active route's
+    // real upstream id (the renderer allowlist only offers native OpenAI slugs,
+    // which cannot map to upstreams directly), and mark the request so its
+    // bearer is normalized to the Basiliskos key for the backend.
+    let mut codex_dial = false;
+    if request_path == "/v1/responses" {
+        let content_type = request
+            .headers()
+            .iter()
+            .find(|h| {
+                h.field
+                    .as_str()
+                    .as_str()
+                    .eq_ignore_ascii_case("content-type")
+            })
+            .map(|h| h.value.as_str().to_string())
+            .unwrap_or_else(|| "none".into());
+        let body_head: String = body
+            .iter()
+            .take(160)
+            .map(|b| *b as char)
+            .collect::<String>()
+            .replace('\n', " ");
+        // The Codex Desktop app ENCRYPTS Responses request bodies; CLIProxyAPI
+        // decrypts them (codex.optimize-multi-agent-v2). The dial is a real
+        // model switcher: the picked model id routes to its own provider via
+        // CLIProxyAPI's catalog (the deepseek compat block only aliases
+        // deepseek ids), so no model override happens here. The provider is
+        // resolved only for diagnostics and the dial log.
+        let rewrite_result = (|| -> Result<(), String> {
+            let _mutation = mutation_lock()?;
+            let state = load_state()?;
+            let provider = active_provider_from_auth(&auth_dir()?, &state)
+                .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
+            provider_for_event = Some(provider.clone());
+            active_account_for_event = state.active_account.clone();
+            Ok(())
+        })();
+        if let Err(message) = rewrite_result {
+            let line = format!(
+                "{} | method={} ctype={} body_len={} body_head={} | {message}",
+                chrono::Utc::now().to_rfc3339(),
+                request.method().as_str(),
+                content_type,
+                body.len(),
+                body_head
+            );
+            append_codex_dial_log(&line);
+            diagnostics::record(
+                ErrorCode::RequestInvalid,
+                "warning",
+                &format!("Codex dial rewrite failed: {message}"),
+                Some(correlation_id),
+                Some(400),
+                None,
+            );
+            respond_proxy_error(
+                request,
+                ErrorCode::RequestInvalid,
+                400,
+                "The Codex request could not be rewritten to the active Basiliskos route.",
+                correlation_id,
+            );
+            return;
+        }
+        append_codex_dial_log(&format!(
+            "{} | method={} ctype={} body_len={} body_head={} | OK",
+            chrono::Utc::now().to_rfc3339(),
+            request.method().as_str(),
+            content_type,
+            body.len(),
+            body_head
+        ));
+        codex_dial = true;
+    }
+
     let upstream_url = format!("http://127.0.0.1:{BACKEND_PORT}{request_url}");
     let mut upstream_headers = Vec::new();
     for header in request.headers() {
         let name = header.field.as_str().as_str();
-        if !is_hop_by_hop_header(name) {
-            upstream_headers.push((name.to_owned(), header.value.as_str().to_owned()));
+        if is_hop_by_hop_header(name) {
+            continue;
         }
+        if codex_dial && name.eq_ignore_ascii_case("authorization") {
+            // The isolated Codex window authenticates with its anchored ChatGPT
+            // bearer; the backend validates the Basiliskos key. Normalize it.
+            upstream_headers.push(("authorization".to_owned(), format!("Bearer {api_key}")));
+            continue;
+        }
+        upstream_headers.push((name.to_owned(), header.value.as_str().to_owned()));
     }
     if let Some(budget) = context_budget {
         let input_tokens = match upstream_input_token_count(
@@ -2388,19 +2611,38 @@ fn handle_front_proxy_request(
             headers.push(header);
         }
     }
-    let response = Response::new(
-        status,
-        headers,
-        TrackedUpstream {
+    let response_body: Box<dyn Read + Send> = {
+        let mut tracked = TrackedUpstream {
             receiver: upstream.body,
             current: None,
             offset: 0,
             correlation_id: correlation_id.to_owned(),
-            provider: provider_for_event,
-        },
-        None,
-        None,
-    );
+            provider: provider_for_event.clone(),
+        };
+        if upstream_status >= 400 && provider_is_text_only(provider_for_event.as_deref()) {
+            // Error bodies are small and non-streaming. Buffer the rejection so
+            // a text-only route's image error can be rephrased; every other
+            // body passes through byte-for-byte.
+            let mut bytes = Vec::new();
+            let read_ok = tracked
+                .by_ref()
+                .take((MAX_RELAY_ERROR_BODY_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .is_ok();
+            if read_ok && bytes.len() <= MAX_RELAY_ERROR_BODY_BYTES {
+                if let Some(rephrased) = rephrase_text_only_image_error(&bytes) {
+                    Box::new(std::io::Cursor::new(rephrased))
+                } else {
+                    Box::new(std::io::Cursor::new(bytes))
+                }
+            } else {
+                Box::new(tracked)
+            }
+        } else {
+            Box::new(tracked)
+        }
+    };
+    let response = Response::new(status, headers, response_body, None, None);
     if request.respond(response).is_err() {
         diagnostics::record(
             ErrorCode::ClientCancelled,
@@ -2411,6 +2653,48 @@ fn handle_front_proxy_request(
             None,
         );
     }
+}
+
+/// The DeepSeek backend schema is text-only for message content. When a routed
+/// client sends an image, the upstream rejects the whole request with a serde
+/// error that names neither the provider nor the cause. The isolated Codex
+/// window encrypts request bodies, so the relay cannot strip the image before
+/// the upstream sees it; rephrase that exact rejection into an actionable
+/// message instead of leaking the raw deserialization error.
+const TEXT_ONLY_IMAGE_REJECTION_MARKER: &str = "unknown variant `image_url`";
+const MAX_RELAY_ERROR_BODY_BYTES: usize = 1024 * 1024;
+
+/// True for providers whose upstream message schema cannot carry images at
+/// all (DeepSeek today). The /v1/messages path protects these routes with the
+/// vision lane and the placeholder fixup; the encrypted Codex dial cannot be
+/// protected pre-flight, so its rejection is rephrased instead.
+fn provider_is_text_only(provider: Option<&str>) -> bool {
+    matches!(provider, Some("deepseek"))
+}
+
+/// Rewrites the exact DeepSeek text-only image rejection into a Basiliskos
+/// message that tells the user what happened and how to send images. Returns
+/// None (pass-through) for every other body, including streamed or otherwise
+/// framed responses.
+fn rephrase_text_only_image_error(body: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    if !text.contains(TEXT_ONLY_IMAGE_REJECTION_MARKER) {
+        return None;
+    }
+    if !text.trim_start().starts_with('{') {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "error": {
+                "message": "The active Basiliskos route (DeepSeek) is text-only and cannot read images. The isolated Codex window sends images in an encrypted form the relay cannot inspect, so the upstream rejected this request. Switch the active route to a vision-capable provider (Codex, Grok, Kimi, or Claude) to send images.",
+                "type": "invalid_request_error",
+                "code": "bas_text_only_image"
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
 }
 
 fn start_front_proxy(app: AppHandle, api_key: String) -> Result<FrontProxy, String> {
@@ -2663,6 +2947,17 @@ fn spawn_backend_process(
     append_logs: bool,
 ) -> Result<(Child, Option<usize>), String> {
     let executable = prepare_runtime(app)?;
+    // The Codex compaction plugin lives next to the gateway so CPA can load it.
+    if let Err(error) = prepare_codex_compaction_plugin(app) {
+        diagnostics::record(
+            ErrorCode::ConfigTransactionFailed,
+            "warning",
+            &format!("Codex compaction plugin not installed: {error}"),
+            None,
+            None,
+            None,
+        );
+    }
     let log_dir = gateway_dir()?.join("controller-logs");
     secure_create_dir_all(&log_dir)?;
     let stdout_path = log_dir.join("gateway.stdout.log");
@@ -2969,8 +3264,107 @@ fn stop_hydra_claude_runtime() {
     }
 }
 
+fn request_codex_window_close(pid: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+    for window in enum_codex_hwnds_for_pid(pid) {
+        unsafe {
+            let _ = PostMessageW(
+                window.hwnd as windows_sys::Win32::Foundation::HWND,
+                WM_CLOSE,
+                0,
+                0,
+            );
+        }
+    }
+}
+
+fn stop_hydra_codex_runtime() {
+    let (child, job, pid, executable, home) = match runtime_lock() {
+        Ok(mut runtime) => {
+            let child = runtime.codex_child.take();
+            #[cfg(target_os = "windows")]
+            let job = runtime.codex_job.take();
+            #[cfg(not(target_os = "windows"))]
+            let job = None;
+            (
+                child,
+                job,
+                runtime.codex_root_pid.take(),
+                runtime.codex_executable.take(),
+                runtime.codex_home.take(),
+            )
+        }
+        Err(_) => return,
+    };
+    #[cfg(target_os = "windows")]
+    {
+        if let (Some(pid), Some(executable), Some(home)) = (pid, executable, home) {
+            // Only the PID created from the verified Store executable with the
+            // isolated home is asked to close. The job object below is the
+            // ownership boundary for any descendants; the user's normal Codex
+            // app is never enumerated by name or terminated.
+            if executable.is_file() && home == isolated_codex_home().unwrap_or_default() {
+                request_codex_window_close(pid);
+            }
+        }
+        if let Some(job) = job {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while job_has_active_processes(job) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(100));
+            }
+            if job_has_active_processes(job) {
+                terminate_owned_job(job);
+            }
+            close_gateway_job(Some(job));
+        }
+    }
+    if let Some(mut child) = child {
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
+fn hydra_codex_running() -> bool {
+    let Ok(mut runtime) = runtime_lock() else {
+        return false;
+    };
+    #[cfg(target_os = "windows")]
+    if let Some(job) = runtime.codex_job {
+        if job_has_active_processes(job) {
+            return true;
+        }
+        close_gateway_job(runtime.codex_job.take());
+        runtime.codex_child.take().map(|mut child| child.wait());
+        runtime.codex_root_pid = None;
+        runtime.codex_executable = None;
+        runtime.codex_home = None;
+        diagnostics::record(
+            ErrorCode::CodexExited,
+            "info",
+            "The isolated Basiliskos Codex process tree exited.",
+            None,
+            None,
+            None,
+        );
+        return false;
+    }
+    let Some(child) = runtime.codex_child.as_mut() else {
+        return false;
+    };
+    match child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(_)) | Err(_) => {
+            runtime.codex_child = None;
+            false
+        }
+    }
+}
+
 fn stop_gateway_runtime() {
     stop_hydra_claude_runtime();
+    stop_hydra_codex_runtime();
     let (proxy, child, job) = match runtime_lock() {
         Ok(mut runtime) => {
             runtime.phase = GatewayPhase::Stopping;
@@ -3347,29 +3741,22 @@ fn deepseek_vision_templates() -> &'static [DeepseekVisionTemplate] {
 fn vision_model_supported(provider: &str, model: &str) -> bool {
     match provider {
         // Confirmed by the pinned CLIProxyAPI Codex model catalog.
-        "codex" => matches!(
-            model,
-            "gpt-5.6-sol"
-                | "gpt-5.6-terra"
-                | "gpt-5.6-luna"
-                | "gpt-5.5"
-                | "gpt-5.4"
-                | "gpt-5.4-mini"
-        ),
+        "codex" => matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"),
         // K3 is the currently verified Kimi OAuth multimodal route.
         "kimi" => model == "kimi-k3",
         // Claude's supported model catalog is multimodal; the credential is
         // still optional and is discovered at runtime.
         "claude" => CLAUDE_MODELS.iter().any(|spec| spec.id == model),
-        // Grok 4.5 is the known image-capable xAI OAuth route in this catalog.
-        "xai" => matches!(model, "grok-4.5" | "grok-4.3"),
+        // Grok 4.5/4.6 are the known image-capable xAI OAuth routes in this catalog.
+        "xai" => matches!(model, "grok-4.5" | "grok-4.6"),
         _ => false,
     }
 }
 
 fn vision_credential_available(account: &GatewayAccount) -> bool {
-    // `disabled` belongs to the primary single-account relay invariant. It
-    // must not hide a saved OAuth credential from the independent vision lane.
+    // `disabled` marks the account as not the last-selected one of its
+    // provider. It must not hide a saved OAuth credential from the
+    // independent vision lane.
     !matches!(
         account.credential_status.as_str(),
         "expired" | "relogin_required"
@@ -3403,7 +3790,7 @@ pub(crate) fn deepseek_vision_plan(accounts: &[GatewayAccount]) -> DeepseekVisio
         for account in provider_accounts {
             let available = vision_credential_available(account);
             let detail = if available && account.disabled {
-                "OAuth credential is present; it is disabled only for the primary relay account selector.".into()
+                "OAuth credential is present; it is simply not the last-selected account of its provider.".into()
             } else if available {
                 "OAuth credential is present and eligible for the vision lane.".into()
             } else {
@@ -3442,6 +3829,10 @@ fn shared_claude_library_dir() -> Result<PathBuf, String> {
 
 pub(crate) fn isolated_claude_profile_dir() -> Result<PathBuf, String> {
     Ok(root_dir()?.join("claude-profile"))
+}
+
+pub(crate) fn isolated_codex_home() -> Result<PathBuf, String> {
+    Ok(root_dir()?.join("codex-profile"))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3804,6 +4195,7 @@ fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
         .collect::<Vec<_>>();
     let running = gateway_running();
     let claude_running = hydra_claude_running();
+    let codex_running = hydra_codex_running();
     let (phase, relay_present, backend_exit_reason, active_requests, login, auto_failover) = {
         let runtime = runtime_lock()?;
         let active_requests = runtime
@@ -3844,6 +4236,7 @@ fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
         base_url: format!("http://127.0.0.1:{GATEWAY_PORT}"),
         version: GATEWAY_VERSION.into(),
         claude_running,
+        codex_running,
         accounts,
         active_account: state.active_account,
         routes,
@@ -3896,7 +4289,7 @@ fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
                 "waiting"
             }
             .into(),
-            detail: route_detail,
+            detail: route_detail.clone(),
         },
         oauth: ComponentStatus {
             state: login
@@ -3914,6 +4307,17 @@ fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
                 "The isolated Basiliskos Claude process is running".into()
             } else {
                 "The isolated Basiliskos Claude process is stopped".into()
+            },
+        },
+        codex: ComponentStatus {
+            state: if codex_running { "running" } else { "stopped" }.into(),
+            detail: if codex_running {
+                format!(
+                    "The isolated Basiliskos Codex is running on {}",
+                    route_detail.clone()
+                )
+            } else {
+                "The isolated Basiliskos Codex process is stopped".into()
             },
         },
         backend_exit_reason,
@@ -4726,6 +5130,12 @@ async fn maintain_saved_oauth_credentials_once() {
             continue;
         };
         for name in names {
+            // One-refresher rule: the isolated Codex window owns the anchor
+            // account's credential. The relay must not auto-refresh it, or the
+            // rotation would invalidate the seeded login every maintenance cycle.
+            if provider == "codex" && name == CODEX_ANCHOR_FILE_NAME {
+                continue;
+            }
             let result = match provider {
                 "codex" => refresh_codex_credential(&name, false).await,
                 "claude" => refresh_claude_credential(&name, false).await,
@@ -4952,25 +5362,43 @@ fn validate_account_invariant(directory: &Path, state_path: &Path) -> Result<(),
             enabled.push(file_name);
         }
     }
-    match state.active_account.as_deref() {
-        Some(active) => {
-            if !supported.iter().any(|file| file == active) {
-                return Err("The selected account disappeared during the transaction".into());
-            }
-            if enabled.len() != 1 || enabled[0] != active {
-                return Err(format!(
-                    "Account transaction invariant failed: expected only {active} enabled, found {}",
-                    enabled.join(", ")
-                ));
-            }
+    if let Some(active) = state.active_account.as_deref() {
+        if !supported.iter().any(|file| file == active) {
+            return Err("The selected account disappeared during the transaction".into());
         }
-        None if !enabled.is_empty() => {
+        if !enabled.iter().any(|file| file == active) {
             return Err(format!(
-                "Account transaction invariant failed: no account is selected but these are enabled: {}",
+                "Account transaction invariant failed: the selected account {active} is not enabled (enabled: {})",
                 enabled.join(", ")
             ));
         }
-        None => {}
+    }
+    // The relay keeps at most one enabled account per provider. The selected
+    // (active) account drives the Claude path, while the other providers' last-
+    // selected accounts stay enabled so the isolated Codex window can route a
+    // picked model to its real provider. Two enabled accounts of the SAME
+    // provider would make CLIProxyAPI's credential selection ambiguous.
+    let mut seen_provider = std::collections::BTreeSet::new();
+    let enabled_list = enabled.join(", ");
+    for file_name in &enabled {
+        let provider = account_provider(
+            &serde_json::from_slice::<Value>(&fs::read(directory.join(file_name)).map_err(
+                |error| {
+                    format!(
+                        "Could not re-read {}: {error}",
+                        directory.join(file_name).display()
+                    )
+                },
+            )?)
+            .map_err(|error| format!("Account {} failed re-validation: {error}", file_name))?,
+            file_name,
+        );
+        let Some(provider) = provider else { continue };
+        if !seen_provider.insert(provider.to_string()) {
+            return Err(format!(
+                "Account transaction invariant failed: more than one enabled account for provider {provider}: {enabled_list}"
+            ));
+        }
     }
     Ok(())
 }
@@ -4983,22 +5411,30 @@ fn selection_transaction(
     state: &ControllerState,
     file_name: &str,
 ) -> Result<(Vec<FileMutation>, ControllerState), String> {
-    let mut mutations = Vec::with_capacity(accounts.len() + 1);
-    for account in accounts
+    let selected_provider = accounts
         .iter()
-        .filter(|account| account.file_name != file_name)
-        .chain(
-            accounts
-                .iter()
-                .filter(|account| account.file_name == file_name),
-        )
-    {
-        let path = directory.join(&account.file_name);
+        .find(|account| account.file_name == file_name)
+        .map(|account| account.provider.as_str());
+    let mut mutations = Vec::with_capacity(accounts.len() + 1);
+    for account in accounts {
+        let selected = account.file_name == file_name;
+        // The selected account becomes enabled; other accounts of the same
+        // provider are disabled so CLIProxyAPI's per-provider credential
+        // selection stays unambiguous. Accounts of OTHER providers keep their
+        // current state: the isolated Codex window routes picked models to any
+        // provider whose credential is enabled.
+        let disabled = if selected {
+            false
+        } else if selected_provider == Some(account.provider.as_str()) {
+            true
+        } else {
+            account.disabled
+        };
         mutations.push(FileMutation {
-            path,
+            path: directory.join(&account.file_name),
             after: Some(account_bytes_with_disabled(
                 &directory.join(&account.file_name),
-                account.file_name != file_name,
+                disabled,
             )?),
         });
     }
@@ -5048,7 +5484,7 @@ struct AccountPaths<'a> {
 
 fn removal_transaction(
     paths: AccountPaths<'_>,
-    accounts: &[GatewayAccount],
+    _accounts: &[GatewayAccount],
     state: &ControllerState,
     labels: &BTreeMap<String, String>,
     file_name: &str,
@@ -5058,17 +5494,9 @@ fn removal_transaction(
         path: paths.directory.join(file_name),
         after: None,
     }];
-    if removing_active {
-        for account in accounts {
-            if account.file_name != file_name {
-                let account_path = paths.directory.join(&account.file_name);
-                mutations.push(FileMutation {
-                    after: Some(account_bytes_with_disabled(&account_path, true)?),
-                    path: account_path,
-                });
-            }
-        }
-    }
+    // Other providers' accounts stay enabled: the isolated Codex window may
+    // still route picked models to them. Only the removed file and the state
+    // change here.
     let mut next_labels = labels.clone();
     if next_labels.remove(file_name).is_some() {
         mutations.push(FileMutation {
@@ -5185,6 +5613,9 @@ fn attempt_same_provider_failover(rate_limited_account: &str, provider: &str) {
     if let Ok(profile) = isolated_claude_profile_dir() {
         let _ = write_isolated_claude_config(&profile, &new_state);
     }
+    if let Ok(home) = isolated_codex_home() {
+        let _ = write_isolated_codex_config(&home, &new_state);
+    }
     refresh_model_catalog_cache(provider, &new_state.api_key);
     diagnostics::record(
         ErrorCode::AccountAutoFailover,
@@ -5243,6 +5674,9 @@ pub async fn select_gateway_account(
     }
     let claude_config_changed =
         write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
+    // Keep the isolated Codex window's model honest: it follows the active
+    // route, so an account switch must refresh the dial's config.toml too.
+    let _ = write_isolated_codex_config(&isolated_codex_home()?, &state);
     if let Some(newly_active_provider) = accounts
         .iter()
         .find(|account| account.file_name == file_name)
@@ -5314,6 +5748,7 @@ pub fn set_gateway_route(
     prepare_config()?;
     if account_is_active {
         write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
+        let _ = write_isolated_codex_config(&isolated_codex_home()?, &state);
     }
     Ok(RouteUpdateResult {
         snapshot: gateway_snapshot_locked()?,
@@ -5477,7 +5912,7 @@ async fn verify_deepseek_api_key(api_key: &str) -> Result<(), String> {
 /// credential is a normal auth-dir JSON file, which keeps rename / disable /
 /// remove / activate working unchanged.
 ///
-/// The account is stored disabled (the single-enabled-account invariant), so the
+/// The account is stored disabled (one enabled account per provider), so the
 /// returned `fileName` lets the caller activate it right away through
 /// `select_gateway_account`.
 #[tauri::command]
@@ -6399,6 +6834,160 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
     .map(|()| true)
 }
 
+/// Renders the isolated Codex `config.toml` body: only the Basiliskos relay as
+/// provider, over the OpenAI Responses wire API. Pure so tests can assert the
+/// golden shape without touching any real state.
+fn codex_config_toml(model: &str, thinking: &str, port: u16, catalog_path: &str) -> String {
+    let thinking = if thinking == "auto" { "high" } else { thinking };
+    format!(
+        r#"# Generated by Basiliskos for the isolated Codex client only.
+# Global ~/.codex is not modified.
+model = "{model}"
+model_reasoning_effort = "{thinking}"
+# Stream the model's reasoning live instead of a post-hoc summary.
+model_reasoning_summary = "detailed"
+# Routed models cannot serve Codex's compaction protocol (DeepSeek's response
+# shape does not match compaction v2), so disable automatic compaction.
+model_auto_compact_token_limit = 9000000000000
+model_catalog_json = "{catalog_path}"
+# Auto-injected by Basiliskos: point the built-in OpenAI provider at the relay.
+openai_base_url = "http://127.0.0.1:{port}/v1"
+"#,
+        model = model.replace('"', ""),
+        thinking = thinking.replace('"', ""),
+        port = port,
+        catalog_path = catalog_path.replace('\\', "/"),
+    )
+}
+
+/// Builds the `ModelsResponse` catalog for the isolated Codex picker: one
+/// `ModelInfo` per Basiliskos route model, slug = the real upstream model id so
+/// CLIProxyAPI routes the chosen model to the right credential. The system
+/// prompt is a neutral Basiliskos-authored agent prompt (the openai/codex
+/// prompt made routed models falsely claim to be OpenAI's Codex).
+fn codex_catalog_models() -> Vec<Value> {
+    let base_instructions = include_str!("../assets/codex-system-prompt.md");
+    let mut models = Vec::new();
+    for provider in SUPPORTED_PROVIDERS {
+        for spec in model_specs(provider) {
+            let context_window = context_window_for_route(provider, spec.id).unwrap_or(200_000);
+            let reasoning_levels = spec
+                .thinking_levels
+                .iter()
+                .map(|level| {
+                    serde_json::json!({
+                        "effort": level,
+                        "description": thinking_level_label(level),
+                    })
+                })
+                .collect::<Vec<_>>();
+            models.push(serde_json::json!({
+                "slug": spec.id,
+                "display_name": spec.label,
+                "description": format!("{} via the Basiliskos relay", spec.label),
+                "supported_reasoning_levels": reasoning_levels,
+                "shell_type": "default",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 0,
+                "default_reasoning_summary": "auto",
+                "support_verbosity": false,
+                "web_search_tool_type": "text",
+                "truncation_policy": { "mode": "tokens", "limit": context_window },
+                "supports_parallel_tool_calls": true,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text", "image"],
+                "context_window": context_window,
+                "base_instructions": base_instructions,
+            }));
+        }
+    }
+    models
+}
+
+/// Write a Basiliskos-owned Codex home that points only this client at the
+/// local relay. Never touches the user's global `~/.codex`. Mirrors the Claude
+/// profile write; the Codex app reads `config.toml`/`auth.json` directly from
+/// `CODEX_HOME`, and the generated `model-catalog.json` feeds its picker.
+fn write_isolated_codex_config(home: &Path, state: &ControllerState) -> Result<(), String> {
+    secure_create_dir_all(home)?;
+    let provider = state
+        .active_account
+        .as_deref()
+        .and_then(|file_name| account_provider(&Value::Null, file_name))
+        .ok_or_else(|| "Choose an account before opening Basiliskos Codex.".to_string())?;
+    let route = state
+        .routes
+        .get(&provider)
+        .cloned()
+        .unwrap_or_else(|| RouteSelection {
+            model: default_model(&provider).to_string(),
+            thinking: "auto".into(),
+        });
+    // Picker catalog: every Basiliskos route model, keyed by upstream model id.
+    let catalog = serde_json::json!({ "models": codex_catalog_models() });
+    durable_write(
+        &home.join("model-catalog.json"),
+        serde_json::to_vec_pretty(&catalog)
+            .map_err(|error| format!("Could not serialize the Codex model catalog: {error}"))?
+            .as_slice(),
+    )?;
+    let catalog_path = home
+        .join("model-catalog.json")
+        .to_string_lossy()
+        .replace('\\', "/");
+    durable_write(
+        &home.join("config.toml"),
+        codex_config_toml(&route.model, &route.thinking, GATEWAY_PORT, &catalog_path).as_bytes(),
+    )?;
+    // Seed auth.json only if missing — the provider authenticates to the
+    // Basiliskos relay via env_key; the app's own login state is anchored
+    // separately (anchored-account milestone).
+    let auth_path = home.join("auth.json");
+    if !auth_path.exists() {
+        durable_write(
+            &auth_path,
+            br#"{
+  "OPENAI_API_KEY": null
+}
+"#,
+        )?;
+    }
+    Ok(())
+}
+
+/// Seeds the isolated Codex home's `auth.json` with the ANCHOR account's real
+/// ChatGPT credential, translated from the Basiliskos relay vault. The app's
+/// auth manager reloads `auth.json` continuously, so a fresh seed logs the
+/// isolated window in without any manual sign-in. Returns Ok(false) when the
+/// anchor credential is absent (the null seed stays in place).
+fn seed_isolated_codex_auth_at(
+    home: &Path,
+    auth: &Path,
+    anchor_file_name: &str,
+) -> Result<bool, String> {
+    let anchor_path = auth.join(anchor_file_name);
+    if !anchor_path.is_file() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(&anchor_path)
+        .map_err(|error| format!("Could not read the anchor Codex credential: {error}"))?;
+    let relay: Value =
+        serde_json::from_str(&raw).map_err(|_| "The anchor Codex credential is invalid")?;
+    let mut native = crate::codex_cli::translate_codex_cred(&relay)?;
+    // The real native file carries auth_mode = "chatgpt"; the app's auth
+    // manager expects it to recognize the credential as a ChatGPT OAuth login.
+    native["auth_mode"] = Value::String("chatgpt".into());
+    let bytes = serde_json::to_vec_pretty(&native)
+        .map_err(|error| format!("Could not serialize the anchored Codex credential: {error}"))?;
+    durable_write(&home.join("auth.json"), &bytes)?;
+    Ok(true)
+}
+
+fn seed_isolated_codex_auth(home: &Path) -> Result<bool, String> {
+    seed_isolated_codex_auth_at(home, &auth_dir()?, CODEX_ANCHOR_FILE_NAME)
+}
+
 fn restore_legacy_shared_config_if_needed(state: &mut ControllerState) -> Result<(), String> {
     let meta_path = shared_claude_library_dir()?.join("_meta.json");
     if !meta_path.exists() {
@@ -6570,6 +7159,166 @@ pub fn stop_hydra_claude() -> Result<GatewaySnapshot, String> {
     gateway_snapshot_locked()
 }
 
+#[cfg(target_os = "windows")]
+fn installed_codex_exe() -> Result<PathBuf, String> {
+    let script = "(Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty InstallLocation)";
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    hidden(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("Could not locate the Codex desktop app: {error}"))?;
+    if !output.status.success() {
+        return Err("The Codex desktop app is not installed for this user.".into());
+    }
+    let install_location = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if install_location.is_empty() {
+        return Err(
+            "The Codex desktop app is not installed for this user. Install it from the Microsoft Store."
+                .into(),
+        );
+    }
+    let executable = PathBuf::from(&install_location)
+        .join("app")
+        .join("ChatGPT.exe");
+    let normalized = executable.to_string_lossy().to_ascii_lowercase();
+    if !normalized.contains("\\windowsapps\\openai.codex_")
+        || !normalized.ends_with("\\app\\chatgpt.exe")
+        || !executable.is_file()
+    {
+        return Err("The installed Codex desktop app executable could not be verified.".into());
+    }
+    Ok(executable)
+}
+
+#[cfg(target_os = "windows")]
+fn maybe_apply_codex_icons(app: &AppHandle, pid: u32) {
+    let Ok(window_ico) = codex_icon_path(app, CodexIconKind::WindowBlack) else {
+        codex_log_icon_line("window ico path missing");
+        return;
+    };
+    spawn_codex_icon_reapply(pid, window_ico);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn maybe_apply_codex_icons(_app: &AppHandle, _pid: u32) {}
+
+/// Opens the isolated Basiliskos Codex window: the real installed Codex
+/// desktop app (MSIX `OpenAI.Codex`, entry `app\ChatGPT.exe`) launched with an
+/// isolated `--user-data-dir` + `CODEX_HOME`, pointing only at the local
+/// relay. The user's normal Codex app can run at the same time (verified M0:
+/// the global single-instance lock is scoped by the Chromium user-data dir).
+#[tauri::command]
+pub fn launch_hydra_codex_app(app: AppHandle) -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
+    #[cfg(target_os = "windows")]
+    {
+        if !gateway_running() {
+            start_gateway_locked(app.clone())?;
+        }
+        let mut state = prepare_config()?;
+        restore_legacy_shared_config_if_needed(&mut state)?;
+        if !list_accounts_inner(&state)?
+            .iter()
+            .any(|account| account.active)
+        {
+            return Err("Choose an account before opening Basiliskos Codex.".into());
+        }
+        let home = isolated_codex_home()?;
+        write_isolated_codex_config(&home, &state)?;
+        // Anchor the isolated window's login: real ChatGPT credential from the
+        // relay vault (one-refresher rule — the anchor is excluded from the
+        // relay's auto-refresh, so the isolated app owns it).
+        match seed_isolated_codex_auth(&home) {
+            Ok(true) => codex_log_icon_line(&format!(
+                "anchored Codex login seeded from {CODEX_ANCHOR_FILE_NAME}"
+            )),
+            Ok(false) => codex_log_icon_line(
+                "anchor Codex credential not found; isolated login stays unseeded",
+            ),
+            Err(error) => codex_log_icon_line(&format!("anchor seed failed: {error}")),
+        }
+        let executable = installed_codex_exe()?;
+        let log_dir = home.join("Basiliskos Logs");
+        secure_create_dir_all(&log_dir)?;
+        if hydra_codex_running() {
+            if let Ok(runtime) = runtime_lock() {
+                if let Some(child) = runtime.codex_child.as_ref() {
+                    maybe_apply_codex_icons(&app, child.id());
+                }
+            }
+            return gateway_snapshot_locked();
+        }
+        let stdout_path = log_dir.join("launcher.stdout.log");
+        let stderr_path = log_dir.join("launcher.stderr.log");
+        durable_write(&stdout_path, b"")?;
+        durable_write(&stderr_path, b"")?;
+        let stdout = fs::File::create(&stdout_path)
+            .map_err(|error| format!("Could not create the Basiliskos Codex log: {error}"))?;
+        let stderr = fs::File::create(&stderr_path)
+            .map_err(|error| format!("Could not create the Basiliskos Codex log: {error}"))?;
+        let mut command = Command::new(&executable);
+        command
+            .arg(format!("--user-data-dir={}", home.to_string_lossy()))
+            .env("CODEX_HOME", &home)
+            .env("BASILISKOS_API_KEY", &state.api_key)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        hidden(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            format!("Could not open the isolated Basiliskos Codex window: {error}")
+        })?;
+        let job = assign_gateway_to_kill_on_close_job(&child).inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
+        let pid = child.id();
+        {
+            let mut runtime = runtime_lock()?;
+            runtime.codex_child = Some(child);
+            runtime.codex_job = job;
+            runtime.codex_root_pid = Some(pid);
+            runtime.codex_executable = Some(executable);
+            runtime.codex_home = Some(home.clone());
+        }
+        maybe_apply_codex_icons(&app, pid);
+        std::thread::sleep(Duration::from_millis(900));
+        if !hydra_codex_running() {
+            return Err(
+                "Basiliskos Codex exited during startup. Check ~/.hydra-gateway/codex-profile/Basiliskos Logs."
+                    .into(),
+            );
+        }
+        gateway_snapshot_locked()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("The isolated Basiliskos Codex window is available on Windows only".into())
+    }
+}
+
+#[tauri::command]
+pub fn stop_hydra_codex_app() -> Result<GatewaySnapshot, String> {
+    let _mutation = mutation_lock()?;
+    stop_hydra_codex_runtime();
+    gateway_snapshot_locked()
+}
+
+/// Appends a Codex dial event (method, content-type, body length, body head,
+/// outcome) to a file the operator can read directly, independent of the
+/// in-memory diagnostics feed. Local-only; the body head is the user's own
+/// prompt.
+fn append_codex_dial_log(line: &str) {
+    use std::io::Write;
+    let Ok(dir) = gateway_dir() else { return };
+    let path = dir.join("controller-logs").join("codex-dial.log");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6678,7 +7427,7 @@ mod tests {
         assert_eq!(claude.credential_status, "active");
         assert!(claude
             .detail
-            .contains("disabled only for the primary relay"));
+            .contains("simply not the last-selected account of its provider"));
     }
 
     #[test]
@@ -7010,6 +7759,185 @@ mod tests {
     }
 
     #[test]
+    fn codex_config_toml_points_only_at_the_local_relay_over_responses_wire() {
+        let config = codex_config_toml(
+            "kimi-k3",
+            "high",
+            8317,
+            "C:/codex-profile/model-catalog.json",
+        );
+        assert!(config.contains("model = \"kimi-k3\""));
+        assert!(config.contains("model_reasoning_effort = \"high\""));
+        assert!(config.contains("model_reasoning_summary = \"detailed\""));
+        assert!(config.contains("model_auto_compact_token_limit = 9000000000000"));
+        assert!(config.contains("model_catalog_json = \"C:/codex-profile/model-catalog.json\""));
+        // opencodex-proven loopback form: keep the built-in openai provider and
+        // redirect it with root openai_base_url (the app's renderer allowlist
+        // keeps only native OpenAI slugs in the picker).
+        assert!(config.contains("openai_base_url = \"http://127.0.0.1:8317/v1\""));
+        assert!(!config.contains("model_provider"));
+        assert!(!config.contains("[model_providers."));
+        // "auto" thinking (the Basiliskos default) maps to a concrete Codex effort.
+        let auto = codex_config_toml("grok-4.5", "auto", 8317, "C:/model-catalog.json");
+        assert!(auto.contains("model_reasoning_effort = \"high\""));
+    }
+
+    #[test]
+    fn codex_catalog_advertises_real_upstream_model_ids() {
+        let models = codex_catalog_models();
+        let ids = models
+            .iter()
+            .filter_map(|model| model.get("slug").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        // Every advertised model id is a real upstream id the relay routes by.
+        assert!(ids.contains(&"grok-4.5"));
+        assert!(ids.contains(&"kimi-k3"));
+        assert!(ids.contains(&"deepseek-v4-flash"));
+        // Every entry carries the required ModelInfo fields + a vendored prompt.
+        for model in &models {
+            assert!(model.get("slug").is_some());
+            assert!(model.get("display_name").is_some());
+            assert!(model.get("supported_reasoning_levels").is_some());
+            assert!(model.get("shell_type").is_some());
+            assert!(model.get("visibility").is_some());
+            assert!(model.get("supported_in_api").is_some());
+            assert!(model.get("truncation_policy").is_some());
+            assert!(model.get("supports_parallel_tool_calls").is_some());
+            let prompt = model
+                .get("base_instructions")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            assert!(
+                prompt.starts_with("You are an AI coding assistant"),
+                "prompt must be present"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_home_is_written_only_inside_the_isolated_home() {
+        let root = temp_dir("codex-home");
+        let home = root.join("isolated-home");
+        let untouched = root.join("normal-config.toml");
+        fs::write(&untouched, "normal-config-must-not-change").unwrap();
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: Some("kimi-1.json".into()),
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+            open_claude_on_launch: true,
+        };
+        write_isolated_codex_config(&home, &state).unwrap();
+        assert_eq!(
+            fs::read_to_string(&untouched).unwrap(),
+            "normal-config-must-not-change"
+        );
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("openai_base_url = \"http://127.0.0.1:8317/v1\""));
+        assert!(!config.contains("model_provider"));
+        assert!(config.contains("model_catalog_json = \""));
+        // The active kimi route's default model is advertised to the Codex client.
+        assert!(config.contains(&format!("model = \"{}\"", default_model("kimi"))));
+        // The picker catalog is written next to the config with real model ids.
+        let catalog: Value =
+            serde_json::from_str(&fs::read_to_string(home.join("model-catalog.json")).unwrap())
+                .unwrap();
+        let ids = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model.get("slug").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"deepseek-v4-flash"));
+        let auth: Value =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth.get("OPENAI_API_KEY"), Some(&Value::Null));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual: dumps the generated catalog for the installed codex.exe"]
+    fn dump_codex_catalog_for_validation() {
+        let home = std::env::var("BASILISKOS_CATALOG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("basiliskos-catalog-check"));
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: Some("kimi-1.json".into()),
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+            open_claude_on_launch: true,
+        };
+        write_isolated_codex_config(&home, &state).unwrap();
+        println!("catalog+config written to {}", home.display());
+    }
+
+    #[test]
+    fn anchored_codex_auth_is_translated_with_auth_mode() {
+        let root = temp_dir("codex-anchor");
+        let auth = root.join("auth");
+        let home = root.join("isolated-home");
+        secure_create_dir_all(&auth).unwrap();
+        fs::write(
+            auth.join("codex-anchor@example.com.json"),
+            serde_json::json!({
+                "access_token": "at-1",
+                "account_id": "acct-1",
+                "email": "anchor@example.com",
+                "id_token": "id-1",
+                "last_refresh": "2026-08-12T00:00:00Z",
+                "refresh_token": "rt-1",
+                "type": "codex",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let seeded =
+            seed_isolated_codex_auth_at(&home, &auth, "codex-anchor@example.com.json").unwrap();
+        assert!(seeded);
+        let native: Value =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(native["auth_mode"], "chatgpt");
+        assert_eq!(native["tokens"]["account_id"], "acct-1");
+        assert_eq!(native["tokens"]["access_token"], "at-1");
+        assert_eq!(native["OPENAI_API_KEY"], Value::Null);
+        // A missing anchor is not an error: the null seed stays in place.
+        let absent = seed_isolated_codex_auth_at(&home, &auth, "missing.json").unwrap();
+        assert!(!absent);
+        assert_eq!(
+            serde_json::from_str::<Value>(&fs::read_to_string(home.join("auth.json")).unwrap())
+                .unwrap()["auth_mode"],
+            "chatgpt"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_home_write_requires_a_selected_account() {
+        let root = temp_dir("codex-no-account");
+        let home = root.join("isolated-home");
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+            open_claude_on_launch: true,
+        };
+        assert!(write_isolated_codex_config(&home, &state).is_err());
+        assert!(!home.join("config.toml").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn deepseek_credential_file_name_is_stable_per_key_and_hides_the_key() {
         let name = deepseek_credential_file_name("sk-secret-key-value");
         assert_eq!(name, deepseek_credential_file_name("sk-secret-key-value"));
@@ -7035,7 +7963,19 @@ mod tests {
         assert!(config.contains("- name: \"basiliskos-deepseek\""));
         assert!(config.contains("base-url: \"https://api.deepseek.com/v1\""));
         assert!(config.contains("- name: \"deepseek-v4-flash\""));
-        assert!(config.contains("- name: \"deepseek-v4-pro\""));
+        assert!(
+            config.contains("- name: \"deepseek-v4-flash\"\n        alias: \"deepseek-v4-flash\"")
+        );
+        // Only DeepSeek ids are aliased. Other providers' models (grok-4.5,
+        // claude-*, gpt-5.6-*) must NOT be captured, or the isolated Codex
+        // window's model switcher would keep routing them to DeepSeek instead
+        // of their real providers.
+        assert!(config.contains("alias: \"deepseek-v4-pro\""));
+        assert!(!config.contains("alias: \"grok-4.5\""));
+        assert!(!config.contains("alias: \"grok-4.6\""));
+        assert!(!config.contains("alias: \"claude-sonnet-4-5-20250929\""));
+        assert!(!config.contains("alias: \"gpt-5.6-terra\""));
+        assert!(!config.contains("alias: \"kimi-k3\""));
         // CLIProxyAPI load-balances across entries, so a key the user did not
         // select must never be rendered alongside the active one.
         assert!(!config.contains("sk-other-key"));
@@ -7055,7 +7995,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_deepseek_account_does_not_break_the_single_enabled_invariant() {
+    fn adding_a_deepseek_account_does_not_break_the_one_enabled_per_provider_invariant() {
         // Regression: a new DeepSeek account was written enabled, so the auth
         // dir briefly had two enabled accounts, `validate_account_invariant`
         // rejected it, and `run_transaction` rolled the write back — the add
@@ -7217,6 +8157,57 @@ mod tests {
         assert!(serde_json::to_string(&untouched)
             .unwrap()
             .contains("base64"));
+    }
+
+    #[test]
+    fn text_only_image_rejection_is_rephrased_for_the_codex_dial() {
+        // The isolated Codex window encrypts request bodies, so the relay
+        // cannot strip an image before the upstream sees it. The DeepSeek 400
+        // ("unknown variant `image_url`, expected `text`") must become an
+        // actionable message instead of leaking the raw deserialization error.
+        let raw = serde_json::json!({
+            "error": {
+                "message": "Failed to deserialize the JSON body into the target type: messages[43]: unknown variant `image_url`, expected `text` at line 1 column 459913",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_request_error"
+            }
+        })
+        .to_string();
+        let rephrased =
+            rephrase_text_only_image_error(raw.as_bytes()).expect("the rejection is rephrased");
+        let value: Value =
+            serde_json::from_slice(&rephrased).expect("the rephrased body is valid JSON");
+        let message = value["error"]["message"]
+            .as_str()
+            .expect("the rephrased body keeps an error message");
+        assert!(message.contains("text-only"));
+        assert!(message.contains("vision-capable"));
+        assert_eq!(
+            value["error"]["code"],
+            Value::String("bas_text_only_image".into())
+        );
+        assert!(!rephrased
+            .windows(raw.len())
+            .any(|window| window == raw.as_bytes()));
+
+        // Non-image upstream errors pass through untouched.
+        let other =
+            serde_json::json!({"error": {"message": "rate limited", "type": "error"}}).to_string();
+        assert!(rephrase_text_only_image_error(other.as_bytes()).is_none());
+
+        // Streamed or otherwise non-JSON bodies pass through untouched.
+        let sse = b"data: {\"error\":{\"message\":\"unknown variant `image_url`\"}}\n\n";
+        assert!(rephrase_text_only_image_error(sse).is_none());
+    }
+
+    #[test]
+    fn provider_is_text_only_marks_deepseek_only() {
+        assert!(provider_is_text_only(Some("deepseek")));
+        for provider in ["codex", "claude", "xai", "kimi"] {
+            assert!(!provider_is_text_only(Some(provider)));
+        }
+        assert!(!provider_is_text_only(None));
     }
 
     #[test]
@@ -7738,7 +8729,11 @@ mod tests {
     }
 
     #[test]
-    fn account_selection_enables_one_and_disables_the_rest() {
+    fn account_selection_pins_one_account_per_provider_and_keeps_other_providers() {
+        // The isolated Codex window routes picked models to their real
+        // providers, so selecting an account must not disable OTHER providers'
+        // credentials. Only same-provider accounts are pinned (one enabled per
+        // provider) so CLIProxyAPI's credential selection stays unambiguous.
         let root = temp_dir("accounts");
         let auth = root.join("auth");
         fs::create_dir_all(&auth).unwrap();
@@ -7752,29 +8747,22 @@ mod tests {
             r#"{"type":"xai","disabled":false}"#,
         )
         .unwrap();
+        fs::write(auth.join("xai-c.json"), r#"{"type":"xai","disabled":true}"#).unwrap();
+        let account = |file_name: &str, provider: &str, disabled: bool| GatewayAccount {
+            file_name: file_name.into(),
+            provider: provider.into(),
+            email: None,
+            label: provider.into(),
+            disabled,
+            active: false,
+            cooldown_until_ms: None,
+            expires_at_ms: None,
+            credential_status: "unknown".into(),
+        };
         let accounts = vec![
-            GatewayAccount {
-                file_name: "codex-a.json".into(),
-                provider: "codex".into(),
-                email: None,
-                label: "Codex".into(),
-                disabled: false,
-                active: false,
-                cooldown_until_ms: None,
-                expires_at_ms: None,
-                credential_status: "unknown".into(),
-            },
-            GatewayAccount {
-                file_name: "xai-b.json".into(),
-                provider: "xai".into(),
-                email: None,
-                label: "Grok".into(),
-                disabled: false,
-                active: false,
-                cooldown_until_ms: None,
-                expires_at_ms: None,
-                credential_status: "unknown".into(),
-            },
+            account("codex-a.json", "codex", false),
+            account("xai-b.json", "xai", false),
+            account("xai-c.json", "xai", true),
         ];
         let state_path = root.join("controller.json");
         let state = ControllerState {
@@ -7799,8 +8787,16 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(auth.join("codex-a.json")).unwrap()).unwrap();
         let grok: Value =
             serde_json::from_str(&fs::read_to_string(auth.join("xai-b.json")).unwrap()).unwrap();
-        assert_eq!(codex.get("disabled").and_then(Value::as_bool), Some(true));
+        let grok_other: Value =
+            serde_json::from_str(&fs::read_to_string(auth.join("xai-c.json")).unwrap()).unwrap();
+        // Same-provider sibling pinned off, selected account enabled, and the
+        // other provider's credential left available for the model switcher.
         assert_eq!(grok.get("disabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            grok_other.get("disabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(codex.get("disabled").and_then(Value::as_bool), Some(false));
         let selected: ControllerState =
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert_eq!(selected.active_account.as_deref(), Some("xai-b.json"));
@@ -7989,10 +8985,14 @@ mod tests {
     }
 
     #[test]
-    fn active_account_removal_disables_every_remaining_account() {
+    fn active_account_removal_leaves_other_providers_credentials_untouched() {
+        // Removing the active account clears the selection but must not disable
+        // other providers' credentials — the isolated Codex window still routes
+        // picked models to them.
         let root = temp_dir("active-removal");
         let (auth, state_path, labels_path, accounts, state, labels) =
             active_removal_fixture(&root);
+        let xai_before = fs::read(auth.join("xai-b.json")).unwrap();
         let (mutations, _) = removal_transaction(
             AccountPaths {
                 root: &root,
@@ -8014,9 +9014,8 @@ mod tests {
         assert!(!crate::persistence::backup_path(&auth.join("codex-a.json"))
             .unwrap()
             .exists());
-        let remaining: Value =
-            serde_json::from_slice(&fs::read(auth.join("xai-b.json")).unwrap()).unwrap();
-        assert_eq!(remaining["disabled"], true);
+        // The remaining credential is byte-for-byte unchanged.
+        assert_eq!(fs::read(auth.join("xai-b.json")).unwrap(), xai_before);
         let after: ControllerState =
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert_eq!(after.active_account, None);
@@ -8028,7 +9027,7 @@ mod tests {
 
     #[test]
     fn active_account_removal_rolls_back_every_write_failure() {
-        for fail_after in 0..4 {
+        for fail_after in 0..3 {
             let root = temp_dir("active-removal-failure");
             let (auth, state_path, labels_path, accounts, state, labels) =
                 active_removal_fixture(&root);
@@ -8063,7 +9062,9 @@ mod tests {
                 "codex-a.json",
             )
             .unwrap();
-            assert_eq!(mutations.len(), 4);
+            // The removed file, the state, and the labels — the remaining
+            // credential is untouched by design.
+            assert_eq!(mutations.len(), 3);
             assert!(crate::persistence::run_transaction_with_fault(
                 &root,
                 &mutations,
@@ -8345,8 +9346,8 @@ mod tests {
             normalized_route(&state, "claude").model,
             "claude-sonnet-4-5-20250929"
         );
-        assert_eq!(normalized_route(&state, "codex").model, "gpt-5.5");
-        assert_eq!(normalized_route(&state, "xai").model, "grok-build-0.1");
+        assert_eq!(normalized_route(&state, "codex").model, "gpt-5.6-terra");
+        assert_eq!(normalized_route(&state, "xai").model, "grok-4.5");
         assert_eq!(normalized_route(&state, "xai").thinking, "auto");
         assert_eq!(normalized_route(&state, "kimi").model, "kimi-k3");
         assert_eq!(normalized_route(&state, "kimi").thinking, "auto");
@@ -8834,7 +9835,7 @@ mod tests {
         state.routes.insert(
             "xai".into(),
             RouteSelection {
-                model: "grok-build-0.1".into(),
+                model: "grok-composer-2.5-fast".into(),
                 thinking: "high".into(),
             },
         );
@@ -8843,10 +9844,10 @@ mod tests {
             "codex".into(),
             RouteSelection {
                 model: "made-up-model".into(),
-                thinking: "ultra".into(),
+                thinking: "none".into(),
             },
         );
-        assert_eq!(normalized_route(&state, "codex").model, "gpt-5.5");
+        assert_eq!(normalized_route(&state, "codex").model, "gpt-5.6-terra");
         assert_eq!(normalized_route(&state, "codex").thinking, "auto");
     }
 
@@ -9164,6 +10165,7 @@ mod tests {
             base_url: "http://127.0.0.1:8317".into(),
             version: "test".into(),
             claude_running: false,
+            codex_running: false,
             accounts: Vec::new(),
             active_account: None,
             routes: Vec::new(),
@@ -9198,6 +10200,10 @@ mod tests {
                 detail: String::new(),
             },
             claude: ComponentStatus {
+                state: "stopped".into(),
+                detail: String::new(),
+            },
+            codex: ComponentStatus {
                 state: "stopped".into(),
                 detail: String::new(),
             },

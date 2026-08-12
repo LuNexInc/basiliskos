@@ -30,6 +30,7 @@ pub enum ErrorCode {
     LoginFailed,
     LoginCancelled,
     ClaudeExited,
+    CodexExited,
     ConfigTransactionFailed,
     AccountAutoFailover,
 }
@@ -58,6 +59,7 @@ impl ErrorCode {
             Self::LoginFailed => "BAS-AUTH-001",
             Self::LoginCancelled => "BAS-AUTH-002",
             Self::ClaudeExited => "BAS-CLAUDE-001",
+            Self::CodexExited => "BAS-CODEX-001",
             Self::ConfigTransactionFailed => "BAS-CONFIG-001",
             Self::AccountAutoFailover => "BAS-ACCOUNT-001",
         }
