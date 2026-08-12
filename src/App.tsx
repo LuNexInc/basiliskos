@@ -226,7 +226,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-export const APP_VERSION = "2.3.2";
+export const APP_VERSION = "2.3.3";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },

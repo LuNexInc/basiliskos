@@ -639,6 +639,30 @@ fn client_picker_choice(
     Some((model, thinking))
 }
 
+/// Reads Claude's native thinking/effort control from the request
+/// (`output_config.effort` or the top-level `effort` field, the shape Claude
+/// Desktop sends for gateway models). Returns None when the client left
+/// thinking on auto.
+fn client_effort_choice(request: &serde_json::Map<String, Value>) -> Option<String> {
+    let effort = request
+        .get("output_config")
+        .and_then(Value::as_object)
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            request
+                .get("effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })?;
+    match effort.as_str() {
+        "auto" => None,
+        "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "none" => Some(effort),
+        _ => None,
+    }
+}
+
 /// Applies the provider-specific model transformation (thinking suffix, Grok
 /// 4.5 desktop-effort remap, DeepSeek plain id) to a base model id. The base is
 /// either the Basiliskos route selection or a client-chosen picker model.
@@ -1560,8 +1584,10 @@ fn rewrite_claude_request(
         .as_object_mut()
         .ok_or_else(|| "Claude request body must be a JSON object".to_string())?;
     // A model the client picked in Claude's picker (advertised via
-    // `inferenceModels`) wins over the Basiliskos route selection. The chosen
-    // entry carries both the upstream model and its thinking level.
+    // `inferenceModels`) wins over the Basiliskos route selection; the picker
+    // carries the model only. Thinking comes from Claude's native effort
+    // control in the window (`output_config.effort`), which wins over the
+    // route's saved thinking.
     let hidden = load_hidden_models().unwrap_or_default();
     let route = normalized_route(state, provider);
     let chosen = client_picker_choice(object, provider, &hidden, &route.model);
@@ -1569,7 +1595,14 @@ fn rewrite_claude_request(
         .as_ref()
         .map(|(model, _)| model.as_str())
         .unwrap_or(&route.model);
-    let thinking_override = chosen.as_ref().map(|(_, thinking)| thinking.as_str());
+    let client_effort = client_effort_choice(object);
+    let thinking_override = client_effort.as_deref().filter(|level| {
+        *level == "auto"
+            || (provider == "xai" && base_model == "grok-4.5")
+            || model_specs(provider).iter().any(|spec| {
+                spec.id == base_model && spec.thinking_levels.contains(&level.to_string().as_str())
+            })
+    });
     let routed_model = apply_route_model(base_model, thinking_override, object, state, provider);
     object.insert("model".into(), Value::String(routed_model));
 
@@ -4728,6 +4761,129 @@ fn start_oauth_credential_maintenance() {
     });
 }
 
+/// Reads the newest Claude Code session file under the isolated profile and
+/// returns the window's current (model alias, effort) selection. Claude writes
+/// this file on every session activity, so the newest file reflects the live
+/// picker + effort controls. Returns None when no session file exists.
+fn newest_claude_session_choice() -> Option<(String, String)> {
+    let sessions_root = isolated_claude_profile_dir()
+        .ok()?
+        .join("claude-code-sessions");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for account in fs::read_dir(&sessions_root).ok()? {
+        let account = account.ok()?;
+        if !account.path().is_dir() {
+            continue;
+        }
+        for bucket in fs::read_dir(account.path()).ok()? {
+            let bucket = bucket.ok()?;
+            if !bucket.path().is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(bucket.path()).ok()? {
+                let entry = entry.ok()?;
+                if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    continue;
+                }
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                if newest
+                    .as_ref()
+                    .is_none_or(|(existing, _)| modified > *existing)
+                {
+                    newest = Some((modified, entry.path()));
+                }
+            }
+        }
+    }
+    let (_, path) = newest?;
+    let value: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let model = value.get("model").and_then(Value::as_str)?;
+    let effort = value
+        .get("effort")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    Some((model.to_string(), effort.to_string()))
+}
+
+/// Maps a Claude effort level to a thinking level the routed model supports.
+/// Grok 4.5 keeps the desktop-effort remap (medium→low, high/xhigh/max→high).
+fn effort_to_thinking(provider: &str, model: &str, effort: &str) -> String {
+    if effort == "auto" || effort == "none" {
+        return "auto".to_string();
+    }
+    if provider == "xai" && model == "grok-4.5" {
+        return match effort {
+            "low" | "medium" => "low".to_string(),
+            "high" | "xhigh" | "max" => "high".to_string(),
+            _ => "auto".to_string(),
+        };
+    }
+    let supported = model_specs(provider)
+        .iter()
+        .find(|spec| spec.id == model)
+        .is_some_and(|spec| spec.thinking_levels.contains(&effort));
+    if supported {
+        effort.to_string()
+    } else {
+        "auto".to_string()
+    }
+}
+
+/// Applies the isolated window's live model/effort selection to the Basiliskos
+/// route so the GUI stays in real-time sync with the picker, even before any
+/// request is sent. Only acts while the Claude window is running; skips when
+/// the selection is the generic routing alias or matches the route already.
+fn sync_route_from_claude_session() {
+    let Ok(_mutation) = mutation_lock() else {
+        return;
+    };
+    if !hydra_claude_running() {
+        return;
+    }
+    let Some((model, effort)) = newest_claude_session_choice() else {
+        return;
+    };
+    let Ok(mut state) = load_state() else { return };
+    let Some(active) = state.active_account.clone() else {
+        return;
+    };
+    let Ok(accounts) = list_accounts_inner(&state) else {
+        return;
+    };
+    let Some(account) = accounts.iter().find(|account| account.file_name == active) else {
+        return;
+    };
+    let provider = account.provider.clone();
+    let default_model = default_model(&provider);
+    let Some((upstream, _)) = alias_to_picker_entry(&provider, &model, default_model) else {
+        return; // generic routing alias or unknown — leave the route alone
+    };
+    let thinking = effort_to_thinking(&provider, &upstream, &effort);
+    let current = state
+        .routes
+        .get(&provider)
+        .map(|route| (route.model.as_str(), route.thinking.as_str()));
+    if current == Some((upstream.as_str(), thinking.as_str())) {
+        return;
+    }
+    let mut route = state
+        .routes
+        .get(&provider)
+        .cloned()
+        .unwrap_or(RouteSelection {
+            model: default_model.to_string(),
+            thinking: "auto".into(),
+        });
+    route.model = upstream.clone();
+    route.thinking = thinking.clone();
+    state.routes.insert(provider.clone(), route);
+    let _ = save_state(&state);
+    // A model change regenerates the Claude config so the picker follows.
+    if let Ok(profile) = isolated_claude_profile_dir() {
+        let _ = write_isolated_claude_config(&profile, &state);
+    }
+}
+
 /// Runs backend crash recovery on a fixed timer instead of only on idle
 /// listener ticks. The listener still calls `supervise_backend` on idle, so a
 /// crash during a request burst is now detected within one tick regardless of
@@ -4741,6 +4897,7 @@ pub fn start_backend_supervision(app: AppHandle) {
         loop {
             tokio::time::sleep(BACKEND_SUPERVISION_INTERVAL).await;
             supervise_backend(&app);
+            sync_route_from_claude_session();
         }
     });
 }
@@ -8867,7 +9024,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_aliases_resolve_and_variants_carry_thinking() {
+    fn picker_aliases_resolve_with_auto_thinking() {
         use std::collections::BTreeSet;
         let hidden = BTreeSet::new();
         for provider in SUPPORTED_PROVIDERS {
@@ -8875,21 +9032,15 @@ mod tests {
             let selected = default_model(provider);
             let entries = picker_entries(provider, &hidden, selected);
             assert!(!entries.is_empty(), "{provider} picker is empty");
-            // Every advertised alias is distinct so the picker can distinguish.
+            assert_eq!(entries[0].2, selected, "selected model is first");
             for (alias, _, model, thinking) in &entries {
                 assert!(
                     aliases.insert(alias.as_str()),
                     "{provider} alias collision: {alias}"
                 );
-                // Base entries resolve to a catalog model with auto thinking.
+                assert_eq!(thinking, "auto");
                 let resolved = alias_to_picker_entry(provider, alias, selected);
-                assert!(resolved.is_some(), "{provider} alias {alias} unresolved");
-                if thinking == "auto" {
-                    assert_eq!(resolved, Some((model.clone(), "auto".into())));
-                } else {
-                    // Variant entries resolve to the selected model with the level.
-                    assert_eq!(resolved, Some((selected.to_string(), thinking.clone())));
-                }
+                assert_eq!(resolved, Some((model.clone(), "auto".into())));
             }
         }
         // DeepSeek base aliases map to Claude catalog ids, not DeepSeek ids.
@@ -8897,12 +9048,47 @@ mod tests {
             base_alias("deepseek", "deepseek-v4-flash"),
             Some("claude-sonnet-4-5")
         );
-        // A thinking variant of the selected deepseek model resolves with its
-        // level (flash levels: none/low/high/max → index 2 = high).
+    }
+
+    #[test]
+    fn effort_to_thinking_validates_against_model_levels() {
+        // Flash supports none/low/high/max.
         assert_eq!(
-            alias_to_picker_entry("deepseek", "claude-opus-4-6", "deepseek-v4-flash"),
-            Some(("deepseek-v4-flash".to_string(), "high".to_string()))
+            effort_to_thinking("deepseek", "deepseek-v4-flash", "max"),
+            "max"
         );
+        assert_eq!(
+            effort_to_thinking("deepseek", "deepseek-v4-flash", "high"),
+            "high"
+        );
+        // medium is not a flash level → falls back to auto.
+        assert_eq!(
+            effort_to_thinking("deepseek", "deepseek-v4-flash", "medium"),
+            "auto"
+        );
+        // Grok 4.5 remaps desktop effort to its low/high pair.
+        assert_eq!(effort_to_thinking("xai", "grok-4.5", "max"), "high");
+        assert_eq!(effort_to_thinking("xai", "grok-4.5", "medium"), "low");
+        // Auto passes through.
+        assert_eq!(effort_to_thinking("kimi", "kimi-k3", "auto"), "auto");
+    }
+
+    #[test]
+    fn client_effort_choice_reads_output_config_and_top_level() {
+        let request = serde_json::json!({ "output_config": { "effort": "high" } });
+        assert_eq!(
+            client_effort_choice(request.as_object().unwrap()),
+            Some("high".to_string())
+        );
+        let top_level = serde_json::json!({ "effort": "max" });
+        assert_eq!(
+            client_effort_choice(top_level.as_object().unwrap()),
+            Some("max".to_string())
+        );
+        let none = serde_json::json!({});
+        assert_eq!(client_effort_choice(none.as_object().unwrap()), None);
+        let unknown = serde_json::json!({ "output_config": { "effort": "turbo" } });
+        assert_eq!(client_effort_choice(unknown.as_object().unwrap()), None);
     }
 
     #[test]
