@@ -7425,7 +7425,7 @@ mod tests {
             },
         );
         let mut request = serde_json::json!({
-            "model": "claude-sonnet-4-5",
+            "model": "claude-opus-4-99",
             "system": [{"type": "text", "text": "You are powered by Sonnet."}],
             "messages": [{"role": "user", "content": "Who are you?"}]
         });
@@ -7474,7 +7474,7 @@ mod tests {
             ("max", "grok-4.5(high)"),
         ] {
             let mut request = serde_json::json!({
-                "model": "claude-fable-5",
+                "model": "claude-opus-4-99",
                 "output_config": { "effort": effort }
             });
             rewrite_claude_request(&mut request, &state, "xai", false).unwrap();
@@ -8022,7 +8022,7 @@ mod tests {
             open_claude_on_launch: true,
         };
         let mut request = serde_json::json!({
-            "model": "claude-sonnet-4-5",
+            "model": "claude-opus-4-99",
             "tools": [
                 {
                     "type": "web_search_20250305",
@@ -8052,7 +8052,7 @@ mod tests {
             open_claude_on_launch: true,
         };
         let mut request = serde_json::json!({
-            "model": "claude-sonnet-4-5",
+            "model": "claude-opus-4-99",
             "tools": [
                 {"type": "web_search", "name": "web_search"},
                 {"type": "function", "name": "some_other_tool", "parameters": {"type": "object"}}
@@ -8079,7 +8079,7 @@ mod tests {
             open_claude_on_launch: true,
         };
         let mut request = serde_json::json!({
-            "model": "claude-sonnet-4-5",
+            "model": "claude-opus-4-99",
             "tools": [
                 {"type": "x_search"},
                 {
@@ -8236,7 +8236,7 @@ mod tests {
                 thinking: "high".into(),
             },
         );
-        let mut request = serde_json::json!({"model": "claude-sonnet-4-5"});
+        let mut request = serde_json::json!({"model": "claude-opus-4-99"});
         rewrite_claude_request(&mut request, &state, "xai", true).unwrap();
         assert_eq!(
             request.get("model").and_then(Value::as_str),
@@ -8271,7 +8271,7 @@ mod tests {
         // The generic default alias is not a picker alias for kimi (kimi uses
         // pool indexes 0-6, not claude-fable-5), so the request falls back to
         // the Basiliskos route selection.
-        let mut request = serde_json::json!({"model": "claude-fable-5"});
+        let mut request = serde_json::json!({"model": "claude-opus-4-99"});
         rewrite_claude_request(&mut request, &state, "kimi", true).unwrap();
         assert_eq!(
             request.get("model").and_then(Value::as_str),
@@ -8303,7 +8303,7 @@ mod tests {
                 thinking: "max".into(),
             },
         );
-        let mut request = serde_json::json!({"model": "claude-sonnet-4-5"});
+        let mut request = serde_json::json!({"model": "claude-opus-4-99"});
         rewrite_claude_request(&mut request, &state, "kimi", true).unwrap();
         assert_eq!(
             request.get("model").and_then(Value::as_str),
