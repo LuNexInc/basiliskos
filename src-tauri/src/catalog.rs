@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -268,7 +268,7 @@ pub(crate) fn context_budget_for_request(provider: &str, request: &Value) -> Opt
 /// upstream model (see gateway.rs `client_model_choice`). Aliases are unique
 /// within a provider so Claude's picker can distinguish entries. The pool below
 /// covers the largest provider (xai, 9 models).
-const ANTHROPIC_ALIAS_POOL: [&str; 11] = [
+const ANTHROPIC_ALIAS_POOL: [&str; 17] = [
     "claude-sonnet-4-5",
     "claude-opus-4-5",
     "claude-haiku-4-5",
@@ -280,11 +280,17 @@ const ANTHROPIC_ALIAS_POOL: [&str; 11] = [
     "claude-sonnet-4-5-20250929",
     "claude-opus-4-5-20251101",
     "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-7",
+    "claude-opus-4-9",
+    "claude-haiku-4-6",
+    "claude-sonnet-4-8",
+    "claude-opus-4-10",
+    "claude-haiku-4-7",
 ];
 
-/// Stable Anthropic routing alias for a provider model. The claude provider
+/// Stable Anthropic base alias for a provider model. The claude provider
 /// aliases to its own model id (already an Anthropic catalog id).
-pub(crate) fn model_alias(provider: &str, model: &str) -> Option<&'static str> {
+pub(crate) fn base_alias(provider: &str, model: &str) -> Option<&'static str> {
     if provider == "claude" {
         return model_specs("claude")
             .iter()
@@ -296,17 +302,103 @@ pub(crate) fn model_alias(provider: &str, model: &str) -> Option<&'static str> {
     ANTHROPIC_ALIAS_POOL.get(index).copied()
 }
 
-/// Reverse lookup: Anthropic alias → real upstream model for a provider.
-pub(crate) fn alias_to_model(provider: &str, alias: &str) -> Option<&'static str> {
+/// Human label for a thinking level shown in the picker entries.
+pub(crate) fn thinking_level_label(level: &str) -> &'static str {
+    match level {
+        "auto" => "Auto",
+        "none" => "Off",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra high",
+        "max" => "Maximum",
+        "ultra" => "Ultra",
+        _ => "Auto",
+    }
+}
+
+/// Builds the Claude picker entries for the active provider: the selected
+/// model first (its base entry, then an explicit entry per supported thinking
+/// level), then the other visible models as base entries. Returns
+/// (alias, label, upstream model, thinking).
+pub(crate) fn picker_entries(
+    provider: &str,
+    hidden: &BTreeSet<String>,
+    selected: &str,
+) -> Vec<(String, String, String, String)> {
+    let specs = model_specs(provider);
+    let visible = |spec: &ModelSpec| spec.id == selected || !hidden.contains(spec.id);
+    let mut entries = Vec::new();
+    if let Some(spec) = specs.iter().find(|spec| spec.id == selected) {
+        if visible(spec) {
+            if let Some(alias) = base_alias(provider, spec.id) {
+                entries.push((
+                    alias.to_string(),
+                    spec.label.to_string(),
+                    spec.id.to_string(),
+                    "auto".into(),
+                ));
+            }
+            // Thinking variants use pool slots after the base models. Only one
+            // model's variants are advertised at a time (the selected one), so
+            // the slots are unambiguous: index < n_models is a base model,
+            // index >= n_models is a thinking variant of the selected model.
+            if provider != "claude" && spec.thinking_levels.len() > 1 {
+                for (index, level) in spec.thinking_levels.iter().enumerate() {
+                    if let Some(alias) = ANTHROPIC_ALIAS_POOL.get(specs.len() + index) {
+                        entries.push((
+                            alias.to_string(),
+                            format!("{} · {}", spec.label, thinking_level_label(level)),
+                            spec.id.to_string(),
+                            level.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for spec in specs {
+        if spec.id == selected || !visible(spec) {
+            continue;
+        }
+        if let Some(alias) = base_alias(provider, spec.id) {
+            entries.push((
+                alias.to_string(),
+                spec.label.to_string(),
+                spec.id.to_string(),
+                "auto".into(),
+            ));
+        }
+    }
+    entries
+}
+
+/// Reverse lookup for a picker request: Anthropic alias → (upstream model,
+/// thinking). Base aliases resolve from the provider catalog with "auto"
+/// thinking; variant aliases (index >= model count) resolve against the
+/// selected model's thinking levels.
+pub(crate) fn alias_to_picker_entry(
+    provider: &str,
+    alias: &str,
+    selected: &str,
+) -> Option<(String, String)> {
     if provider == "claude" {
         return model_specs("claude")
             .iter()
             .find(|spec| spec.id == alias)
-            .map(|spec| spec.id);
+            .map(|spec| (spec.id.to_string(), "auto".into()));
     }
-    model_specs(provider)
+    let specs = model_specs(provider);
+    let index = ANTHROPIC_ALIAS_POOL
         .iter()
-        .enumerate()
-        .find(|(index, _)| ANTHROPIC_ALIAS_POOL.get(*index) == Some(&alias))
-        .map(|(_, spec)| spec.id)
+        .position(|candidate| *candidate == alias)?;
+    if index < specs.len() {
+        return Some((specs[index].id.to_string(), "auto".into()));
+    }
+    let selected_spec = specs.iter().find(|spec| spec.id == selected)?;
+    if selected_spec.thinking_levels.len() > 1 {
+        let level = selected_spec.thinking_levels.get(index - specs.len())?;
+        return Some((selected.to_string(), (*level).to_string()));
+    }
+    None
 }

@@ -22,8 +22,8 @@ use uuid::Uuid;
 use crate::diagnostics::{self, DiagnosticEvent, ErrorCode};
 
 use crate::catalog::{
-    alias_to_model, context_budget_for_request, context_window_for_route, default_model,
-    default_routes, model_alias, model_specs, ModelSpec, CLAUDE_MODELS, DEEPSEEK_MODELS,
+    alias_to_picker_entry, context_budget_for_request, context_window_for_route, default_model,
+    default_routes, model_specs, picker_entries, ModelSpec, CLAUDE_MODELS, DEEPSEEK_MODELS,
     SUPPORTED_PROVIDERS,
 };
 use crate::claude_window::{
@@ -620,25 +620,23 @@ fn provider_route(state: &ControllerState, provider: &str) -> ProviderRoute {
     }
 }
 
-/// Returns the model the client explicitly chose, when it is a visible catalog
-/// model for the provider (one Claude Desktop advertised in its picker via
-/// `inferenceModels`). Returns None for the generic routing alias, hidden
-/// models, and unknown ids, so callers fall back to the Basiliskos route.
-fn client_model_choice(
+/// Returns the (model, thinking) pair the client chose in Claude's picker,
+/// when it is a visible catalog model. The request carries the Anthropic
+/// routing alias Claude advertised; `alias_to_picker_entry` maps it back to
+/// the real upstream model and thinking level. Returns None for unknown or
+/// hidden ids so callers fall back to the Basiliskos route.
+fn client_picker_choice(
     request: &serde_json::Map<String, Value>,
     provider: &str,
     hidden: &BTreeSet<String>,
-) -> Option<String> {
+    selected_model: &str,
+) -> Option<(String, String)> {
     let requested = request.get("model").and_then(Value::as_str)?;
-    // The request carries the Anthropic routing alias Claude advertised in the
-    // picker; map it back to the real upstream model. The generic routing
-    // alias (claude-fable-5 default) and unknown ids fall through.
-    let upstream = alias_to_model(provider, requested).unwrap_or(requested);
-    let specs = model_specs(provider);
-    if !specs.iter().any(|spec| spec.id == upstream) {
+    let (model, thinking) = alias_to_picker_entry(provider, requested, selected_model)?;
+    if !model_specs(provider).iter().any(|spec| spec.id == model) || hidden.contains(&model) {
         return None;
     }
-    (!hidden.contains(upstream)).then(|| upstream.to_string())
+    Some((model, thinking))
 }
 
 /// Applies the provider-specific model transformation (thinking suffix, Grok
@@ -646,6 +644,7 @@ fn client_model_choice(
 /// either the Basiliskos route selection or a client-chosen picker model.
 fn apply_route_model(
     base_model: &str,
+    thinking_override: Option<&str>,
     request: &mut serde_json::Map<String, Value>,
     state: &ControllerState,
     provider: &str,
@@ -658,9 +657,20 @@ fn apply_route_model(
     if provider == "deepseek" {
         return base_model.to_string();
     }
-    // Validate the route's thinking level against the model actually being
-    // routed (which may be a client-chosen picker model, not the route model).
+    // A picker variant carries its own validated thinking level; otherwise use
+    // the route's thinking (validated against the model actually being routed).
     let route_thinking = normalized_route(state, provider).thinking;
+    if let Some(level) = thinking_override {
+        if level == "auto" {
+            return base_model.to_string();
+        }
+        if provider == "xai" && base_model == "grok-4.5" {
+            let remapped =
+                grok_4_5_thinking_from_desktop_effort(request).unwrap_or_else(|| level.to_string());
+            return format!("{}({})", base_model, remapped);
+        }
+        return format!("{}({})", base_model, level);
+    }
     let thinking = model_specs(provider)
         .iter()
         .find(|spec| spec.id == base_model)
@@ -693,9 +703,14 @@ fn apply_route_model(
 /// than implying that they tune the selected reasoning level. `none` explicitly
 /// disables thinking and leaves sampling controls intact. On auto, keep the
 /// client request unchanged for a non-thinking or client-managed request.
-fn apply_deepseek_thinking(object: &mut serde_json::Map<String, Value>, state: &ControllerState) {
+fn apply_deepseek_thinking(
+    object: &mut serde_json::Map<String, Value>,
+    state: &ControllerState,
+    thinking_override: Option<&str>,
+) {
     let route = normalized_route(state, "deepseek");
-    if route.thinking == "none" {
+    let thinking = thinking_override.unwrap_or(&route.thinking);
+    if thinking == "none" {
         object.insert("thinking".into(), serde_json::json!({ "type": "disabled" }));
         if let Some(output_config) = object
             .get_mut("output_config")
@@ -708,8 +723,8 @@ fn apply_deepseek_thinking(object: &mut serde_json::Map<String, Value>, state: &
         }
         return;
     }
-    let effort = match route.thinking.as_str() {
-        "low" | "high" | "max" => route.thinking,
+    let effort = match thinking {
+        "low" | "high" | "max" => thinking,
         _ => return,
     };
     object.insert("thinking".into(), serde_json::json!({ "type": "adaptive" }));
@@ -1540,22 +1555,26 @@ fn rewrite_claude_request(
     state: &ControllerState,
     provider: &str,
     inject_identity: bool,
-) -> Result<Option<String>, String> {
+) -> Result<(), String> {
     let object = body
         .as_object_mut()
         .ok_or_else(|| "Claude request body must be a JSON object".to_string())?;
     // A model the client picked in Claude's picker (advertised via
-    // `inferenceModels`) wins over the Basiliskos route selection. Returns the
-    // chosen id so the caller can persist it into the route and keep the
-    // Basiliskos panel truthful.
-    let chosen = client_model_choice(object, provider, &load_hidden_models().unwrap_or_default());
-    let route_model = normalized_route(state, provider).model;
-    let base_model = chosen.as_deref().unwrap_or(&route_model);
-    let routed_model = apply_route_model(base_model, object, state, provider);
+    // `inferenceModels`) wins over the Basiliskos route selection. The chosen
+    // entry carries both the upstream model and its thinking level.
+    let hidden = load_hidden_models().unwrap_or_default();
+    let route = normalized_route(state, provider);
+    let chosen = client_picker_choice(object, provider, &hidden, &route.model);
+    let base_model = chosen
+        .as_ref()
+        .map(|(model, _)| model.as_str())
+        .unwrap_or(&route.model);
+    let thinking_override = chosen.as_ref().map(|(_, thinking)| thinking.as_str());
+    let routed_model = apply_route_model(base_model, thinking_override, object, state, provider);
     object.insert("model".into(), Value::String(routed_model));
 
     if provider == "deepseek" {
-        apply_deepseek_thinking(object, state);
+        apply_deepseek_thinking(object, state, thinking_override);
     }
 
     for fixup in tool_compatibility_fixups(provider) {
@@ -1563,7 +1582,7 @@ fn rewrite_claude_request(
     }
 
     if !inject_identity {
-        return Ok(chosen);
+        return Ok(());
     }
 
     let identity = serde_json::json!({
@@ -1593,7 +1612,7 @@ fn rewrite_claude_request(
             ));
         }
     }
-    Ok(chosen)
+    Ok(())
 }
 
 fn collect_vision_blocks(
@@ -2136,28 +2155,36 @@ fn handle_front_proxy_request(
             state.routes.insert(provider.clone(), validated);
             let mut json: Value = serde_json::from_slice(&body)
                 .map_err(|_| "Claude request body is invalid JSON".to_string())?;
-            let chosen = rewrite_claude_request(
-                &mut json,
-                &state,
-                &provider,
-                request_path == "/v1/messages",
-            )?;
-            // Persist a client-chosen picker model into the route so the
-            // Basiliskos panel stays truthful about what is being routed. Only
-            // writes when the model actually changed.
-            if let Some(model) = chosen {
+            // Persist a client-chosen picker (model + thinking) into the route
+            // BEFORE the rewrite, so the identity prompt and the Basiliskos
+            // panel are truthful on the very first request after a switch.
+            let hidden = load_hidden_models().unwrap_or_default();
+            let selected_model = state
+                .routes
+                .get(&provider)
+                .map(|route| route.model.clone())
+                .unwrap_or_else(|| default_model(&provider).to_string());
+            if let Some((model, thinking)) = json.as_object().and_then(|object| {
+                client_picker_choice(object, &provider, &hidden, &selected_model)
+            }) {
                 let current = state
                     .routes
                     .get(&provider)
-                    .map(|route| route.model.as_str());
-                if current != Some(model.as_str()) {
+                    .map(|route| (route.model.as_str(), route.thinking.as_str()));
+                if current != Some((model.as_str(), thinking.as_str())) {
                     let mut updated = state.clone();
                     if let Some(route) = updated.routes.get_mut(&provider) {
                         route.model = model.clone();
+                        route.thinking = thinking.clone();
                     }
                     save_state(&updated)?;
+                    state = updated;
+                    // Regenerate the Claude config so the picker follows the
+                    // new selected model's thinking variants.
+                    let _ = write_isolated_claude_config(&isolated_claude_profile_dir()?, &state);
                 }
             }
+            rewrite_claude_request(&mut json, &state, &provider, request_path == "/v1/messages")?;
             if request_path == "/v1/messages" {
                 context_budget = context_budget_for_request(&provider, &json);
             }
@@ -6118,34 +6145,19 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
         .find(|account| account.active)
         .map(|account| account.provider.as_str());
     let model_label = route_label(state, active_provider);
-    // Advertise the active provider's visible catalog in Claude's own picker.
-    // Each entry uses the REAL upstream model id as `name` (the front proxy
-    // honors a client-chosen picker model, see `client_model_choice`) with a
-    // `labelOverride` for display. The currently-selected route model is first
-    // so a freshly loaded window's default request matches the Basiliskos route.
+    // Advertise the active provider's picker entries in Claude's own picker:
+    // the selected model plus its thinking-level variants ("Model · High"),
+    // then the other visible models. `name` is a real Anthropic catalog alias
+    // (Claude validates it); the front proxy maps the alias back to the
+    // upstream model + thinking (`client_picker_choice`).
     let inference_models = match active_provider {
         Some(provider) if SUPPORTED_PROVIDERS.contains(&provider) => {
+            let hidden = load_hidden_models().unwrap_or_default();
             let route = provider_route(state, provider);
-            let selected = route.selected_model.clone();
-            let mut ordered = vec![selected.clone()];
-            for option in &route.model_options {
-                if option.id != selected {
-                    ordered.push(option.id.clone());
-                }
-            }
-            ordered
+            picker_entries(provider, &hidden, &route.selected_model)
                 .into_iter()
-                .map(|id| {
-                    let spec = model_specs(provider)
-                        .iter()
-                        .find(|spec| spec.id == id)
-                        .expect("advertised picker models come from the catalog");
-                    // Claude Desktop requires the `name` to be a real Anthropic
-                    // catalog id; the alias maps back to the upstream model in
-                    // the front proxy (`client_model_choice`).
-                    let name = model_alias(provider, &id)
-                        .expect("every advertised picker model has an Anthropic alias");
-                    serde_json::json!({ "name": name, "labelOverride": spec.label })
+                .map(|(alias, label, _, _)| {
+                    serde_json::json!({ "name": alias, "labelOverride": label })
                 })
                 .collect::<Vec<_>>()
         }
@@ -6393,6 +6405,7 @@ pub fn stop_hydra_claude() -> Result<GatewaySnapshot, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::base_alias;
     use crate::usage::{unrecorded_usage_window, usage_window};
     use crate::vision::text_from_vision_response;
 
@@ -8830,47 +8843,65 @@ mod tests {
     }
 
     #[test]
-    fn client_model_choice_honors_visible_catalog_models_only() {
+    fn client_picker_choice_honors_visible_catalog_models_only() {
         let hidden = BTreeSet::new();
         // Claude sends the Anthropic routing alias; the proxy maps it back to
-        // the real upstream model.
+        // the real upstream model with its thinking level.
         let request = serde_json::json!({ "model": "claude-opus-4-5" });
         assert_eq!(
-            client_model_choice(request.as_object().unwrap(), "kimi", &hidden),
-            Some("kimi-k2.7-code".into())
+            client_picker_choice(request.as_object().unwrap(), "kimi", &hidden, "kimi-k3"),
+            Some(("kimi-k2.7-code".to_string(), "auto".to_string()))
         );
         // Unknown aliases fall back to the Basiliskos route.
         let unknown = serde_json::json!({ "model": "claude-sonnet-9-9" });
         assert_eq!(
-            client_model_choice(unknown.as_object().unwrap(), "kimi", &hidden),
+            client_picker_choice(unknown.as_object().unwrap(), "kimi", &hidden, "kimi-k3"),
             None
         );
         // A model the user hid is not honored even when requested by alias.
         let hidden_set = BTreeSet::from(["kimi-k2.7-code".to_string()]);
         assert_eq!(
-            client_model_choice(request.as_object().unwrap(), "kimi", &hidden_set),
+            client_picker_choice(request.as_object().unwrap(), "kimi", &hidden_set, "kimi-k3"),
             None
         );
     }
 
     #[test]
-    fn model_aliases_round_trip_and_are_distinct_per_provider() {
+    fn picker_aliases_resolve_and_variants_carry_thinking() {
         use std::collections::BTreeSet;
+        let hidden = BTreeSet::new();
         for provider in SUPPORTED_PROVIDERS {
             let mut aliases = BTreeSet::new();
-            for spec in model_specs(provider) {
-                let alias = model_alias(provider, spec.id)
-                    .unwrap_or_else(|| panic!("{provider} {} has no alias", spec.id));
-                // Every alias is a distinct Anthropic catalog name so the
-                // picker can distinguish entries.
-                assert!(aliases.insert(alias), "{provider} alias collision: {alias}");
-                assert_eq!(alias_to_model(provider, alias), Some(spec.id));
+            let selected = default_model(provider);
+            let entries = picker_entries(provider, &hidden, selected);
+            assert!(!entries.is_empty(), "{provider} picker is empty");
+            // Every advertised alias is distinct so the picker can distinguish.
+            for (alias, _, model, thinking) in &entries {
+                assert!(
+                    aliases.insert(alias.as_str()),
+                    "{provider} alias collision: {alias}"
+                );
+                // Base entries resolve to a catalog model with auto thinking.
+                let resolved = alias_to_picker_entry(provider, alias, selected);
+                assert!(resolved.is_some(), "{provider} alias {alias} unresolved");
+                if thinking == "auto" {
+                    assert_eq!(resolved, Some((model.clone(), "auto".into())));
+                } else {
+                    // Variant entries resolve to the selected model with the level.
+                    assert_eq!(resolved, Some((selected.to_string(), thinking.clone())));
+                }
             }
         }
-        // DeepSeek aliases map to Claude catalog ids, not DeepSeek ids.
+        // DeepSeek base aliases map to Claude catalog ids, not DeepSeek ids.
         assert_eq!(
-            model_alias("deepseek", "deepseek-v4-flash"),
+            base_alias("deepseek", "deepseek-v4-flash"),
             Some("claude-sonnet-4-5")
+        );
+        // A thinking variant of the selected deepseek model resolves with its
+        // level (flash levels: none/low/high/max → index 2 = high).
+        assert_eq!(
+            alias_to_picker_entry("deepseek", "claude-opus-4-6", "deepseek-v4-flash"),
+            Some(("deepseek-v4-flash".to_string(), "high".to_string()))
         );
     }
 
@@ -8896,7 +8927,7 @@ mod tests {
         // kimi-k3 only supports max thinking, so route thinking "high" must
         // degrade to auto (plain id) for the route model.
         assert_eq!(
-            apply_route_model("kimi-k3", &mut request, &state, "kimi"),
+            apply_route_model("kimi-k3", None, &mut request, &state, "kimi"),
             "kimi-k3"
         );
         // A client-chosen kimi-k2.7-code supports high → suffix applied.
@@ -8908,12 +8939,12 @@ mod tests {
             },
         );
         assert_eq!(
-            apply_route_model("kimi-k2.7-code", &mut request, &state, "kimi"),
+            apply_route_model("kimi-k2.7-code", None, &mut request, &state, "kimi"),
             "kimi-k2.7-code(high)"
         );
         // DeepSeek never gets a suffix.
         assert_eq!(
-            apply_route_model("deepseek-v4-flash", &mut request, &state, "deepseek"),
+            apply_route_model("deepseek-v4-flash", None, &mut request, &state, "deepseek"),
             "deepseek-v4-flash"
         );
     }
