@@ -302,11 +302,25 @@ pub(crate) fn base_alias(provider: &str, model: &str) -> Option<&'static str> {
     ANTHROPIC_ALIAS_POOL.get(index).copied()
 }
 
+/// Human label for a thinking level shown in the picker entries.
+pub(crate) fn thinking_level_label(level: &str) -> &'static str {
+    match level {
+        "auto" => "Auto",
+        "none" => "Off",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra high",
+        "max" => "Maximum",
+        "ultra" => "Ultra",
+        _ => "Auto",
+    }
+}
+
 /// Builds the Claude picker entries for the active provider: the selected
-/// model first, then the other visible models, each with a stable Anthropic
-/// base alias. Thinking is not encoded here — Claude's native effort control
-/// (see gateway.rs `client_effort_choice` / the session-file sync) drives it.
-/// Returns (alias, label, upstream model, thinking).
+/// model first (its base entry, then an explicit entry per supported thinking
+/// level), then the other visible models as base entries. Returns
+/// (alias, label, upstream model, thinking).
 pub(crate) fn picker_entries(
     provider: &str,
     hidden: &BTreeSet<String>,
@@ -324,6 +338,22 @@ pub(crate) fn picker_entries(
                     spec.id.to_string(),
                     "auto".into(),
                 ));
+            }
+            // Thinking variants use pool slots after the base models. Only one
+            // model's variants are advertised at a time (the selected one), so
+            // the slots are unambiguous: index < n_models is a base model,
+            // index >= n_models is a thinking variant of the selected model.
+            if provider != "claude" && spec.thinking_levels.len() > 1 {
+                for (index, level) in spec.thinking_levels.iter().enumerate() {
+                    if let Some(alias) = ANTHROPIC_ALIAS_POOL.get(specs.len() + index) {
+                        entries.push((
+                            alias.to_string(),
+                            format!("{} · {}", spec.label, thinking_level_label(level)),
+                            spec.id.to_string(),
+                            level.to_string(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -345,11 +375,12 @@ pub(crate) fn picker_entries(
 
 /// Reverse lookup for a picker request: Anthropic alias → (upstream model,
 /// thinking). Base aliases resolve from the provider catalog with "auto"
-/// thinking; the claude provider aliases to its own model id.
+/// thinking; variant aliases (index >= model count) resolve against the
+/// selected model's thinking levels.
 pub(crate) fn alias_to_picker_entry(
     provider: &str,
     alias: &str,
-    _selected: &str,
+    selected: &str,
 ) -> Option<(String, String)> {
     if provider == "claude" {
         return model_specs("claude")
@@ -361,6 +392,13 @@ pub(crate) fn alias_to_picker_entry(
     let index = ANTHROPIC_ALIAS_POOL
         .iter()
         .position(|candidate| *candidate == alias)?;
-    let spec = specs.get(index)?;
-    Some((spec.id.to_string(), "auto".into()))
+    if index < specs.len() {
+        return Some((specs[index].id.to_string(), "auto".into()));
+    }
+    let selected_spec = specs.iter().find(|spec| spec.id == selected)?;
+    if selected_spec.thinking_levels.len() > 1 {
+        let level = selected_spec.thinking_levels.get(index - specs.len())?;
+        return Some((selected.to_string(), (*level).to_string()));
+    }
+    None
 }

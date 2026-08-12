@@ -4855,10 +4855,21 @@ fn sync_route_from_claude_session() {
     };
     let provider = account.provider.clone();
     let default_model = default_model(&provider);
-    let Some((upstream, _)) = alias_to_picker_entry(&provider, &model, default_model) else {
+    let selected = state
+        .routes
+        .get(&provider)
+        .map(|route| route.model.as_str())
+        .unwrap_or(default_model);
+    let Some((upstream, entry_thinking)) = alias_to_picker_entry(&provider, &model, selected)
+    else {
         return; // generic routing alias or unknown — leave the route alone
     };
-    let thinking = effort_to_thinking(&provider, &upstream, &effort);
+    // A variant picker entry carries its thinking; the session effort field
+    // (when present) overrides it.
+    let thinking = match effort_to_thinking(&provider, &upstream, &effort).as_str() {
+        "auto" => entry_thinking,
+        level => level.to_string(),
+    };
     let current = state
         .routes
         .get(&provider)
@@ -9024,7 +9035,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_aliases_resolve_with_auto_thinking() {
+    fn picker_aliases_resolve_and_variants_carry_thinking() {
         use std::collections::BTreeSet;
         let hidden = BTreeSet::new();
         for provider in SUPPORTED_PROVIDERS {
@@ -9038,15 +9049,26 @@ mod tests {
                     aliases.insert(alias.as_str()),
                     "{provider} alias collision: {alias}"
                 );
-                assert_eq!(thinking, "auto");
                 let resolved = alias_to_picker_entry(provider, alias, selected);
-                assert_eq!(resolved, Some((model.clone(), "auto".into())));
+                assert!(resolved.is_some(), "{provider} alias {alias} unresolved");
+                if thinking == "auto" {
+                    assert_eq!(resolved, Some((model.clone(), "auto".into())));
+                } else {
+                    // Variant entries resolve to the selected model with the level.
+                    assert_eq!(resolved, Some((selected.to_string(), thinking.clone())));
+                }
             }
         }
         // DeepSeek base aliases map to Claude catalog ids, not DeepSeek ids.
         assert_eq!(
             base_alias("deepseek", "deepseek-v4-flash"),
             Some("claude-sonnet-4-5")
+        );
+        // A thinking variant of the selected deepseek model resolves with its
+        // level (flash levels: none/low/high/max → index 2 = high).
+        assert_eq!(
+            alias_to_picker_entry("deepseek", "claude-opus-4-6", "deepseek-v4-flash"),
+            Some(("deepseek-v4-flash".to_string(), "high".to_string()))
         );
     }
 
