@@ -258,3 +258,55 @@ pub(crate) fn context_budget_for_request(provider: &str, request: &Value) -> Opt
             .unwrap_or(0),
     })
 }
+
+/// Claude Desktop validates `inferenceModels[].name` against Anthropic's own
+/// provider catalog even with `unstableDisableModelVerification` — the name
+/// must be a real Anthropic model id (verified empirically 2026-08-12 against
+/// Claude 1.28929: `deepseek-v4-flash` → invalid; `claude-sonnet-4-5` etc. →
+/// healthy). So every advertised picker entry routes through a stable
+/// Anthropic alias and the front proxy maps the alias back to the real
+/// upstream model (see gateway.rs `client_model_choice`). Aliases are unique
+/// within a provider so Claude's picker can distinguish entries. The pool below
+/// covers the largest provider (xai, 9 models).
+const ANTHROPIC_ALIAS_POOL: [&str; 11] = [
+    "claude-sonnet-4-5",
+    "claude-opus-4-5",
+    "claude-haiku-4-5",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-fable-5",
+    "claude-sonnet-4-5-20250929",
+    "claude-opus-4-5-20251101",
+    "claude-haiku-4-5-20251001",
+];
+
+/// Stable Anthropic routing alias for a provider model. The claude provider
+/// aliases to its own model id (already an Anthropic catalog id).
+pub(crate) fn model_alias(provider: &str, model: &str) -> Option<&'static str> {
+    if provider == "claude" {
+        return model_specs("claude")
+            .iter()
+            .find(|spec| spec.id == model)
+            .map(|spec| spec.id);
+    }
+    let specs = model_specs(provider);
+    let index = specs.iter().position(|spec| spec.id == model)?;
+    ANTHROPIC_ALIAS_POOL.get(index).copied()
+}
+
+/// Reverse lookup: Anthropic alias → real upstream model for a provider.
+pub(crate) fn alias_to_model(provider: &str, alias: &str) -> Option<&'static str> {
+    if provider == "claude" {
+        return model_specs("claude")
+            .iter()
+            .find(|spec| spec.id == alias)
+            .map(|spec| spec.id);
+    }
+    model_specs(provider)
+        .iter()
+        .enumerate()
+        .find(|(index, _)| ANTHROPIC_ALIAS_POOL.get(*index) == Some(&alias))
+        .map(|(_, spec)| spec.id)
+}

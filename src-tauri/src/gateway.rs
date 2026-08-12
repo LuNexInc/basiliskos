@@ -22,8 +22,9 @@ use uuid::Uuid;
 use crate::diagnostics::{self, DiagnosticEvent, ErrorCode};
 
 use crate::catalog::{
-    context_budget_for_request, context_window_for_route, default_model, default_routes,
-    model_specs, ModelSpec, CLAUDE_MODELS, DEEPSEEK_MODELS, SUPPORTED_PROVIDERS,
+    alias_to_model, context_budget_for_request, context_window_for_route, default_model,
+    default_routes, model_alias, model_specs, ModelSpec, CLAUDE_MODELS, DEEPSEEK_MODELS,
+    SUPPORTED_PROVIDERS,
 };
 use crate::claude_window::{
     claude_icon_path, enum_claude_hwnds_for_pid, log_icon_line, spawn_claude_icon_reapply,
@@ -629,11 +630,15 @@ fn client_model_choice(
     hidden: &BTreeSet<String>,
 ) -> Option<String> {
     let requested = request.get("model").and_then(Value::as_str)?;
+    // The request carries the Anthropic routing alias Claude advertised in the
+    // picker; map it back to the real upstream model. The generic routing
+    // alias (claude-fable-5 default) and unknown ids fall through.
+    let upstream = alias_to_model(provider, requested).unwrap_or(requested);
     let specs = model_specs(provider);
-    if !specs.iter().any(|spec| spec.id == requested) {
+    if !specs.iter().any(|spec| spec.id == upstream) {
         return None;
     }
-    (!hidden.contains(requested)).then(|| requested.to_string())
+    (!hidden.contains(upstream)).then(|| upstream.to_string())
 }
 
 /// Applies the provider-specific model transformation (thinking suffix, Grok
@@ -6135,7 +6140,12 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
                         .iter()
                         .find(|spec| spec.id == id)
                         .expect("advertised picker models come from the catalog");
-                    serde_json::json!({ "name": id, "labelOverride": spec.label })
+                    // Claude Desktop requires the `name` to be a real Anthropic
+                    // catalog id; the alias maps back to the upstream model in
+                    // the front proxy (`client_model_choice`).
+                    let name = model_alias(provider, &id)
+                        .expect("every advertised picker model has an Anthropic alias");
+                    serde_json::json!({ "name": name, "labelOverride": spec.label })
                 })
                 .collect::<Vec<_>>()
         }
@@ -8258,7 +8268,10 @@ mod tests {
                 thinking: "high".into(),
             },
         );
-        let mut request = serde_json::json!({"model": "claude-sonnet-4-5"});
+        // The generic default alias is not a picker alias for kimi (kimi uses
+        // pool indexes 0-6, not claude-fable-5), so the request falls back to
+        // the Basiliskos route selection.
+        let mut request = serde_json::json!({"model": "claude-fable-5"});
         rewrite_claude_request(&mut request, &state, "kimi", true).unwrap();
         assert_eq!(
             request.get("model").and_then(Value::as_str),
@@ -8819,28 +8832,45 @@ mod tests {
     #[test]
     fn client_model_choice_honors_visible_catalog_models_only() {
         let hidden = BTreeSet::new();
-        let request = serde_json::json!({ "model": "kimi-k2.7-code" });
+        // Claude sends the Anthropic routing alias; the proxy maps it back to
+        // the real upstream model.
+        let request = serde_json::json!({ "model": "claude-opus-4-5" });
         assert_eq!(
             client_model_choice(request.as_object().unwrap(), "kimi", &hidden),
             Some("kimi-k2.7-code".into())
         );
-        // The generic Claude routing alias is never a catalog model.
-        let alias = serde_json::json!({ "model": "claude-fable-5" });
-        assert_eq!(
-            client_model_choice(alias.as_object().unwrap(), "kimi", &hidden),
-            None
-        );
-        // Unknown ids fall back to the Basiliskos route.
-        let unknown = serde_json::json!({ "model": "not-a-model" });
+        // Unknown aliases fall back to the Basiliskos route.
+        let unknown = serde_json::json!({ "model": "claude-sonnet-9-9" });
         assert_eq!(
             client_model_choice(unknown.as_object().unwrap(), "kimi", &hidden),
             None
         );
-        // A model the user hid is not honored.
+        // A model the user hid is not honored even when requested by alias.
         let hidden_set = BTreeSet::from(["kimi-k2.7-code".to_string()]);
         assert_eq!(
             client_model_choice(request.as_object().unwrap(), "kimi", &hidden_set),
             None
+        );
+    }
+
+    #[test]
+    fn model_aliases_round_trip_and_are_distinct_per_provider() {
+        use std::collections::BTreeSet;
+        for provider in SUPPORTED_PROVIDERS {
+            let mut aliases = BTreeSet::new();
+            for spec in model_specs(provider) {
+                let alias = model_alias(provider, spec.id)
+                    .unwrap_or_else(|| panic!("{provider} {} has no alias", spec.id));
+                // Every alias is a distinct Anthropic catalog name so the
+                // picker can distinguish entries.
+                assert!(aliases.insert(alias), "{provider} alias collision: {alias}");
+                assert_eq!(alias_to_model(provider, alias), Some(spec.id));
+            }
+        }
+        // DeepSeek aliases map to Claude catalog ids, not DeepSeek ids.
+        assert_eq!(
+            model_alias("deepseek", "deepseek-v4-flash"),
+            Some("claude-sonnet-4-5")
         );
     }
 
