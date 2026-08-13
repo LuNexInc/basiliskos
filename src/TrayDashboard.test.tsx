@@ -22,8 +22,8 @@ describe("tray dashboard preview render", () => {
     const TrayDashboard = await loadTrayWithTrayFlag();
     render(<TrayDashboard />);
     await act(async () => {});
-    expect(screen.getByText("Basiliskos")).toBeInTheDocument();
-    expect(screen.getByText("Fuel core")).toBeInTheDocument();
+    expect(screen.getByText("BasiliskOS")).toBeInTheDocument();
+    expect(screen.getByText("Relay")).toBeInTheDocument();
     expect(screen.getByText("CORE ONLINE")).toBeInTheDocument();
     expect(screen.getByText(/Relay · /)).toBeInTheDocument();
     expect(screen.getByText(/Link · /)).toBeInTheDocument();

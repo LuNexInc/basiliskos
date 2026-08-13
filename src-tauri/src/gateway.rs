@@ -39,7 +39,7 @@ use crate::usage::{
 };
 use crate::vision::{
     append_vision_presentation_guidance, replace_images_with_description, resolve_deepseek_vision,
-    tool_compatibility_fixups,
+    tool_compatibility_fixups, vision_sidecar_request_from_any,
 };
 
 use crate::persistence::{
@@ -47,13 +47,15 @@ use crate::persistence::{
     secure_create_dir_all, secure_existing_path, FileMutation,
 };
 
-// Pin CLIProxyAPI 7.2.128 (2026-08-10). Upstream issue #4339 (x_search
+// Pin CLIProxyAPI 7.2.131 (2026-08-13). Upstream issue #4339 (x_search
 // injection vs client web_search) is now a configurable injector rather than
 // unconditional; re-verified against this pin during the 2.3.0 upgrade smoke
-// test. Kimi K3 (`kimi-k3`) registry support confirmed still present.
-const GATEWAY_VERSION: &str = "7.2.128";
+// test. Kimi K3 (`kimi-k3`) registry support confirmed still present. The
+// 7.2.131 xAI registry adds grok-4.6 (verified: routes 200 with the saved
+// xAI OAuth; 7.2.128 and 7.2.130 predate it).
+const GATEWAY_VERSION: &str = "7.2.131";
 pub(crate) const GATEWAY_EXE_SHA256: &str =
-    "5676ddaef47fb64ea9806d6d35c4be9600bed4625cf6bd4b65f1a00e527d5a8a";
+    "05f0c7bc700c54e0b031838c52b753a052e3ce167fdb7b47b99c3b1ee4d26f34";
 const GATEWAY_PORT: u16 = 8317;
 const BACKEND_PORT: u16 = 8318;
 const MAX_RELAY_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -1138,10 +1140,6 @@ fn save_state(state: &ControllerState) -> Result<(), String> {
 /// The relay's own API key (the `hydra-...` credential clients use to
 /// authenticate against the front proxy). Shared by client integrations that
 /// point third-party tools at `127.0.0.1:8317/v1`.
-pub(crate) fn relay_api_key() -> Result<String, String> {
-    Ok(load_state()?.api_key)
-}
-
 fn load_account_labels() -> Result<BTreeMap<String, String>, String> {
     let path = account_labels_path()?;
     if !path.exists() && !crate::persistence::backup_path(&path)?.exists() {
@@ -1309,8 +1307,53 @@ fn active_deepseek_api_key(auth: &Path, state: &ControllerState) -> Option<Strin
     nested_string(&value, &["api_key"]).filter(|key| is_valid_deepseek_api_key(key))
 }
 
+/// Returns the API key of an enabled DeepSeek account, preferring the active
+/// account when it is a DeepSeek account, and falling back to any other enabled
+/// DeepSeek account. The fallback keeps the isolated Codex window's model
+/// switcher real: a DeepSeek pick routes to real DeepSeek even when another
+/// provider is the active account (the one-enabled-per-provider invariant means
+/// there is at most one such account in steady state).
+fn enabled_deepseek_api_key(auth: &Path, state: &ControllerState) -> Option<String> {
+    if let Some(key) = active_deepseek_api_key(auth, state) {
+        return Some(key);
+    }
+    let Ok(entries) = fs::read_dir(auth) else {
+        return None;
+    };
+    let mut keys = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !(file_name.starts_with("deepseek-") && file_name.ends_with(".json")) {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if account_provider(&value, &file_name).as_deref() != Some("deepseek") {
+            continue;
+        }
+        if value
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Some(key) =
+            nested_string(&value, &["api_key"]).filter(|key| is_valid_deepseek_api_key(key))
+        {
+            keys.push(key);
+        }
+    }
+    keys.sort();
+    keys.into_iter().next()
+}
+
 /// Renders the CLIProxyAPI `openai-compatibility` provider block for DeepSeek,
-/// or an empty string when no DeepSeek account is active.
+/// or an empty string when no enabled DeepSeek account exists.
 ///
 /// The key belongs under `api-key-entries`; `api-keys` parses without error but
 /// yields zero loaded clients (verified against the pinned 7.2.128 runtime).
@@ -1321,7 +1364,7 @@ fn active_deepseek_api_key(auth: &Path, state: &ControllerState) -> Option<Strin
 /// picked model runs its own provider (credentials permitting) instead of
 /// being hijacked to the active route.
 fn deepseek_compat_block(auth: &Path, state: &ControllerState) -> String {
-    let Some(api_key) = active_deepseek_api_key(auth, state) else {
+    let Some(api_key) = enabled_deepseek_api_key(auth, state) else {
         return String::new();
     };
     let route_model = state
@@ -1400,6 +1443,9 @@ plugins:
   configs:
     basiliskos-codex-compaction:
       enabled: true
+      auth_dir: {auth_dir}
+      deepseek_responses_url: "https://api.deepseek.com/responses"
+      vision_url: "http://127.0.0.1:{GATEWAY_PORT}/hydra/vision-describe"
 # Explicit: upstream default since v7.2.128; keeps it fixed even if the
 # upstream default flips. Prevents native x_search injection into Grok
 # requests (issue #4339) regardless of client tool declarations.
@@ -1890,6 +1936,77 @@ fn proxy_error(
     response
 }
 
+fn json_proxy_response(
+    status: u16,
+    body: Value,
+    correlation_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_string(body.to_string()).with_status_code(StatusCode(status));
+    if let Ok(header) = Header::from_bytes("content-type", "application/json") {
+        response.add_header(header);
+    }
+    if let Ok(header) = Header::from_bytes("x-basiliskos-correlation-id", correlation_id) {
+        response.add_header(header);
+    }
+    response
+}
+
+/// Describe images for the Codex DeepSeek hop. Does not require DeepSeek to be
+/// the active Basiliskos route — the Codex picker can select DeepSeek while
+/// another provider is selected in the controller.
+fn handle_hydra_vision_describe(
+    request: tiny_http::Request,
+    body: &[u8],
+    async_runtime: &tokio::runtime::Handle,
+    client: &reqwest::Client,
+    correlation_id: &str,
+) {
+    let result = (|| -> Result<String, String> {
+        let json: Value = serde_json::from_slice(body)
+            .map_err(|_| "The vision request body is invalid JSON".to_string())?;
+        let sidecar_request = vision_sidecar_request_from_any(&json)
+            .ok_or_else(|| "The request contains no supported image blocks.".to_string())?;
+        let accounts = {
+            let _mutation = mutation_lock()?;
+            let state = load_state()?;
+            list_accounts_inner(&state)?
+        };
+        resolve_deepseek_vision(
+            async_runtime,
+            client,
+            &accounts,
+            &sidecar_request,
+            correlation_id,
+        )
+    })();
+    match result {
+        Ok(description) => {
+            let _ = request.respond(json_proxy_response(
+                200,
+                serde_json::json!({ "description": description }),
+                correlation_id,
+            ));
+        }
+        Err(error) => {
+            diagnostics::record(
+                ErrorCode::VisionUnavailable,
+                "warning",
+                &error,
+                Some(correlation_id),
+                Some(502),
+                None,
+            );
+            respond_proxy_error(
+                request,
+                ErrorCode::VisionUnavailable,
+                502,
+                "Basiliskos could not obtain an image description from any configured OAuth vision provider.",
+                correlation_id,
+            );
+        }
+    }
+}
+
 fn respond_proxy_error(
     request: tiny_http::Request,
     code: ErrorCode,
@@ -2265,6 +2382,11 @@ fn handle_front_proxy_request(
             "The request body exceeds the 8 MiB Basiliskos limit.",
             correlation_id,
         );
+        return;
+    }
+
+    if request_path == "/hydra/vision-describe" {
+        handle_hydra_vision_describe(request, &body, async_runtime, client, correlation_id);
         return;
     }
 
@@ -5305,6 +5427,180 @@ fn sync_route_from_claude_session() {
     }
 }
 
+/// Parses the picker choice out of the Codex config.toml text.
+fn parse_codex_config_toml(raw: &str) -> Option<(String, String)> {
+    let mut model = None;
+    let mut effort = "auto".to_string();
+    for line in raw.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("model = ") {
+            model = Some(rest.trim().trim_matches('"').to_string());
+        } else if let Some(rest) = line.strip_prefix("model_reasoning_effort = ") {
+            effort = rest.trim().trim_matches('"').to_string();
+        }
+    }
+    model.map(|m| (m, effort))
+}
+
+/// Reads the isolated Codex window's current picker choice from its
+/// config.toml (`model = "..."`, `model_reasoning_effort = "..."`). The app
+/// persists the picker selection there on change; the encrypted dial body is
+/// not visible to the relay, so this file is the sync signal.
+fn codex_config_model() -> Option<(String, String)> {
+    let home = isolated_codex_home().ok()?;
+    let raw = fs::read_to_string(home.join("config.toml")).ok()?;
+    parse_codex_config_toml(&raw)
+}
+
+/// Finds the Basiliskos provider that advertises the given model id.
+fn model_to_provider(model: &str) -> Option<&'static str> {
+    SUPPORTED_PROVIDERS
+        .into_iter()
+        .find(|provider| model_specs(provider).iter().any(|spec| spec.id == model))
+}
+
+/// Chooses the account to make active when the Codex window picks a model of
+/// a different provider: the already-enabled account of that provider (the
+/// per-provider pin), else the first non-expired account, else the first.
+fn pick_codex_sync_account<'a>(
+    accounts: &'a [GatewayAccount],
+    provider: &str,
+) -> Option<&'a GatewayAccount> {
+    let candidates = accounts
+        .iter()
+        .filter(|account| account.provider == provider)
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find(|account| !account.disabled)
+        .or_else(|| {
+            candidates.iter().find(|account| {
+                !matches!(
+                    account.credential_status.as_str(),
+                    "expired" | "relogin_required"
+                )
+            })
+        })
+        .or_else(|| candidates.first())
+        .copied()
+}
+
+/// Applies the isolated Codex window's picker model to the Basiliskos active
+/// route so Claude Desktop and the Basiliskos GUI follow the window (option 1:
+/// the window's switcher is the source of truth while it is open). The
+/// encrypted dial cannot be inspected, so the relay reads the persisted
+/// config.toml choice. Same-provider picks update the route model; a pick of a
+/// different provider's model switches the active account. Runs on the
+/// supervision timer; best-effort (any failure leaves the route untouched).
+fn sync_route_from_codex_window(app: &AppHandle) {
+    let Ok(_mutation) = mutation_lock() else {
+        return;
+    };
+    if !hydra_codex_running() {
+        return;
+    }
+    let Some((model, _effort)) = codex_config_model() else {
+        return;
+    };
+    let Some(provider) = model_to_provider(&model) else {
+        return; // a model Basiliskos does not advertise — leave the route alone
+    };
+    let Ok(mut state) = load_state() else { return };
+    let Ok(accounts) = list_accounts_inner(&state) else {
+        return;
+    };
+    let active_provider = state
+        .active_account
+        .as_deref()
+        .and_then(|file| accounts.iter().find(|a| a.file_name == file))
+        .map(|account| account.provider.as_str());
+    // Sync the MODEL only. The config.toml reasoning effort is the launch
+    // default ("high" even when the route says auto), not a reliable user
+    // intent, so syncing thinking from it would make spurious route changes.
+    let existing_thinking = state
+        .routes
+        .get(provider)
+        .map(|route| route.thinking.clone())
+        .unwrap_or_else(|| "auto".to_string());
+    let target_route = RouteSelection {
+        model: model.clone(),
+        thinking: existing_thinking,
+    };
+
+    if active_provider == Some(provider) {
+        // Same provider: update the route model only, preserving thinking.
+        let current = state.routes.get(provider);
+        if current == Some(&target_route) {
+            return;
+        }
+        state.routes.insert(provider.to_string(), target_route);
+        let _ = save_state(&state);
+        if let Ok(profile) = isolated_claude_profile_dir() {
+            let _ = write_isolated_claude_config(&profile, &state);
+        }
+        return;
+    }
+
+    // Different provider: switch the active account to that provider's pinned
+    // (or first usable) account, then set the route to the picked model.
+    let Some(target) = pick_codex_sync_account(&accounts, provider) else {
+        return;
+    };
+    let target_file = target.file_name.clone();
+    let Ok(root) = root_dir() else { return };
+    let Ok(directory) = auth_dir() else { return };
+    let Ok(state_path) = controller_path() else {
+        return;
+    };
+    let restart_backend = selection_requires_backend_restart(
+        &accounts,
+        state.active_account.as_deref(),
+        &target_file,
+    );
+    let Ok((mutations, mut switched)) = selection_transaction(
+        &root,
+        &directory,
+        &state_path,
+        &accounts,
+        &state,
+        &target_file,
+    ) else {
+        return;
+    };
+    if run_transaction(&root, &mutations, || {
+        validate_account_invariant(&directory, &state_path)
+    })
+    .is_err()
+    {
+        return;
+    }
+    switched.routes.insert(provider.to_string(), target_route);
+    if let Ok(mut runtime) = runtime_lock() {
+        runtime.last_known_good_models.clear();
+    }
+    let _ = save_state(&switched);
+    let _ = prepare_config();
+    if restart_backend {
+        if let Err(error) = restart_backend_for_provider_config(app, &switched) {
+            diagnostics::record(
+                ErrorCode::BackendRestartFailed,
+                "warning",
+                &format!("Codex route sync backend restart failed: {error}"),
+                None,
+                None,
+                Some(provider),
+            );
+        }
+    }
+    if let Ok(profile) = isolated_claude_profile_dir() {
+        let _ = write_isolated_claude_config(&profile, &switched);
+    }
+    if let Ok(home) = isolated_codex_home() {
+        let _ = write_isolated_codex_config(&home, &switched);
+    }
+    refresh_model_catalog_cache(provider, &switched.api_key);
+}
+
 /// Runs backend crash recovery on a fixed timer instead of only on idle
 /// listener ticks. The listener still calls `supervise_backend` on idle, so a
 /// crash during a request burst is now detected within one tick regardless of
@@ -5318,7 +5614,14 @@ pub fn start_backend_supervision(app: AppHandle) {
         loop {
             tokio::time::sleep(BACKEND_SUPERVISION_INTERVAL).await;
             supervise_backend(&app);
-            sync_route_from_claude_session();
+            // The Codex window is the live control surface when it is open:
+            // its picker drives the active route, so the Claude-session sync
+            // yields to it. When the Codex window is closed, the Claude
+            // session drives as before.
+            if !hydra_codex_running() {
+                sync_route_from_claude_session();
+            }
+            sync_route_from_codex_window(&app);
         }
     });
 }
@@ -6865,10 +7168,49 @@ openai_base_url = "http://127.0.0.1:{port}/v1"
 /// CLIProxyAPI routes the chosen model to the right credential. The system
 /// prompt is a neutral Basiliskos-authored agent prompt (the openai/codex
 /// prompt made routed models falsely claim to be OpenAI's Codex).
-fn codex_catalog_models() -> Vec<Value> {
+/// Providers that currently have at least one enabled credential. The Codex
+/// window's model picker only offers models whose provider is actually
+/// authenticated; an un-authed provider (e.g. Claude with no credential) is
+/// dropped so the picker never shows a model that cannot route.
+fn enabled_providers(auth: &Path) -> std::collections::HashSet<String> {
+    let mut providers = std::collections::HashSet::new();
+    let Ok(entries) = fs::read_dir(auth) else {
+        return providers;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(provider) = account_provider(&value, &file_name) else {
+            continue;
+        };
+        if value
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        providers.insert(provider);
+    }
+    providers
+}
+
+fn codex_catalog_models(enabled: &std::collections::HashSet<String>) -> Vec<Value> {
     let base_instructions = include_str!("../assets/codex-system-prompt.md");
     let mut models = Vec::new();
     for provider in SUPPORTED_PROVIDERS {
+        if !enabled.contains(provider) {
+            continue;
+        }
         for spec in model_specs(provider) {
             let context_window = context_window_for_route(provider, spec.id).unwrap_or(200_000);
             let reasoning_levels = spec
@@ -6924,8 +7266,10 @@ fn write_isolated_codex_config(home: &Path, state: &ControllerState) -> Result<(
             model: default_model(&provider).to_string(),
             thinking: "auto".into(),
         });
-    // Picker catalog: every Basiliskos route model, keyed by upstream model id.
-    let catalog = serde_json::json!({ "models": codex_catalog_models() });
+    // Picker catalog: only models whose provider is currently authenticated,
+    // so an un-authed provider (Claude with no credential) is never offered.
+    let catalog =
+        serde_json::json!({ "models": codex_catalog_models(&enabled_providers(&auth_dir()?)) });
     durable_write(
         &home.join("model-catalog.json"),
         serde_json::to_vec_pretty(&catalog)
@@ -7474,6 +7818,36 @@ mod tests {
     }
 
     #[test]
+    fn responses_images_become_sidecar_anthropic_blocks() {
+        use crate::vision::{vision_content_from_responses, vision_sidecar_request_from_any};
+        let request = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "What is in this screenshot?"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                    ]
+                }
+            ]
+        });
+        let content = vision_content_from_responses(&request).unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "AAAA");
+        let sidecar = vision_sidecar_request_from_any(&request).unwrap();
+        assert!(sidecar.get("messages").is_some());
+        assert!(vision_sidecar_request_from_any(&serde_json::json!({
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"no image"}]}]
+        }))
+        .is_none());
+    }
+
+    #[test]
     fn vision_response_parser_accepts_anthropic_and_openai_shapes() {
         assert_eq!(
             text_from_vision_response(&serde_json::json!({
@@ -7784,7 +8158,11 @@ mod tests {
 
     #[test]
     fn codex_catalog_advertises_real_upstream_model_ids() {
-        let models = codex_catalog_models();
+        let all: std::collections::HashSet<String> = SUPPORTED_PROVIDERS
+            .iter()
+            .map(|provider| provider.to_string())
+            .collect();
+        let models = codex_catalog_models(&all);
         let ids = models
             .iter()
             .filter_map(|model| model.get("slug").and_then(Value::as_str))
@@ -7812,6 +8190,36 @@ mod tests {
                 "prompt must be present"
             );
         }
+    }
+
+    #[test]
+    fn codex_catalog_offers_only_authenticated_providers() {
+        let auth = temp_dir("codex-catalog-auth");
+        auth_file(&auth, "xai-test.json", "xai");
+        deepseek_auth_file(&auth, "deepseek-aaa.json", "sk-key", false);
+
+        let enabled = enabled_providers(&auth);
+        assert!(enabled.contains("xai"));
+        assert!(enabled.contains("deepseek"));
+        assert!(!enabled.contains("claude"));
+        assert!(!enabled.contains("codex"));
+        assert!(!enabled.contains("kimi"));
+
+        let models = codex_catalog_models(&enabled);
+        let ids = models
+            .iter()
+            .filter_map(|model| model.get("slug").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        // Authenticated providers are offered.
+        assert!(ids.contains(&"grok-4.5"));
+        assert!(ids.contains(&"deepseek-v4-flash"));
+        // Un-authed providers are dropped, so the picker never shows a model
+        // that cannot route.
+        assert!(!ids.contains(&"gpt-5.6-terra"));
+        assert!(!ids.contains(&"kimi-k3"));
+        assert!(!ids.contains(&"claude-sonnet-4-5-20250929"));
+
+        let _ = fs::remove_dir_all(auth);
     }
 
     #[test]
@@ -7948,16 +8356,18 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_config_block_uses_api_key_entries_only_for_the_active_account() {
+    fn deepseek_compat_block_uses_the_enabled_account_regardless_of_active() {
         let auth = temp_dir("deepseek-config");
         deepseek_auth_file(&auth, "deepseek-aaa.json", "sk-active-key", false);
-        deepseek_auth_file(&auth, "deepseek-bbb.json", "sk-other-key", false);
+        deepseek_auth_file(&auth, "deepseek-bbb.json", "sk-other-key", true); // disabled
         auth_file(&auth, "xai-test.json", "xai");
 
         let config = render_config(&auth, &state_with_active("deepseek-aaa.json"));
         // `api-keys` parses but loads zero clients on the pinned runtime; the
         // key must be under `api-key-entries`.
         assert!(config.contains("openai-compatibility:"));
+        assert!(config.contains("deepseek_responses_url: \"https://api.deepseek.com/responses\""));
+        assert!(config.contains("vision_url: \"http://127.0.0.1:8317/hydra/vision-describe\""));
         assert!(config.contains("api-key-entries:"));
         assert!(config.contains("- api-key: \"sk-active-key\""));
         assert!(config.contains("- name: \"basiliskos-deepseek\""));
@@ -7976,16 +8386,17 @@ mod tests {
         assert!(!config.contains("alias: \"claude-sonnet-4-5-20250929\""));
         assert!(!config.contains("alias: \"gpt-5.6-terra\""));
         assert!(!config.contains("alias: \"kimi-k3\""));
-        // CLIProxyAPI load-balances across entries, so a key the user did not
-        // select must never be rendered alongside the active one.
+        // A disabled account's key is never rendered.
         assert!(!config.contains("sk-other-key"));
 
-        // A non-DeepSeek active account keeps every DeepSeek key out of the config.
+        // A non-DeepSeek active account still routes DeepSeek picks for real:
+        // the enabled DeepSeek account's key stays in the compat block.
         let other = render_config(&auth, &state_with_active("xai-test.json"));
-        assert!(!other.contains("openai-compatibility:"));
-        assert!(!other.contains("sk-active-key"));
+        assert!(other.contains("openai-compatibility:"));
+        assert!(other.contains("- api-key: \"sk-active-key\""));
+        assert!(!other.contains("sk-other-key"));
 
-        // A disabled DeepSeek account must not be routed either.
+        // With every DeepSeek account disabled, the block is omitted.
         deepseek_auth_file(&auth, "deepseek-aaa.json", "sk-active-key", true);
         let disabled = render_config(&auth, &state_with_active("deepseek-aaa.json"));
         assert!(!disabled.contains("openai-compatibility:"));
@@ -10094,6 +10505,79 @@ mod tests {
         assert_eq!(effort_to_thinking("xai", "grok-4.5", "medium"), "low");
         // Auto passes through.
         assert_eq!(effort_to_thinking("kimi", "kimi-k3", "auto"), "auto");
+    }
+
+    #[test]
+    fn codex_config_model_parses_the_picker_choice() {
+        let parsed = parse_codex_config_toml(
+            r#"# Generated by Basiliskos for the isolated Codex client only.
+model = "grok-4.6"
+model_reasoning_effort = "xhigh"
+model_reasoning_summary = "detailed"
+model_auto_compact_token_limit = 9000000000000
+openai_base_url = "http://127.0.0.1:8317/v1"
+"#,
+        )
+        .expect("the picker choice parses");
+        assert_eq!(parsed, ("grok-4.6".to_string(), "xhigh".to_string()));
+        // The `model_catalog_json` / `model_reasoning_*` lines must not be
+        // mistaken for the model itself, and a missing effort defaults to auto.
+        let bare = parse_codex_config_toml(
+            "model = \"deepseek-v4-flash\"\nmodel_reasoning_summary = \"detailed\"\n",
+        )
+        .expect("bare choice parses");
+        assert_eq!(bare, ("deepseek-v4-flash".to_string(), "auto".to_string()));
+        assert!(parse_codex_config_toml("openai_base_url = \"x\"\n").is_none());
+    }
+
+    #[test]
+    fn model_to_provider_maps_catalog_ids_only() {
+        assert_eq!(model_to_provider("grok-4.6"), Some("xai"));
+        assert_eq!(model_to_provider("gpt-5.6-terra"), Some("codex"));
+        assert_eq!(model_to_provider("deepseek-v4-flash"), Some("deepseek"));
+        assert_eq!(model_to_provider("kimi-k3"), Some("kimi"));
+        assert_eq!(
+            model_to_provider("claude-sonnet-4-5-20250929"),
+            Some("claude")
+        );
+        // A model Basiliskos does not advertise maps to nothing.
+        assert_eq!(model_to_provider("gpt-4o"), None);
+    }
+
+    #[test]
+    fn pick_codex_sync_account_prefers_the_enabled_pin_then_valid() {
+        let account =
+            |file_name: &str, provider: &str, disabled: bool, status: &str| GatewayAccount {
+                file_name: file_name.into(),
+                provider: provider.into(),
+                email: None,
+                label: provider.into(),
+                disabled,
+                active: false,
+                cooldown_until_ms: None,
+                expires_at_ms: None,
+                credential_status: status.into(),
+            };
+        let accounts = vec![
+            account("xai-a.json", "xai", true, "expired"),
+            account("xai-b.json", "xai", false, "active"),
+            account("xai-c.json", "xai", true, "active"),
+        ];
+        assert_eq!(
+            pick_codex_sync_account(&accounts, "xai").map(|a| a.file_name.as_str()),
+            Some("xai-b.json")
+        );
+        // No enabled account: prefer a non-expired one over an expired one.
+        let no_pin = vec![
+            account("xai-a.json", "xai", true, "expired"),
+            account("xai-c.json", "xai", true, "active"),
+        ];
+        assert_eq!(
+            pick_codex_sync_account(&no_pin, "xai").map(|a| a.file_name.as_str()),
+            Some("xai-c.json")
+        );
+        // Unknown provider → nothing.
+        assert!(pick_codex_sync_account(&accounts, "kimi").is_none());
     }
 
     #[test]

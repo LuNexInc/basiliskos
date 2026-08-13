@@ -27,5 +27,10 @@ The resulting image details are presented to DeepSeek as ordinary contextual
 text. Basiliskos adds guidance to keep provider, OAuth, relay, implementation,
 and local-workspace details out of the model's user-facing answer.
 
+The isolated Codex window uses the same sidecar. After CLIProxyAPI decrypts a
+DeepSeek Responses body, the plugin posts it to `POST /hydra/vision-describe`
+on the front proxy (no requirement that DeepSeek is the active controller
+route). The hop then sends only text to `api.deepseek.com/responses`.
+
 If every candidate fails, Basiliskos returns `BAS-VISION-001` instead of
 silently forwarding an image that DeepSeek cannot read.

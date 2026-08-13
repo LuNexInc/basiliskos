@@ -228,7 +228,7 @@ type PreparedBasiliskosUpdate = {
 
 type AppView = "console" | "changes";
 
-export const APP_VERSION = "2.4.21";
+export const APP_VERSION = "2.4.31";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },
@@ -247,6 +247,22 @@ function QuotaBar({ segments = 16, percent }: { segments?: number; percent: numb
       {Array.from({ length: segments }, (_, index) => (
         <span key={index} className={index < lit ? "lit" : ""} />
       ))}
+    </div>
+  );
+}
+
+function HeroFuel({ percent }: { percent?: number }) {
+  if (percent === undefined) {
+    return (
+      <div className="hero-fuel unrecorded">
+        <span>Usage unrecorded</span>
+      </div>
+    );
+  }
+  return (
+    <div className="hero-fuel">
+      <QuotaBar segments={8} percent={percent} />
+      <span>{Math.round(percent)}% left</span>
     </div>
   );
 }
@@ -917,20 +933,6 @@ export default function App() {
     }
   }
 
-  async function launchOpencode() {
-    setBusy("opencode");
-    try {
-      await invoke("launch_opencode");
-      setMessage("Opencode is opening — it uses the active Basiliskos route.");
-      setIsError(false);
-    } catch (error) {
-      setMessage(messageFrom(error));
-      setIsError(true);
-    } finally {
-      setBusy(null);
-    }
-  }
-
   function requestAccountSelection(account: Account) {
     if (snapshot?.claudeRunning && !snapshot.skipModelSwitchConfirmation) {
       setAccountSwitchConfirm({ open: true, account, dontShowAgain: false, surface: "claude" });
@@ -1297,11 +1299,12 @@ export default function App() {
 
   return (
     <main className="app-shell">
+      <div className="app-chrome">
       <header className="topbar" data-tauri-drag-region>
         <div className="brand">
           <img src={brandArt} alt="Basiliskos crowned serpent emblem" />
           <div>
-            <h1>Basiliskos</h1>
+            <h1>BasiliskOS</h1>
             <p>Local model relay for Claude Code</p>
           </div>
         </div>
@@ -1327,8 +1330,7 @@ export default function App() {
         <button className={view === "console" ? "selected" : ""} aria-current={view === "console" ? "page" : undefined} onClick={() => setView("console")}>Console</button>
         <button className={view === "changes" ? "selected" : ""} aria-current={view === "changes" ? "page" : undefined} onClick={() => setView("changes")}>Changes{availableUpdate && <i aria-label="Update available" />}</button>
       </nav>
-
-      {view === "console" ? <>
+      {view === "console" && (
       <section className="hero" aria-label="Current connection">
         <div className="hero-watermark" aria-hidden="true" style={{ backgroundImage: `url(${brandArt})` }} />
         <div className="hero-services">
@@ -1340,58 +1342,27 @@ export default function App() {
                 ? `${active.label} · Thinking ${thinkingLabel(activeRoute.thinking)}${contextWindowLabel(activeRoute.contextWindow) ? ` · ${contextWindowLabel(activeRoute.contextWindow)}` : ""}`
                 : "Serve an account below"}
             </p>
-            {activeUsagePercent !== undefined ? (
-              <div className="hero-fuel">
-                <QuotaBar percent={activeUsagePercent} />
-                <span>{Math.round(activeUsagePercent)}% fuel left</span>
-              </div>
-            ) : (
-              <div className="hero-fuel unrecorded">
-                <span>Usage unrecorded</span>
-              </div>
-            )}
+            <HeroFuel percent={activeUsagePercent} />
           </div>
           <div className="hero-service">
             <span className="eyebrow">Codex CLI</span>
             <h3>{codexCliAccount ? codexCliAccount.label : "Not set"}</h3>
             <p>{codexCliAccount ? codexCliAccount.email ?? "Real codex command" : "Serve an account below"}</p>
-            {codexUsagePercent !== undefined ? (
-              <div className="hero-fuel">
-                <QuotaBar percent={codexUsagePercent} />
-                <span>{Math.round(codexUsagePercent)}% fuel left</span>
-              </div>
-            ) : (
-              <div className="hero-fuel unrecorded">
-                <span>Usage unrecorded</span>
-              </div>
-            )}
+            <HeroFuel percent={codexUsagePercent} />
           </div>
           <div className="hero-service">
             <span className="eyebrow">Grok CLI</span>
             <h3>{grokCliAccount ? grokCliAccount.label : "Not set"}</h3>
             <p>{grokCliAccount ? grokCliAccount.email ?? "Real grok command" : "Serve an account below"}</p>
-            {grokUsagePercent !== undefined ? (
-              <div className="hero-fuel">
-                <QuotaBar percent={grokUsagePercent} />
-                <span>{Math.round(grokUsagePercent)}% fuel left</span>
-              </div>
-            ) : (
-              <div className="hero-fuel unrecorded">
-                <span>Usage unrecorded</span>
-              </div>
-            )}
-          </div>
-          <div className="hero-service">
-            <span className="eyebrow">Opencode</span>
-            <h3>Basiliskos relay</h3>
-            <p>Go coding agent · inherits the active route</p>
-            <button className="secondary" onClick={() => void launchOpencode()} disabled={busy !== null}>
-              {busy === "opencode" ? <LoaderCircle className="spin" size={17} /> : <Terminal size={17} />}
-              Open Opencode
-            </button>
+            <HeroFuel percent={grokUsagePercent} />
           </div>
         </div>
         <div className="hero-actions">
+          <div className="hero-chatgpt">
+            <span className="eyebrow">ChatGPT</span>
+            <strong>{snapshot?.codexRunning ? "Window open" : "Window closed"}</strong>
+            <p>{active ? active.label : "No account"}</p>
+          </div>
           <span className={`token-status ${active ? "ok" : "muted"}`}>
             <i aria-hidden="true" />{active ? "Credential selected · local" : "No active credential"}
           </span>
@@ -1401,7 +1372,11 @@ export default function App() {
           </button>
         </div>
       </section>
+      )}
+      </div>
 
+      {view === "console" ? <>
+      <div className="workspace">
       <div className="choices-grid">
         <section className="panel accounts-panel" aria-label="Choose account">
           <div className="panel-head">
@@ -1722,12 +1697,13 @@ export default function App() {
             <p className="route-note">Changes apply to the next request from the Basiliskos Claude window. Thinking levels depend on the selected model.</p>
           </div>
           <div className="panel-foot claude-foot"><ShieldCheck size={16} /><div><strong>Basiliskos Claude window</strong> · <span className={snapshot?.claudeRunning ? "running-dot" : "stopped-dot"}>● {snapshot?.claude.state ?? "unknown"}</span><br />{snapshot?.claude.detail ?? "Waiting for controller status"}</div>{snapshot?.claudeRunning ? <button onClick={() => void closeBasiliskosClaude()} disabled={busy !== null}>Close window</button> : <button onClick={() => void openBasiliskosClaude()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}><AppWindow size={15} /> Open window</button>}</div>
-          <div className="panel-foot claude-foot"><AppWindow size={16} /><div><strong>Basiliskos Codex window</strong> · <span className={snapshot?.codexRunning ? "running-dot" : "stopped-dot"}>● {snapshot?.codex?.state ?? "unknown"}</span><br />{snapshot?.codex?.detail ?? "Waiting for controller status"}<br /><span className="route-note">Runs on {active ? `${active.label} · ${activeRoute?.selectedModelLabel ?? activeRoute?.selectedModel ?? "—"}` : "no account selected"} · effort {(activeRoute?.thinking ?? "auto") === "auto" ? "high" : (activeRoute?.thinking ?? "—")} — applied when the window opens; restart Codex after changing the route</span></div>{snapshot?.codexRunning ? <button onClick={() => void closeBasiliskosCodex()} disabled={busy !== null}>Close window</button> : <button onClick={() => void openBasiliskosCodex()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}><AppWindow size={15} /> Open window</button>}</div>
+          <div className="panel-foot claude-foot"><AppWindow size={16} /><div><strong>ChatGPT window</strong> · <span className={snapshot?.codexRunning ? "running-dot" : "stopped-dot"}>● {snapshot?.codex?.state ?? "unknown"}</span><br />{snapshot?.codex?.detail ?? "Waiting for controller status"}<br /><span className="route-note">Isolated ChatGPT / Codex app. Runs on {active ? `${active.label} · ${activeRoute?.selectedModelLabel ?? activeRoute?.selectedModel ?? "—"}` : "no account selected"} · effort {(activeRoute?.thinking ?? "auto") === "auto" ? "high" : (activeRoute?.thinking ?? "—")} — applied when the window opens; restart ChatGPT after changing the route</span></div>{snapshot?.codexRunning ? <button onClick={() => void closeBasiliskosCodex()} disabled={busy !== null}>Close window</button> : <button onClick={() => void openBasiliskosCodex()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}><AppWindow size={15} /> Open window</button>}</div>
           <label className="settings-row">
             <input type="checkbox" checked={snapshot?.openClaudeOnLaunch !== false} onChange={(event) => void setOpenClaudeOnLaunch(event.target.checked)} disabled={busy !== null} />
             <span>Reopen the Basiliskos Claude window when Basiliskos starts</span>
           </label>
         </section>
+      </div>
       </div>
 
       {showDiagnostics && (

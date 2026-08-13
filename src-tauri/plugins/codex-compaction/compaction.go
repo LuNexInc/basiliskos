@@ -188,7 +188,7 @@ func interceptStreamChunk(raw []byte) ([]byte, error) {
 	state.mu.Unlock()
 
 	if !isCompaction || buf == nil || summaryBuilder == nil {
-		return okEnvelope(streamChunkInterceptResponse{Body: req.Body})
+		return okEnvelope(streamChunkInterceptResponse{Body: rewriteArgumentsIntegerFloats(req.Body)})
 	}
 	// Header-init chunk: pass through (headers only).
 	if req.ChunkIndex == -1 {

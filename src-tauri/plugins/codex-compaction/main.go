@@ -65,7 +65,10 @@ type pluginState struct {
 }
 
 type pluginConfig struct {
-	MaxConcurrency int `yaml:"max_concurrency"`
+	MaxConcurrency       int    `yaml:"max_concurrency"`
+	AuthDir              string `yaml:"auth_dir"`
+	DeepSeekResponsesURL string `yaml:"deepseek_responses_url"`
+	VisionURL            string `yaml:"vision_url"`
 }
 
 type envelope struct {
@@ -198,7 +201,7 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "basiliskos-codex-compaction",
-			Version:          "0.1.0",
+			Version:          "0.2.0",
 			Author:           "router-for-me",
 			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
 			Logo:             "https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/main/docs/logo.png",
@@ -251,15 +254,62 @@ func interceptBeforeAuth(raw []byte) ([]byte, error) {
 	}
 
 	state.mu.Lock()
-	defer state.mu.Unlock()
 	if _, exists := state.active[req.RequestID]; exists {
+		state.mu.Unlock()
 		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 	}
 	if len(state.active) >= state.config.MaxConcurrency {
+		state.mu.Unlock()
 		return terminatedResponse(http.StatusTooManyRequests, "plugin concurrency limit reached", http.Header{"Retry-After": {"1"}})
 	}
 	state.active[req.RequestID] = struct{}{}
-	return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
+	authDir := state.config.AuthDir
+	hopURL := state.config.DeepSeekResponsesURL
+	visionURL := state.config.VisionURL
+	state.mu.Unlock()
+
+	merged := mergeCodexAppTools(req.Body)
+	if hop, handled, hopErr := maybeHopDeepSeekResponses(req, merged, authDir, hopURL, visionURL); handled {
+		return hop, hopErr
+	}
+	return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: merged})
+}
+
+func maybeHopDeepSeekResponses(req pluginapi.RequestInterceptRequest, body []byte, authDir, hopURL, visionURL string) ([]byte, bool, error) {
+	model := requestModel(pluginapiRequestModel{Model: req.Model, RequestedModel: req.RequestedModel}, body)
+	if !isDeepSeekResponsesRequest(model, body) {
+		return nil, false, nil
+	}
+	sanitized, errSanitize := sanitizeDeepSeekResponsesBody(body)
+	if errSanitize != nil {
+		return nil, true, errSanitize
+	}
+	if responsesHasImages(sanitized) {
+		token := requestRelayToken(req.Headers)
+		described, errVision := describeAndReplaceResponsesImages(sanitized, visionURL, token, deepSeekHTTP)
+		if errVision != nil {
+			appendMarker("DEEPSEEK_RESPONSES_HOP vision_failed model=" + model)
+			raw, errTerm := terminatedResponse(http.StatusBadGateway, "Basiliskos could not obtain an image description from any configured OAuth vision provider.", nil)
+			return raw, true, errTerm
+		}
+		sanitized = described
+		appendMarker("DEEPSEEK_RESPONSES_HOP vision_ok model=" + model)
+	}
+	key, errKey := loadEnabledDeepSeekAPIKey(authDir)
+	if errKey != nil {
+		appendMarker("DEEPSEEK_RESPONSES_HOP missing_key model=" + model)
+		raw, errTerm := terminatedResponse(http.StatusUnauthorized, "DeepSeek Responses hop has no enabled API key.", nil)
+		return raw, true, errTerm
+	}
+	status, headers, payload, errHop := hopDeepSeekResponses(sanitized, key, hopURL, deepSeekHTTP)
+	if errHop != nil {
+		appendMarker("DEEPSEEK_RESPONSES_HOP transport_error model=" + model)
+		raw, errTerm := terminatedResponse(http.StatusBadGateway, "DeepSeek Responses hop failed.", nil)
+		return raw, true, errTerm
+	}
+	appendMarker(fmt.Sprintf("DEEPSEEK_RESPONSES_HOP model=%s status=%d", model, status))
+	raw, errTerm := terminatedRawResponse(status, headers, payload)
+	return raw, true, errTerm
 }
 
 func passThroughRequest(raw []byte) ([]byte, error) {
@@ -268,6 +318,24 @@ func passThroughRequest(raw []byte) ([]byte, error) {
 		return nil, errUnmarshal
 	}
 	return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
+}
+
+func terminatedRawResponse(statusCode int, headers http.Header, body []byte) ([]byte, error) {
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	if headers.Get("Content-Type") == "" {
+		headers.Set("Content-Type", "application/json")
+	}
+	if statusCode < 100 || statusCode > 599 {
+		statusCode = http.StatusBadGateway
+	}
+	return okEnvelope(pluginapi.RequestInterceptResponse{
+		Terminate:       true,
+		StatusCode:      statusCode,
+		ResponseHeaders: headers,
+		ResponseBody:    body,
+	})
 }
 
 func terminatedResponse(statusCode int, message string, headers http.Header) ([]byte, error) {

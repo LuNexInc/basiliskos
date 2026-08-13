@@ -53,12 +53,14 @@ type Snapshot = {
   running: boolean;
   version: string;
   claudeRunning: boolean;
+  codexRunning?: boolean;
   accounts: Account[];
   routes: ProviderRoute[];
   autoFailover?: { fromLabel: string; toLabel: string; atMs: number };
   relay: ComponentStatus;
   backend: ComponentStatus;
   claude: ComponentStatus;
+  codex?: ComponentStatus;
 };
 
 type ActiveServiceIdentities = {
@@ -78,6 +80,7 @@ const PREVIEW_SNAPSHOT: Snapshot = {
   running: true,
   version: "preview",
   claudeRunning: true,
+  codexRunning: true,
   accounts: [
     {
       fileName: "claude-preview.json",
@@ -113,6 +116,7 @@ const PREVIEW_SNAPSHOT: Snapshot = {
   relay: { state: "healthy", detail: "Preview relay" },
   backend: { state: "healthy", detail: "Preview link" },
   claude: { state: "running", detail: "Preview Claude window" },
+  codex: { state: "running", detail: "Preview ChatGPT window" },
 };
 
 const PREVIEW_IDENTITIES: ActiveServiceIdentities = {
@@ -435,8 +439,8 @@ export default function TrayDashboard() {
             <img src={brandArt} alt="" />
           </div>
           <div>
-            <h1>Basiliskos</h1>
-            <p>Fuel core</p>
+            <h1>BasiliskOS</h1>
+            <p>Relay</p>
           </div>
         </div>
         <div className="tray-top-meta">
@@ -460,6 +464,9 @@ export default function TrayDashboard() {
         <span className={statusTone(snapshot?.claude)} title={snapshot?.claude.detail}>
           <i aria-hidden="true" /> Claude · {snapshot?.claude.state ?? "…"}
         </span>
+        <span className={statusTone(snapshot?.codex)} title={snapshot?.codex?.detail}>
+          <i aria-hidden="true" /> ChatGPT · {snapshot?.codex?.state ?? "…"}
+        </span>
       </section>
 
       <section className="tray-services" aria-label="Current connection">
@@ -479,6 +486,20 @@ export default function TrayDashboard() {
               : "Serve an account in the full window"}
           </p>
           <ReactorCore percent={activeUsage} label="Claude Code" />
+        </article>
+
+        <article className="tray-service">
+          <div className="tray-service-head">
+            <span className="eyebrow">ChatGPT</span>
+            <span className="tray-service-tag">{snapshot?.codexRunning ? "OPEN" : "CLOSED"}</span>
+          </div>
+          <h2>{active && activeRoute ? activeRoute.selectedModelLabel : "No account"}</h2>
+          <p>
+            {active
+              ? `${active.label} · ${snapshot?.codexRunning ? "Window open" : "Window closed"}`
+              : "Serve from full window"}
+          </p>
+          <ReactorCore percent={activeUsage} label="ChatGPT" />
         </article>
 
         <article className="tray-service">

@@ -77,7 +77,8 @@ pub(crate) const XAI_MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: "grok-4.6",
         label: "Grok 4.6",
-        thinking_levels: &["low", "medium", "high"],
+        // 7.2.131 registry: low/medium/high/xhigh; 500k context.
+        thinking_levels: &["low", "medium", "high", "xhigh"],
     },
     ModelSpec {
         id: "grok-4.5",

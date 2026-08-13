@@ -12,7 +12,6 @@ mod codex_window;
 mod diagnostics;
 mod gateway;
 mod grok_cli;
-mod opencode_cli;
 mod persistence;
 #[cfg(test)]
 mod test_support;
@@ -284,9 +283,6 @@ pub fn run() {
             grok_cli::rename_grok_cli_account,
             grok_cli::remove_grok_cli_account,
             grok_cli::serve_grok_cli_from_relay,
-            opencode_cli::serve_opencode_from_relay,
-            opencode_cli::launch_opencode,
-            opencode_cli::opencode_running,
             codex_switcher_import::import_accounts_from_codex_switcher,
             active_service_identities,
             show_main_window,

@@ -3,6 +3,17 @@
 > What is intentionally settled + why + reverse-if. HANDOFF = history; this = standing state.
 > Newest on top. Extracted from AGENTS.md 2026-07-25 — keep in sync when a call changes.
 
+## 2026-08-14 — Codex DeepSeek images use the existing OAuth vision sidecar
+- **Decision:** When the Codex DeepSeek hop sees `input_image` (or equivalent) parts, the plugin calls `POST /hydra/vision-describe` on the Basiliskos front proxy. That endpoint runs the existing isolated OAuth sidecar plan (Codex → Kimi → Claude → Grok) and returns a text description. The plugin replaces image parts with `Image details:` text plus the standing presentation guidance, then hops the text-only Responses body to DeepSeek. DeepSeek does not need to be the active controller account.
+- **Why:** DeepSeek V4 Responses still cannot read images. The Claude `/v1/messages` path already had this sidecar; the Codex window did not, because bodies are encrypted until CPA decrypts them. The plugin is the first place that sees plaintext Responses.
+- **Reverse if:** DeepSeek ships native image input on Responses, or Charles wants screenshots on a DeepSeek Codex pick to fail closed instead of being described.
+
+## 2026-08-14 — Codex DeepSeek uses native Responses, not CPA chat
+- **Decision:** After CLIProxyAPI decrypts a Codex `/v1/responses` body whose model is DeepSeek, the Basiliskos plugin hops that payload to `https://api.deepseek.com/responses`. It does not let the openai-compatibility executor translate the turn to Chat Completions. Encrypted reasoning blobs and `previous_response_id` are stripped first. Claude `/v1/messages` DeepSeek and Grok/Codex/Kimi Responses stay on the existing relay.
+- **Why:** DeepSeek V4 Chat Completions rejects split assistant `tool_calls` history and requires a full `reasoning_content` replay after any tool turn. Native Responses merges `function_call` items on DeepSeek's side and drops Codex `encrypted_content`, which is the cheaper token path. CPA 7.2.131 hard-codes compat DeepSeek to `/chat/completions`; prepare-gateway replaces the official exe, so the hop lives in the plugin we ship.
+- **Known limitation:** The hop buffers the DeepSeek SSE body before returning it to Codex (plugin terminate is one shot). First-token latency equals full generation. Compaction still uses the existing summarizer path.
+- **Reverse if:** CPA grows a Responses-native openai-compatibility path, or Charles wants the Chat Completions repairer instead.
+
 ## 2026-08-13 — The Codex window model switcher is real, not a facade
 - **Decision:** the isolated Codex window routes the picked model to its own provider. `grok-4.6` runs real Grok, `gpt-5.6-*` runs real Codex, `kimi-k3` runs Kimi — regardless of the active account. The DeepSeek `openai-compatibility` block aliases DeepSeek ids only; it no longer captures other providers' models. The dial rewrite no longer forces the active route's model. Accounts keep ONE enabled account per provider (not one globally), so CLIProxyAPI's per-provider credential selection stays unambiguous and the Claude path keeps using the user's selected account.
 - **Why:** Charles picked Grok 4.6 in the Codex window's switcher and was silently routed to DeepSeek (the active route) when a screenshot 400'd with DeepSeek's text-only schema error. The switcher displayed one model and ran another — a facade. Verified against the pinned 7.2.128 runtime: with the aliases removed and the xAI/codex credentials enabled, `grok-4.5` and `gpt-5.6-terra` both route to their real providers (200).

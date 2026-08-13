@@ -17,7 +17,7 @@ use crate::gateway::{
     close_gateway_job, endpoint_health_check, exact_auth_path, gateway_dir, hidden,
     runtime_exe_path, sha256_file, vision_content_from_request, yaml_quote,
     DeepseekVisionCandidate, GatewayAccount, TrackedUpstream, UpstreamMeta, VisionSlots,
-    GATEWAY_EXE_SHA256, MAX_VISION_DESCRIPTION_BYTES, MAX_VISION_PROMPT_CHARS,
+    GATEWAY_EXE_SHA256, MAX_VISION_DESCRIPTION_BYTES, MAX_VISION_IMAGES, MAX_VISION_PROMPT_CHARS,
     VISION_SIDECAR_SLOTS, VISION_SIDECAR_START_TIMEOUT,
 };
 use crate::persistence::{durable_write, secure_create_dir_all};
@@ -226,6 +226,132 @@ pub(crate) fn resolve_deepseek_vision(
     } else {
         "Every configured OAuth vision provider failed.".into()
     })
+}
+
+/// Build the sidecar Messages payload from a Claude request or a Codex
+/// Responses body. Returns None when no image parts are present.
+pub(crate) fn vision_sidecar_request_from_any(request: &Value) -> Option<Value> {
+    if vision_content_from_request(request).is_some() {
+        return Some(request.clone());
+    }
+    let content = vision_content_from_responses(request)?;
+    Some(serde_json::json!({
+        "messages": [{"role": "user", "content": content}],
+    }))
+}
+
+pub(crate) fn vision_content_from_responses(request: &Value) -> Option<Vec<Value>> {
+    let input = request.get("input")?.as_array()?;
+    let mut content = Vec::new();
+    let mut image_count = 0;
+    let mut text_chars = 0;
+    for item in input {
+        match item.get("type").and_then(Value::as_str) {
+            Some("input_image") | Some("image") => {
+                if let Some(block) = image_block_from_responses_part(item) {
+                    if image_count < MAX_VISION_IMAGES {
+                        content.push(block);
+                        image_count += 1;
+                    }
+                }
+            }
+            _ => match item.get("content") {
+                Some(Value::Array(parts)) => {
+                    collect_responses_vision_parts(
+                        parts,
+                        &mut content,
+                        &mut image_count,
+                        &mut text_chars,
+                    );
+                }
+                Some(Value::String(text)) if text_chars < MAX_VISION_PROMPT_CHARS => {
+                    let remaining = MAX_VISION_PROMPT_CHARS.saturating_sub(text_chars);
+                    let clipped = text.chars().take(remaining).collect::<String>();
+                    text_chars += clipped.chars().count();
+                    content.push(serde_json::json!({"type": "text", "text": clipped}));
+                }
+                _ => {}
+            },
+        }
+    }
+    (image_count > 0).then_some(content)
+}
+
+fn collect_responses_vision_parts(
+    parts: &[Value],
+    output: &mut Vec<Value>,
+    image_count: &mut usize,
+    text_chars: &mut usize,
+) {
+    for part in parts {
+        if let Some(block) = image_block_from_responses_part(part) {
+            if *image_count < MAX_VISION_IMAGES {
+                output.push(block);
+                *image_count += 1;
+            }
+            continue;
+        }
+        let typ = part.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(typ, "input_text" | "output_text" | "text") {
+            continue;
+        }
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if *text_chars >= MAX_VISION_PROMPT_CHARS {
+            continue;
+        }
+        let remaining = MAX_VISION_PROMPT_CHARS.saturating_sub(*text_chars);
+        let clipped = text.chars().take(remaining).collect::<String>();
+        *text_chars += clipped.chars().count();
+        output.push(serde_json::json!({"type": "text", "text": clipped}));
+    }
+}
+
+fn image_block_from_responses_part(part: &Value) -> Option<Value> {
+    let typ = part.get("type").and_then(Value::as_str)?;
+    if !matches!(typ, "input_image" | "image" | "image_url") {
+        return None;
+    }
+    if let Some(source) = part.get("source") {
+        return Some(serde_json::json!({"type": "image", "source": source.clone()}));
+    }
+    let url = part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            part.get("image_url")
+                .and_then(|value| value.get("url"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| part.get("url").and_then(Value::as_str))?;
+    image_block_from_url(url)
+}
+
+fn image_block_from_url(url: &str) -> Option<Value> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',')?;
+        let media = meta
+            .split(';')
+            .next()
+            .filter(|value| value.starts_with("image/"))
+            .unwrap_or("image/png");
+        return Some(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media,
+                "data": data,
+            }
+        }));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(serde_json::json!({
+            "type": "image",
+            "source": { "type": "url", "url": url }
+        }));
+    }
+    None
 }
 
 // Declarative, per-provider list of client-side request fixups for confirmed
