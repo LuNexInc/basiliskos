@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Basiliskos",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "identifier": "com.threereadylab.hydragateway",
   "build": {
     "beforeDevCommand": "pnpm prepare:gateway && pnpm dev",
@@ -37,7 +37,8 @@
       "resources/gateway/*",
       "resources/gateway/plugins/*",
       "resources/icons/claude-window-black.ico",
-      "resources/icons/claude-tray-inverted.ico"
+      "resources/icons/claude-tray-inverted.ico",
+      "resources/icons/codex-window-black.ico"
     ],
     "icon": [
       "icons/32x32.png",

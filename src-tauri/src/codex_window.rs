@@ -115,6 +115,47 @@ pub(crate) struct CodexHwndInfo {
 }
 
 #[cfg(target_os = "windows")]
+fn process_tree(root: u32) -> Vec<u32> {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return vec![root];
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut children: Vec<(u32, u32)> = Vec::new();
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        children.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+
+    let mut pids = vec![root];
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (pid, parent) in &children {
+            if pids.contains(parent) && !pids.contains(pid) {
+                pids.push(*pid);
+                grew = true;
+            }
+        }
+    }
+    pids
+}
+
+#[cfg(target_os = "windows")]
 pub(crate) fn enum_codex_hwnds_for_pid(pid: u32) -> Vec<CodexHwndInfo> {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, TRUE};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -122,7 +163,7 @@ pub(crate) fn enum_codex_hwnds_for_pid(pid: u32) -> Vec<CodexHwndInfo> {
     };
 
     struct EnumData {
-        pid: u32,
+        pids: Vec<u32>,
         windows: Vec<CodexHwndInfo>,
     }
 
@@ -130,7 +171,7 @@ pub(crate) fn enum_codex_hwnds_for_pid(pid: u32) -> Vec<CodexHwndInfo> {
         let data = &mut *(lparam as *mut EnumData);
         let mut window_pid = 0_u32;
         GetWindowThreadProcessId(hwnd, &mut window_pid);
-        if window_pid == data.pid && GetWindow(hwnd, GW_OWNER).is_null() {
+        if data.pids.contains(&window_pid) && GetWindow(hwnd, GW_OWNER).is_null() {
             let mut class_buf = [0_u16; 256];
             let class_len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32);
             let class_name = if class_len > 0 {
@@ -148,7 +189,7 @@ pub(crate) fn enum_codex_hwnds_for_pid(pid: u32) -> Vec<CodexHwndInfo> {
     }
 
     let mut data = EnumData {
-        pid,
+        pids: process_tree(pid),
         windows: Vec::new(),
     };
     unsafe {

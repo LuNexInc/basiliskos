@@ -9802,6 +9802,10 @@ mod tests {
             root.join("claude-tray-inverted.ico").is_file(),
             "missing claude-tray-inverted.ico"
         );
+        assert!(
+            root.join("codex-window-black.ico").is_file(),
+            "missing codex-window-black.ico"
+        );
     }
 
     #[test]
