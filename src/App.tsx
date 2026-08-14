@@ -227,8 +227,9 @@ type PreparedBasiliskosUpdate = {
 };
 
 type AppView = "console" | "changes";
+type ProviderFilter = "all" | Provider;
 
-export const APP_VERSION = "2.4.31";
+export const APP_VERSION = "2.5.0";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },
@@ -237,6 +238,14 @@ const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "kimi", label: "Kimi", detail: "Kimi Code OAuth" },
   { id: "deepseek", label: "DeepSeek", detail: "DeepSeek API key" },
 ];
+
+const PROVIDER_NAMES: Record<Provider, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  xai: "Grok",
+  kimi: "Kimi",
+  deepseek: "DeepSeek",
+};
 
 const THINKING_LEVELS = ["auto", "none", "low", "medium", "high", "xhigh", "max", "ultra"];
 
@@ -380,6 +389,7 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [provider, setProvider] = useState<Provider>("codex");
+  const [providerFilter, setProviderFilter] = useState<ProviderFilter>("all");
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState("Starting Basiliskos…");
   const [isError, setIsError] = useState(false);
@@ -586,9 +596,12 @@ export default function App() {
   }, [snapshot?.login, pendingAuth]);
 
   const accounts = useMemo(
-    () => snapshot?.accounts.filter((account) => account.provider === provider) ?? [],
-    [provider, snapshot],
+    () => providerFilter === "all"
+      ? snapshot?.accounts ?? []
+      : snapshot?.accounts.filter((account) => account.provider === providerFilter) ?? [],
+    [providerFilter, snapshot],
   );
+  const totalAccountCount = snapshot?.accounts.length ?? 0;
   const allUsageFiles = usageAccountFiles(snapshot?.accounts ?? []);
   const allUsageKey = snapshot?.accounts
     .filter((account) => account.provider !== "deepseek")
@@ -1300,434 +1313,582 @@ export default function App() {
   return (
     <main className="app-shell">
       <div className="app-chrome">
-      <header className="topbar" data-tauri-drag-region>
-        <div className="brand">
-          <img src={brandArt} alt="Basiliskos crowned serpent emblem" />
-          <div>
-            <h1>BasiliskOS</h1>
-            <p>Local model relay for Claude Code</p>
-          </div>
-        </div>
-        <div className="topbar-right">
-          {availableUpdate && (
-            <button className="update-indicator" onClick={() => setView("changes")} title={`${availableUpdate.name} is available`}>
-              <BellDot size={15} /> Update {availableUpdate.tagName.replace(/^v/i, "")} available
-            </button>
-          )}
-          <div className="health-indicators" aria-label="Basiliskos health">
-            <StatusBadge label="Local server" status={snapshot?.relay} />
-            <StatusBadge label="Provider link" status={snapshot?.backend} />
-          </div>
-          <div className="window-controls" aria-label="Window controls">
-            <button type="button" aria-label="Minimize Basiliskos" title="Minimize" onClick={() => void minimizeWindow()}><Minus size={15} /></button>
-            <button type="button" aria-label="Maximize Basiliskos" title="Maximize" onClick={() => void toggleWindowMaximize()}><Maximize2 size={14} /></button>
-            <button type="button" className="close-control" aria-label="Hide Basiliskos to tray" title="Hide to tray" onClick={() => void hideWindow()}><X size={15} /></button>
-          </div>
-        </div>
-      </header>
-
-      <nav className="app-tabs" aria-label="Basiliskos sections">
-        <button className={view === "console" ? "selected" : ""} aria-current={view === "console" ? "page" : undefined} onClick={() => setView("console")}>Console</button>
-        <button className={view === "changes" ? "selected" : ""} aria-current={view === "changes" ? "page" : undefined} onClick={() => setView("changes")}>Changes{availableUpdate && <i aria-label="Update available" />}</button>
-      </nav>
-      {view === "console" && (
-      <section className="hero" aria-label="Current connection">
-        <div className="hero-watermark" aria-hidden="true" style={{ backgroundImage: `url(${brandArt})` }} />
-        <div className="hero-services">
-          <div className="hero-service">
-            <span className="eyebrow">Claude Code</span>
-            <h3>{active && activeRoute ? activeRoute.selectedModelLabel : "No account"}</h3>
-            <p>
-              {active && activeRoute
-                ? `${active.label} · Thinking ${thinkingLabel(activeRoute.thinking)}${contextWindowLabel(activeRoute.contextWindow) ? ` · ${contextWindowLabel(activeRoute.contextWindow)}` : ""}`
-                : "Serve an account below"}
-            </p>
-            <HeroFuel percent={activeUsagePercent} />
-          </div>
-          <div className="hero-service">
-            <span className="eyebrow">Codex CLI</span>
-            <h3>{codexCliAccount ? codexCliAccount.label : "Not set"}</h3>
-            <p>{codexCliAccount ? codexCliAccount.email ?? "Real codex command" : "Serve an account below"}</p>
-            <HeroFuel percent={codexUsagePercent} />
-          </div>
-          <div className="hero-service">
-            <span className="eyebrow">Grok CLI</span>
-            <h3>{grokCliAccount ? grokCliAccount.label : "Not set"}</h3>
-            <p>{grokCliAccount ? grokCliAccount.email ?? "Real grok command" : "Serve an account below"}</p>
-            <HeroFuel percent={grokUsagePercent} />
-          </div>
-        </div>
-        <div className="hero-actions">
-          <div className="hero-chatgpt">
-            <span className="eyebrow">ChatGPT</span>
-            <strong>{snapshot?.codexRunning ? "Window open" : "Window closed"}</strong>
-            <p>{active ? active.label : "No account"}</p>
-          </div>
-          <span className={`token-status ${active ? "ok" : "muted"}`}>
-            <i aria-hidden="true" />{active ? "Credential selected · local" : "No active credential"}
-          </span>
-          <button className="secondary" onClick={() => void startOrStop()} disabled={busy !== null}>
-            {busy === "power" ? <LoaderCircle className="spin" size={17} /> : snapshot?.running ? <CircleStop size={17} /> : <Play size={17} />}
-            {snapshot?.running ? "Stop relay" : "Start relay"}
-          </button>
-        </div>
-      </section>
-      )}
-      </div>
-
-      {view === "console" ? <>
-      <div className="workspace">
-      <div className="choices-grid">
-        <section className="panel accounts-panel" aria-label="Choose account">
-          <div className="panel-head">
-            <div><span className="zone-label">CHOOSE ACCOUNT</span><h2>Authorized subscriptions</h2></div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                className="add-button"
-                onClick={() => void refreshUsage(allUsageFiles)}
-                disabled={allUsageFiles.length === 0 || allUsageLoading}
-                title="Refresh usage for every account now. Basiliskos also refreshes automatically every five minutes."
-              >
-                <RefreshCw className={allUsageLoading ? "spin" : undefined} size={15} /> Refresh usage
-              </button>
-              {loginWaiting ? (
-                <button className="add-button cancel-login" onClick={() => void cancelLogin()} disabled={busy !== null}>
-                  {busy === "cancel-login" ? <LoaderCircle className="spin" size={15} /> : <X size={15} />} Cancel login
-                </button>
-              ) : (
-                <button className="add-button" onClick={() => void addAccount()} disabled={busy !== null}>
-                  {busy === "login" ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />}{" "}
-                  {usesApiKeyAuth(provider) ? "Add API key" : "Add account"}
-                </button>
-              )}
+        <header className="topbar" data-tauri-drag-region>
+          <div className="brand">
+            <img src={brandArt} alt="Basiliskos crowned serpent emblem" />
+            <div>
+              <h1>BasiliskOS</h1>
+              <p>Local model relay for Claude Code</p>
             </div>
           </div>
-          <div className="provider-tabs" role="tablist" aria-label="Account provider">
-            {PROVIDERS.map((item) => (
-              <button key={item.id} role="tab" aria-selected={provider === item.id} className={provider === item.id ? "selected" : ""} onClick={() => { setProvider(item.id); cancelApiKeyPrompt(); }}>
-                {item.label}
+          <div className="topbar-right">
+            {availableUpdate && (
+              <button className="update-indicator" onClick={() => setView("changes")} title={`${availableUpdate.name} is available`}>
+                <BellDot size={15} /> Update {availableUpdate.tagName.replace(/^v/i, "")} available
               </button>
-            ))}
-          </div>
-          {apiKeyPrompt && (
-            <div className="auth-wait-card" role="group" aria-label="DeepSeek API key">
-              <div className="auth-wait-head">
-                <span className="zone-label">API KEY</span>
-                <strong>DeepSeek</strong>
-                <p>
-                  DeepSeek authorizes with an API key instead of a browser login. Create one at
-                  platform.deepseek.com, then paste it here. It is stored locally and verified with
-                  DeepSeek before it is saved.
-                </p>
-              </div>
-              <div className="auth-wait-url-row">
-                <input
-                  className="auth-wait-url"
-                  type="password"
-                  autoComplete="off"
-                  spellCheck={false}
-                  aria-label="DeepSeek API key"
-                  placeholder="sk-…"
-                  value={apiKeyDraft}
-                  onChange={(event) => setApiKeyDraft(event.target.value)}
-                  onKeyDown={(event) => { if (event.key === "Enter") void submitApiKey(); }}
-                  disabled={busy !== null}
-                />
-                <button type="button" className="auth-wait-action" onClick={() => void submitApiKey()} disabled={busy !== null || !apiKeyDraft.trim()}>
-                  {busy === "api-key" ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} aria-hidden="true" />} Verify and save
-                </button>
-                <button type="button" className="auth-wait-action" onClick={cancelApiKeyPrompt} disabled={busy !== null}>
-                  <X size={14} aria-hidden="true" /> Cancel
-                </button>
-              </div>
+            )}
+            <div className="health-indicators" aria-label="Basiliskos health">
+              <StatusBadge label="Local server" status={snapshot?.relay} />
+              <StatusBadge label="Provider link" status={snapshot?.backend} />
             </div>
-          )}
-          {pendingAuth && (
-            <div className="auth-wait-card" role="status" aria-live="polite">
-              <div className="auth-wait-head">
-                <span className="zone-label">AUTHORIZATION</span>
-                <strong>
-                  {PROVIDERS.find((item) => item.id === pendingAuth.provider)?.label ?? pendingAuth.provider}
-                  {pendingAuth.accountLabel ? ` · ${pendingAuth.accountLabel}` : ""}
-                </strong>
+            <div className="window-controls" aria-label="Window controls">
+              <button type="button" aria-label="Minimize Basiliskos" title="Minimize" onClick={() => void minimizeWindow()}><Minus size={15} /></button>
+              <button type="button" aria-label="Maximize Basiliskos" title="Maximize" onClick={() => void toggleWindowMaximize()}><Maximize2 size={14} /></button>
+              <button type="button" className="close-control" aria-label="Hide Basiliskos to tray" title="Hide to tray" onClick={() => void hideWindow()}><X size={15} /></button>
+            </div>
+          </div>
+        </header>
+
+        <nav className="app-tabs" aria-label="Basiliskos sections">
+          <button className={view === "console" ? "selected" : ""} aria-current={view === "console" ? "page" : undefined} onClick={() => setView("console")}>Console</button>
+          <button className={view === "changes" ? "selected" : ""} aria-current={view === "changes" ? "page" : undefined} onClick={() => setView("changes")}>Changes{availableUpdate && <i aria-label="Update available" />}</button>
+        </nav>
+
+        {view === "console" && (
+          <section className="target-matrix" aria-label="Target Engines">
+            <div className="target-card">
+              <div className="target-card-header">
+                <span className="eyebrow">Claude Code</span>
+                <span className={`target-status-dot ${snapshot?.claudeRunning ? "running" : "stopped"}`}>
+                  ● {snapshot?.claudeRunning ? "Running" : "Stopped"}
+                </span>
+              </div>
+              <div className="target-card-body">
+                <h3 title={active && activeRoute ? activeRoute.selectedModelLabel : "No account"}>
+                  {active && activeRoute ? activeRoute.selectedModelLabel : "No account"}
+                </h3>
                 <p>
-                  {prefersManualAuthBrowser(pendingAuth.provider)
-                    ? "Open this URL in a private window or a dedicated browser profile so the right account is chosen. The default browser often auto-completes the wrong one."
-                    : "Finish the official provider login in your browser. You can also copy the URL if auto-open failed."}
+                  {active && activeRoute
+                    ? `${active.label} · Thinking ${thinkingLabel(activeRoute.thinking)}${contextWindowLabel(activeRoute.contextWindow) ? ` · ${contextWindowLabel(activeRoute.contextWindow)}` : ""}`
+                    : "Choose an account below"}
                 </p>
+                <HeroFuel percent={activeUsagePercent} />
               </div>
-              <div className="auth-wait-url-row">
-                <code className="auth-wait-url" title={pendingAuth.authorizationUrl}>{pendingAuth.authorizationUrl}</code>
-                <button type="button" className="auth-wait-action" onClick={() => void copyAuthField("url")} disabled={busy !== null}>
-                  <Copy size={14} aria-hidden="true" /> Copy URL
-                </button>
-                <button type="button" className="auth-wait-action" onClick={() => void openAuthUrlManually()} disabled={busy !== null}>
-                  <ExternalLink size={14} aria-hidden="true" /> Open browser
-                </button>
-              </div>
-              {pendingAuth.userCode && (
-                <div className="auth-wait-code-row">
-                  <span className="auth-wait-code-label">Code</span>
-                  <code className="auth-wait-code">{pendingAuth.userCode}</code>
-                  <button type="button" className="auth-wait-action" onClick={() => void copyAuthField("code")} disabled={busy !== null}>
-                    <Copy size={14} aria-hidden="true" /> Copy code
+              <div className="target-card-actions">
+                {snapshot?.claudeRunning ? (
+                  <button className="target-btn close" onClick={() => void closeBasiliskosClaude()} disabled={busy !== null}>
+                    Close window
                   </button>
-                </div>
-              )}
-              {authCopyFeedback && <p className="auth-wait-feedback">{authCopyFeedback}</p>}
-            </div>
-          )}
-          <div className="account-list" role="tabpanel">
-            {accounts.length === 0 ? (
-              <div className="empty-state"><ShieldCheck size={26} /><h3>No {PROVIDERS.find((item) => item.id === provider)?.label} account yet</h3><p>Add one using the official browser login.</p></div>
-            ) : accounts.map((account) => {
-              const usage = usageByAccount[account.fileName];
-              const isEditing = editingAccount === account.fileName;
-              const cooling = cooldownRemaining(account.cooldownUntilMs, now);
-              const credentialWarning = credentialAlert(account, now);
-              return (
-                <article className={`account-row ${account.active ? "active" : ""}`} key={account.fileName}>
-                  <div className="account-avatar">{account.label.slice(0, 1).toUpperCase()}</div>
-                  <div className="account-copy">
-                    {isEditing ? (
-                      <form className="account-name-form" onSubmit={(event) => { event.preventDefault(); void renameAccount(account); }}>
-                        <label className="sr-only" htmlFor={`profile-name-${account.fileName}`}>Profile name</label>
-                        <input
-                          id={`profile-name-${account.fileName}`}
-                          value={draftName}
-                          onChange={(event) => setDraftName(event.target.value)}
-                          onKeyDown={(event) => { if (event.key === "Escape") cancelRename(); }}
-                          maxLength={64}
-                          autoFocus
-                        />
-                        <button type="submit" className="inline-icon-button save" aria-label={`Save name for ${account.label}`} title="Save name" disabled={busy !== null}><Check size={14} /></button>
-                        <button type="button" className="inline-icon-button" aria-label="Cancel rename" title="Cancel" onClick={cancelRename} disabled={busy !== null}><X size={14} /></button>
-                      </form>
-                    ) : (
-                      <div className="account-name-line">
-                        <strong>{account.label}</strong>
-                        {cooling > 0 && (
-                          <span className="cooldown-chip" title="Rate-limited by the provider; cools down automatically">
-                            <Timer size={11} /> {cooldownLabel(cooling)}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                    <p>{account.email ?? "Authorized account"}</p>
-                    {credentialWarning && (
-                      <div className={`credential-expiry ${credentialWarning.tone}`}>
-                        <Timer size={11} aria-hidden="true" /> {credentialWarning.label}
-                      </div>
-                    )}
-                    <div className="usage-summary">
-                      {usage?.data ? usage.data.windows.map((window) => window.known ? (
-                        <div className={`usage-window ${window.remainingPercent < 20 ? "low" : ""}`} key={window.label} title={`${Math.round(window.usedPercent)}% used`}>
-                          <span>{window.label}</span>
-                          <QuotaBar percent={window.remainingPercent} />
-                          <strong>{Math.round(window.remainingPercent)}% left</strong>
-                          {usageResetLabel(window.resetsAtMs) && <small>{usageResetLabel(window.resetsAtMs)}</small>}
-                        </div>
-                      ) : (
-                        <div className="usage-window unrecorded" key={window.label} title="The provider returned a billing period but did not report a usage percentage.">
-                          <span>{window.label}</span>
-                          <span className="usage-unrecorded">Not reported</span>
-                          {usageResetLabel(window.resetsAtMs) && <small>{usageResetLabel(window.resetsAtMs)}</small>}
-                        </div>
-                      )) : usage?.loading ? (
-                        <span className="usage-state"><LoaderCircle className="spin" size={11} /> Checking usage…</span>
-                      ) : (
-                        <span className="usage-state unavailable" title={usage?.error}>
-                          {usage?.error ?? "Usage unavailable"}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="account-actions">
-                    {accountNeedsRelogin(account, usage?.error) && (
-                      <button
-                        className="icon-button warn"
-                        aria-label={`Re-login ${account.label}`}
-                        onClick={() => void relogin(account)}
-                        disabled={busy !== null}
-                        title="Token expired or rejected — click to sign in again"
-                      >
-                        {busy === `relogin-${account.fileName}` ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />}
-                      </button>
-                    )}
-                    <button
-                      className={`icon-button serve-toggle ${account.active ? "active" : ""}`}
-                      aria-label={account.active ? `${account.label} is serving Claude Code` : `Serve Claude Code with ${account.label}`}
-                      onClick={() => requestAccountSelection(account)}
-                      disabled={busy !== null || cooling > 0 || account.active}
-                    >
-                      <span className="serve-toggle-fill">
-                        <span className="serve-toggle-icon">
-                          {busy === account.fileName ? <LoaderCircle className="spin" size={15} /> : <ClaudeCodeMark className="claude-mark-icon" />}
-                        </span>
-                        <span className="serve-toggle-label">
-                          {account.active ? "Serving Claude Code" : cooling > 0 ? `Cooling down ${cooldownLabel(cooling)}` : "Use for Claude Code"}
-                        </span>
-                      </span>
-                    </button>
-                    <button
-                      className={`icon-button serve-toggle codex ${account.active ? "active" : ""}`}
-                      aria-label={account.active ? `${account.label} is serving Basiliskos Codex` : `Serve Basiliskos Codex with ${account.label}`}
-                      onClick={() => requestCodexAccountSelection(account)}
-                      disabled={busy !== null || cooling > 0 || account.active}
-                    >
-                      <span className="serve-toggle-fill">
-                        <span className="serve-toggle-icon">
-                          {busy === `codex-${account.fileName}` ? <LoaderCircle className="spin" size={15} /> : <CodexMark className="codex-mark-icon" />}
-                        </span>
-                        <span className="serve-toggle-label">
-                          {account.active ? "Serving Basiliskos Codex" : cooling > 0 ? `Cooling down ${cooldownLabel(cooling)}` : "Use for Basiliskos Codex"}
-                        </span>
-                      </span>
-                    </button>
-                    {account.provider === "codex" && (
-                      <button
-                        className={`icon-button serve-toggle cli ${account.email === activeIdentities?.codexCliEmail ? "active" : ""}`}
-                        aria-label={account.email === activeIdentities?.codexCliEmail ? `${account.label} is serving the real Codex CLI` : `Serve real Codex CLI with ${account.label}`}
-                        onClick={() => void serveCodexCliFromRelay(account)}
-                        disabled={servingBusy !== null || account.email === activeIdentities?.codexCliEmail}
-                      >
-                        <span className="serve-toggle-fill">
-                          <span className="serve-toggle-icon">
-                            {servingBusy === account.fileName ? <LoaderCircle className="spin cli-icon" size={15} /> : <Terminal className="cli-icon" size={15} />}
-                          </span>
-                          <span className="serve-toggle-label">
-                            {account.email === activeIdentities?.codexCliEmail ? "Serving Codex CLI" : "Use for Codex CLI"}
-                          </span>
-                        </span>
-                      </button>
-                    )}
-                    {account.provider === "xai" && (
-                      <button
-                        className={`icon-button serve-toggle cli ${account.email === activeIdentities?.grokCliEmail ? "active" : ""}`}
-                        aria-label={account.email === activeIdentities?.grokCliEmail ? `${account.label} is serving the real Grok CLI` : `Serve real Grok CLI with ${account.label}`}
-                        onClick={() => void serveGrokCliFromRelay(account)}
-                        disabled={servingBusy !== null || account.email === activeIdentities?.grokCliEmail}
-                      >
-                        <span className="serve-toggle-fill">
-                          <span className="serve-toggle-icon">
-                            {servingBusy === account.fileName ? <LoaderCircle className="spin cli-icon" size={15} /> : <Terminal className="cli-icon" size={15} />}
-                          </span>
-                          <span className="serve-toggle-label">
-                            {account.email === activeIdentities?.grokCliEmail ? "Serving Grok CLI" : "Use for Grok CLI"}
-                          </span>
-                        </span>
-                      </button>
-                    )}
-                    {!isEditing && <button className="icon-button" aria-label={`Rename ${account.label}`} title={`Rename ${account.label}`} onClick={() => beginRename(account)} disabled={busy !== null}><Pencil size={15} /></button>}
-                    <button className="icon-button danger" aria-label={`Remove ${account.label}`} title={`Remove ${account.label}`} onClick={() => void removeAccount(account)} disabled={busy !== null}><Trash2 size={16} /></button>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
-          <div className="panel-foot account-counts">
-            {providerCounts.map((item, index) => (
-              <span key={item.id}>{index > 0 && <i aria-hidden="true">·</i>}{item.label} · {item.count}</span>
-            ))}
-          </div>
-        </section>
-
-        <section className="panel route-panel" aria-label="Choose model" aria-busy={busy === "route"}>
-          <div className="panel-head"><div><span className="zone-label">CHOOSE MODEL</span><h2>Route for the next request</h2></div></div>
-          <div className="route-body">
-            <div className="chip-field">
-              <div className="chip-field-head">
-                <span>Model</span>
-                {activeRoute && (
+                ) : (
                   <button
-                    type="button"
-                    className="manage-models-button"
-                    onClick={() => void openModelCatalog()}
-                    disabled={busy !== null}
-                    aria-label="Manage which models show up here"
-                    title="Manage which models show up here"
+                    className="target-btn open"
+                    onClick={() => void openBasiliskosClaude()}
+                    disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}
                   >
-                    <ListFilter size={12} /> Manage
+                    <AppWindow size={13} /> Launch window
                   </button>
                 )}
               </div>
-              {activeRoute ? (
-                <div className="chip-row" role="radiogroup" aria-label="Model">
-                  {activeRoute.modelOptions.map((model) => (
-                    <button
-                      type="button"
-                      key={model.id}
-                      role="radio"
-                      aria-checked={activeRoute.selectedModel === model.id}
-                      className={`chip ${activeRoute.selectedModel === model.id ? "selected" : ""}`}
-                      onClick={() => chooseModel(model.id)}
-                      disabled={busy !== null}
-                    >
-                      {model.label}
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <p className="chip-empty">Choose an account first</p>
-              )}
             </div>
-            <div className="chip-field">
-              <span>Thinking</span>
-              <div className="chip-row" role="radiogroup" aria-label="Thinking">
-                {THINKING_LEVELS.map((level) => {
-                  const supported = level === "auto" || (selectedModel?.thinkingLevels.includes(level) ?? false);
-                  const checked = (activeRoute?.thinking ?? "auto") === level;
-                  return (
-                    <button
-                      type="button"
-                      key={level}
-                      role="radio"
-                      aria-checked={checked}
-                      className={`chip ${checked ? "selected" : ""}`}
-                      onClick={() => void updateRoute(activeRoute?.selectedModel ?? "", level)}
-                      disabled={busy !== null || !activeRoute || !supported}
-                      title={supported ? undefined : `${selectedModel?.label ?? "This model"} doesn't support ${thinkingLabel(level)} thinking`}
-                    >
-                      {thinkingLabel(level)}
-                    </button>
-                  );
-                })}
+
+            <div className="target-card">
+              <div className="target-card-header">
+                <span className="eyebrow">ChatGPT App</span>
+                <span className={`target-status-dot ${snapshot?.codexRunning ? "running" : "stopped"}`}>
+                  ● {snapshot?.codexRunning ? "Running" : "Stopped"}
+                </span>
+              </div>
+              <div className="target-card-body">
+                <h3 title={active ? active.label : "No account"}>
+                  {active ? active.label : "No account"}
+                </h3>
+                <p>
+                  {snapshot?.codexRunning
+                    ? `Active on ${active ? active.label : "account"} · Effort ${(activeRoute?.thinking ?? "auto") === "auto" ? "High" : activeRoute?.thinking}`
+                    : "Isolated ChatGPT window"}
+                </p>
+                <HeroFuel percent={codexUsagePercent} />
+              </div>
+              <div className="target-card-actions">
+                {snapshot?.codexRunning ? (
+                  <button className="target-btn close" onClick={() => void closeBasiliskosCodex()} disabled={busy !== null}>
+                    Close window
+                  </button>
+                ) : (
+                  <button
+                    className="target-btn open"
+                    onClick={() => void openBasiliskosCodex()}
+                    disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}
+                  >
+                    <AppWindow size={13} /> Launch window
+                  </button>
+                )}
               </div>
             </div>
-            <p className="route-note">Changes apply to the next request from the Basiliskos Claude window. Thinking levels depend on the selected model.</p>
-          </div>
-          <div className="panel-foot claude-foot"><ShieldCheck size={16} /><div><strong>Basiliskos Claude window</strong> · <span className={snapshot?.claudeRunning ? "running-dot" : "stopped-dot"}>● {snapshot?.claude.state ?? "unknown"}</span><br />{snapshot?.claude.detail ?? "Waiting for controller status"}</div>{snapshot?.claudeRunning ? <button onClick={() => void closeBasiliskosClaude()} disabled={busy !== null}>Close window</button> : <button onClick={() => void openBasiliskosClaude()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}><AppWindow size={15} /> Open window</button>}</div>
-          <div className="panel-foot claude-foot"><AppWindow size={16} /><div><strong>ChatGPT window</strong> · <span className={snapshot?.codexRunning ? "running-dot" : "stopped-dot"}>● {snapshot?.codex?.state ?? "unknown"}</span><br />{snapshot?.codex?.detail ?? "Waiting for controller status"}<br /><span className="route-note">Isolated ChatGPT / Codex app. Runs on {active ? `${active.label} · ${activeRoute?.selectedModelLabel ?? activeRoute?.selectedModel ?? "—"}` : "no account selected"} · effort {(activeRoute?.thinking ?? "auto") === "auto" ? "high" : (activeRoute?.thinking ?? "—")} — applied when the window opens; restart ChatGPT after changing the route</span></div>{snapshot?.codexRunning ? <button onClick={() => void closeBasiliskosCodex()} disabled={busy !== null}>Close window</button> : <button onClick={() => void openBasiliskosCodex()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}><AppWindow size={15} /> Open window</button>}</div>
-          <label className="settings-row">
-            <input type="checkbox" checked={snapshot?.openClaudeOnLaunch !== false} onChange={(event) => void setOpenClaudeOnLaunch(event.target.checked)} disabled={busy !== null} />
-            <span>Reopen the Basiliskos Claude window when Basiliskos starts</span>
-          </label>
-        </section>
-      </div>
+
+            <div className="target-card">
+              <div className="target-card-header">
+                <span className="eyebrow">CLI Bridges</span>
+                <span className={`target-status-dot ${codexCliAccount || grokCliAccount ? "running" : "stopped"}`}>
+                  ● {codexCliAccount || grokCliAccount ? "Configured" : "Idle"}
+                </span>
+              </div>
+              <div className="target-card-body">
+                <h3 title={codexCliAccount ? codexCliAccount.label : "Codex: Not set"}>
+                  {codexCliAccount ? `Codex: ${codexCliAccount.label}` : "Codex: Not set"}
+                </h3>
+                <p title={grokCliAccount ? grokCliAccount.label : "Grok: Not set"}>
+                  {grokCliAccount ? `Grok: ${grokCliAccount.label}` : "Grok: Not set"}
+                </p>
+                <HeroFuel percent={grokUsagePercent ?? codexUsagePercent} />
+              </div>
+              <div className="target-card-actions">
+                <span className="cli-hint"><Terminal size={12} /> Terminal active</span>
+              </div>
+            </div>
+
+            <div className="target-card relay-card">
+              <div className="target-card-header">
+                <span className="eyebrow">Local Relay</span>
+                <span className={`target-status-dot ${snapshot?.running ? "running" : "stopped"}`}>
+                  ● {snapshot?.running ? "127.0.0.1:8317" : "Stopped"}
+                </span>
+              </div>
+              <div className="target-card-body">
+                <span className={`token-status ${active ? "ok" : "muted"}`}>
+                  <i aria-hidden="true" />{active ? "Credential active" : "No active credential"}
+                </span>
+                <p>{snapshot?.activeRequests ? `${snapshot.activeRequests} active request${snapshot.activeRequests === 1 ? "" : "s"}` : "Relay ready"}</p>
+              </div>
+              <div className="target-card-actions">
+                <button className={`relay-toggle-btn ${snapshot?.running ? "running" : ""}`} onClick={() => void startOrStop()} disabled={busy !== null}>
+                  {busy === "power" ? <LoaderCircle className="spin" size={14} /> : snapshot?.running ? <CircleStop size={14} /> : <Play size={14} />}
+                  {snapshot?.running ? "Stop relay" : "Start relay"}
+                </button>
+              </div>
+            </div>
+          </section>
+        )}
       </div>
 
-      {showDiagnostics && (
-        <section className="diagnostics-panel" aria-label="Basiliskos diagnostics">
-          <div className="diagnostics-head">
-            <div><span className="zone-label">DIAGNOSTICS</span><h2>Redacted controller activity</h2></div>
-            <div className="diagnostics-actions">
-              <button onClick={() => void refresh()}><RefreshCw size={15} /> Refresh</button>
-              <button onClick={() => void openDiagnosticsFolder()}><FolderOpen size={15} /> Open logs</button>
-              <button onClick={() => void copyDiagnostics()}><Copy size={15} /> Copy</button>
-              <button aria-label="Close diagnostics" onClick={() => setShowDiagnostics(false)}><X size={15} /></button>
+      {view === "console" ? (
+        <>
+          <div className="workspace">
+            <div className="choices-grid">
+              <section className="panel accounts-panel" aria-label="Choose account">
+                <div className="panel-head">
+                  <div>
+                    <span className="zone-label">SUBSCRIPTION FLEET</span>
+                    <h2>Authorized accounts</h2>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      className="add-button"
+                      onClick={() => void refreshUsage(allUsageFiles)}
+                      disabled={allUsageFiles.length === 0 || allUsageLoading}
+                      title="Refresh usage for every account now. Basiliskos also refreshes automatically every five minutes."
+                    >
+                      <RefreshCw className={allUsageLoading ? "spin" : undefined} size={15} /> Refresh usage
+                    </button>
+                    {loginWaiting ? (
+                      <button className="add-button cancel-login" onClick={() => void cancelLogin()} disabled={busy !== null}>
+                        {busy === "cancel-login" ? <LoaderCircle className="spin" size={15} /> : <X size={15} />} Cancel login
+                      </button>
+                    ) : (
+                      <button className="add-button" onClick={() => void addAccount()} disabled={busy !== null}>
+                        {busy === "login" ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />}{" "}
+                        {usesApiKeyAuth(provider) ? "Add API key" : "Add account"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="provider-tabs" role="tablist" aria-label="Account provider">
+                  <button
+                    role="tab"
+                    aria-selected={providerFilter === "all"}
+                    className={providerFilter === "all" ? "selected" : ""}
+                    onClick={() => { setProviderFilter("all"); cancelApiKeyPrompt(); }}
+                  >
+                    All ({totalAccountCount})
+                  </button>
+                  {PROVIDERS.map((item) => {
+                    const count = snapshot?.accounts.filter((account) => account.provider === item.id).length ?? 0;
+                    return (
+                      <button
+                        key={item.id}
+                        role="tab"
+                        aria-selected={providerFilter === item.id}
+                        className={providerFilter === item.id ? "selected" : ""}
+                        onClick={() => {
+                          setProviderFilter(item.id);
+                          setProvider(item.id);
+                          cancelApiKeyPrompt();
+                        }}
+                      >
+                        {item.label} ({count})
+                      </button>
+                    );
+                  })}
+                </div>
+                {apiKeyPrompt && (
+                  <div className="auth-wait-card" role="group" aria-label="DeepSeek API key">
+                    <div className="auth-wait-head">
+                      <span className="zone-label">API KEY</span>
+                      <strong>DeepSeek</strong>
+                      <p>
+                        DeepSeek authorizes with an API key instead of a browser login. Create one at
+                        platform.deepseek.com, then paste it here. It is stored locally and verified with
+                        DeepSeek before it is saved.
+                      </p>
+                    </div>
+                    <div className="auth-wait-url-row">
+                      <input
+                        className="auth-wait-url"
+                        type="password"
+                        autoComplete="off"
+                        spellCheck={false}
+                        aria-label="DeepSeek API key"
+                        placeholder="sk-…"
+                        value={apiKeyDraft}
+                        onChange={(event) => setApiKeyDraft(event.target.value)}
+                        onKeyDown={(event) => { if (event.key === "Enter") void submitApiKey(); }}
+                        disabled={busy !== null}
+                      />
+                      <button type="button" className="auth-wait-action" onClick={() => void submitApiKey()} disabled={busy !== null || !apiKeyDraft.trim()}>
+                        {busy === "api-key" ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} aria-hidden="true" />} Verify and save
+                      </button>
+                      <button type="button" className="auth-wait-action" onClick={cancelApiKeyPrompt} disabled={busy !== null}>
+                        <X size={14} aria-hidden="true" /> Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {pendingAuth && (
+                  <div className="auth-wait-card" role="status" aria-live="polite">
+                    <div className="auth-wait-head">
+                      <span className="zone-label">AUTHORIZATION</span>
+                      <strong>
+                        {PROVIDERS.find((item) => item.id === pendingAuth.provider)?.label ?? pendingAuth.provider}
+                        {pendingAuth.accountLabel ? ` · ${pendingAuth.accountLabel}` : ""}
+                      </strong>
+                      <p>
+                        {prefersManualAuthBrowser(pendingAuth.provider)
+                          ? "Open this URL in a private window or a dedicated browser profile so the right account is chosen. The default browser often auto-completes the wrong one."
+                          : "Finish the official provider login in your browser. You can also copy the URL if auto-open failed."}
+                      </p>
+                    </div>
+                    <div className="auth-wait-url-row">
+                      <code className="auth-wait-url" title={pendingAuth.authorizationUrl}>{pendingAuth.authorizationUrl}</code>
+                      <button type="button" className="auth-wait-action" onClick={() => void copyAuthField("url")} disabled={busy !== null}>
+                        <Copy size={14} aria-hidden="true" /> Copy URL
+                      </button>
+                      <button type="button" className="auth-wait-action" onClick={() => void openAuthUrlManually()} disabled={busy !== null}>
+                        <ExternalLink size={14} aria-hidden="true" /> Open browser
+                      </button>
+                    </div>
+                    {pendingAuth.userCode && (
+                      <div className="auth-wait-code-row">
+                        <span className="auth-wait-code-label">Code</span>
+                        <code className="auth-wait-code">{pendingAuth.userCode}</code>
+                        <button type="button" className="auth-wait-action" onClick={() => void copyAuthField("code")} disabled={busy !== null}>
+                          <Copy size={14} aria-hidden="true" /> Copy code
+                        </button>
+                      </div>
+                    )}
+                    {authCopyFeedback && <p className="auth-wait-feedback">{authCopyFeedback}</p>}
+                  </div>
+                )}
+                <div className="account-list" role="tabpanel">
+                  {accounts.length === 0 ? (
+                    <div className="empty-state">
+                      <ShieldCheck size={26} />
+                      <h3>No {providerFilter === "all" ? "" : PROVIDERS.find((item) => item.id === providerFilter)?.label} accounts yet</h3>
+                      <p>Add one using the official provider login or API key.</p>
+                    </div>
+                  ) : accounts.map((account) => {
+                    const usage = usageByAccount[account.fileName];
+                    const isEditing = editingAccount === account.fileName;
+                    const cooling = cooldownRemaining(account.cooldownUntilMs, now);
+                    const credentialWarning = credentialAlert(account, now);
+                    return (
+                      <article className={`account-row ${account.active ? "active" : ""}`} key={account.fileName}>
+                        <div className="account-avatar-wrapper">
+                          <div className="account-avatar">{account.label.slice(0, 1).toUpperCase()}</div>
+                          <span className={`provider-mini-badge ${account.provider}`}>
+                            {PROVIDER_NAMES[account.provider]}
+                          </span>
+                        </div>
+                        <div className="account-copy">
+                          {isEditing ? (
+                            <form className="account-name-form" onSubmit={(event) => { event.preventDefault(); void renameAccount(account); }}>
+                              <label className="sr-only" htmlFor={`profile-name-${account.fileName}`}>Profile name</label>
+                              <input
+                                id={`profile-name-${account.fileName}`}
+                                value={draftName}
+                                onChange={(event) => setDraftName(event.target.value)}
+                                onKeyDown={(event) => { if (event.key === "Escape") cancelRename(); }}
+                                maxLength={64}
+                                autoFocus
+                              />
+                              <button type="submit" className="inline-icon-button save" aria-label={`Save name for ${account.label}`} title="Save name" disabled={busy !== null}><Check size={14} /></button>
+                              <button type="button" className="inline-icon-button" aria-label="Cancel rename" title="Cancel" onClick={cancelRename} disabled={busy !== null}><X size={14} /></button>
+                            </form>
+                          ) : (
+                            <div className="account-name-line">
+                              <strong>{account.label}</strong>
+                              {cooling > 0 && (
+                                <span className="cooldown-chip" title="Rate-limited by the provider; cools down automatically">
+                                  <Timer size={11} /> {cooldownLabel(cooling)}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                          <p>{account.email ?? "Authorized subscription"}</p>
+                          {credentialWarning && (
+                            <div className={`credential-expiry ${credentialWarning.tone}`}>
+                              <Timer size={11} aria-hidden="true" /> {credentialWarning.label}
+                            </div>
+                          )}
+                          <div className="usage-summary">
+                            {usage?.data ? usage.data.windows.map((window) => window.known ? (
+                              <div className={`usage-window ${window.remainingPercent < 20 ? "low" : ""}`} key={window.label} title={`${Math.round(window.usedPercent)}% used`}>
+                                <span>{window.label}</span>
+                                <QuotaBar percent={window.remainingPercent} />
+                                <strong>{Math.round(window.remainingPercent)}% left</strong>
+                                {usageResetLabel(window.resetsAtMs) && <small>{usageResetLabel(window.resetsAtMs)}</small>}
+                              </div>
+                            ) : (
+                              <div className="usage-window unrecorded" key={window.label} title="The provider returned a billing period but did not report a usage percentage.">
+                                <span>{window.label}</span>
+                                <span className="usage-unrecorded">Not reported</span>
+                                {usageResetLabel(window.resetsAtMs) && <small>{usageResetLabel(window.resetsAtMs)}</small>}
+                              </div>
+                            )) : usage?.loading ? (
+                              <span className="usage-state"><LoaderCircle className="spin" size={11} /> Checking usage…</span>
+                            ) : (
+                              <span className="usage-state unavailable" title={usage?.error}>
+                                {usage?.error ?? "Usage unavailable"}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <div className="account-actions">
+                          {accountNeedsRelogin(account, usage?.error) && (
+                            <button
+                              className="icon-button warn"
+                              aria-label={`Re-login ${account.label}`}
+                              onClick={() => void relogin(account)}
+                              disabled={busy !== null}
+                              title="Token expired or rejected — click to sign in again"
+                            >
+                              {busy === `relogin-${account.fileName}` ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />}
+                            </button>
+                          )}
+                          <button
+                            className={`icon-button serve-toggle ${account.active ? "active" : ""}`}
+                            aria-label={account.active ? `${account.label} is serving Claude Code` : `Serve Claude Code with ${account.label}`}
+                            onClick={() => requestAccountSelection(account)}
+                            disabled={busy !== null || cooling > 0 || account.active}
+                          >
+                            <span className="serve-toggle-fill">
+                              <span className="serve-toggle-icon">
+                                {busy === account.fileName ? <LoaderCircle className="spin" size={15} /> : <ClaudeCodeMark className="claude-mark-icon" />}
+                              </span>
+                              <span className="serve-toggle-label">
+                                {account.active ? "Serving Claude Code" : cooling > 0 ? `Cooling down ${cooldownLabel(cooling)}` : "Use for Claude Code"}
+                              </span>
+                            </span>
+                          </button>
+                          <button
+                            className={`icon-button serve-toggle codex ${account.active ? "active" : ""}`}
+                            aria-label={account.active ? `${account.label} is serving Basiliskos Codex` : `Serve Basiliskos Codex with ${account.label}`}
+                            onClick={() => requestCodexAccountSelection(account)}
+                            disabled={busy !== null || cooling > 0 || account.active}
+                          >
+                            <span className="serve-toggle-fill">
+                              <span className="serve-toggle-icon">
+                                {busy === `codex-${account.fileName}` ? <LoaderCircle className="spin" size={15} /> : <CodexMark className="codex-mark-icon" />}
+                              </span>
+                              <span className="serve-toggle-label">
+                                {account.active ? "Serving Basiliskos Codex" : cooling > 0 ? `Cooling down ${cooldownLabel(cooling)}` : "Use for Basiliskos Codex"}
+                              </span>
+                            </span>
+                          </button>
+                          {account.provider === "codex" && (
+                            <button
+                              className={`icon-button serve-toggle cli ${account.email === activeIdentities?.codexCliEmail ? "active" : ""}`}
+                              aria-label={account.email === activeIdentities?.codexCliEmail ? `${account.label} is serving the real Codex CLI` : `Serve real Codex CLI with ${account.label}`}
+                              onClick={() => void serveCodexCliFromRelay(account)}
+                              disabled={servingBusy !== null || account.email === activeIdentities?.codexCliEmail}
+                            >
+                              <span className="serve-toggle-fill">
+                                <span className="serve-toggle-icon">
+                                  {servingBusy === account.fileName ? <LoaderCircle className="spin cli-icon" size={15} /> : <Terminal className="cli-icon" size={15} />}
+                                </span>
+                                <span className="serve-toggle-label">
+                                  {account.email === activeIdentities?.codexCliEmail ? "Serving Codex CLI" : "Use for Codex CLI"}
+                                </span>
+                              </span>
+                            </button>
+                          )}
+                          {account.provider === "xai" && (
+                            <button
+                              className={`icon-button serve-toggle cli ${account.email === activeIdentities?.grokCliEmail ? "active" : ""}`}
+                              aria-label={account.email === activeIdentities?.grokCliEmail ? `${account.label} is serving the real Grok CLI` : `Serve real Grok CLI with ${account.label}`}
+                              onClick={() => void serveGrokCliFromRelay(account)}
+                              disabled={servingBusy !== null || account.email === activeIdentities?.grokCliEmail}
+                            >
+                              <span className="serve-toggle-fill">
+                                <span className="serve-toggle-icon">
+                                  {servingBusy === account.fileName ? <LoaderCircle className="spin cli-icon" size={15} /> : <Terminal className="cli-icon" size={15} />}
+                                </span>
+                                <span className="serve-toggle-label">
+                                  {account.email === activeIdentities?.grokCliEmail ? "Serving Grok CLI" : "Use for Grok CLI"}
+                                </span>
+                              </span>
+                            </button>
+                          )}
+                          {!isEditing && <button className="icon-button" aria-label={`Rename ${account.label}`} title={`Rename ${account.label}`} onClick={() => beginRename(account)} disabled={busy !== null}><Pencil size={15} /></button>}
+                          <button className="icon-button danger" aria-label={`Remove ${account.label}`} title={`Remove ${account.label}`} onClick={() => void removeAccount(account)} disabled={busy !== null}><Trash2 size={16} /></button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+                <div className="panel-foot account-counts">
+                  {providerCounts.map((item, index) => (
+                    <span key={item.id}>{index > 0 && <i aria-hidden="true">·</i>}{item.label} · {item.count}</span>
+                  ))}
+                </div>
+              </section>
+
+              <section className="panel route-panel" aria-label="Choose model" aria-busy={busy === "route"}>
+                <div className="panel-head">
+                  <div>
+                    <span className="zone-label">ROUTE & PARAMETERS</span>
+                    <h2>Next request route</h2>
+                  </div>
+                </div>
+                <div className="route-body">
+                  <div className="chip-field">
+                    <div className="chip-field-head">
+                      <span>Model</span>
+                      {activeRoute && (
+                        <button
+                          type="button"
+                          className="manage-models-button"
+                          onClick={() => void openModelCatalog()}
+                          disabled={busy !== null}
+                          aria-label="Manage which models show up here"
+                          title="Manage which models show up here"
+                        >
+                          <ListFilter size={12} /> Manage
+                        </button>
+                      )}
+                    </div>
+                    {activeRoute ? (
+                      <div className="chip-row" role="radiogroup" aria-label="Model">
+                        {activeRoute.modelOptions.map((model) => (
+                          <button
+                            type="button"
+                            key={model.id}
+                            role="radio"
+                            aria-checked={activeRoute.selectedModel === model.id}
+                            className={`chip ${activeRoute.selectedModel === model.id ? "selected" : ""}`}
+                            onClick={() => chooseModel(model.id)}
+                            disabled={busy !== null}
+                          >
+                            {model.label}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="chip-empty">Choose an account first</p>
+                    )}
+                  </div>
+                  <div className="chip-field">
+                    <span>Thinking / Reasoning Effort</span>
+                    <div className="chip-row" role="radiogroup" aria-label="Thinking">
+                      {THINKING_LEVELS.map((level) => {
+                        const supported = level === "auto" || (selectedModel?.thinkingLevels.includes(level) ?? false);
+                        const checked = (activeRoute?.thinking ?? "auto") === level;
+                        return (
+                          <button
+                            type="button"
+                            key={level}
+                            role="radio"
+                            aria-checked={checked}
+                            className={`chip ${checked ? "selected" : ""}`}
+                            onClick={() => void updateRoute(activeRoute?.selectedModel ?? "", level)}
+                            disabled={busy !== null || !activeRoute || !supported}
+                            title={supported ? undefined : `${selectedModel?.label ?? "This model"} doesn't support ${thinkingLabel(level)} thinking`}
+                          >
+                            {thinkingLabel(level)}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+                <div className="window-strip" aria-label="Isolated windows">
+                  <div className="window-strip-row">
+                    <ShieldCheck size={14} aria-hidden="true" />
+                    <span className="window-strip-name">Claude</span>
+                    <span className={snapshot?.claudeRunning ? "running-dot" : "stopped-dot"}>
+                      {snapshot?.claudeRunning ? "Running" : "Stopped"}
+                    </span>
+                    {snapshot?.claudeRunning ? (
+                      <button type="button" onClick={() => void closeBasiliskosClaude()} disabled={busy !== null}>Close</button>
+                    ) : (
+                      <button type="button" onClick={() => void openBasiliskosClaude()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}>
+                        <AppWindow size={13} /> Open
+                      </button>
+                    )}
+                  </div>
+                  <div className="window-strip-row">
+                    <AppWindow size={14} aria-hidden="true" />
+                    <span className="window-strip-name">ChatGPT</span>
+                    <span className={snapshot?.codexRunning ? "running-dot" : "stopped-dot"}>
+                      {snapshot?.codexRunning ? "Running" : "Stopped"}
+                    </span>
+                    <span
+                      className="window-strip-meta"
+                      title={active
+                        ? `${active.label} · ${activeRoute?.selectedModelLabel ?? "—"} · restart ChatGPT after a route change`
+                        : "Choose an account first"}
+                    >
+                      {active ? (activeRoute?.selectedModelLabel ?? active.label) : "No account"}
+                    </span>
+                    {snapshot?.codexRunning ? (
+                      <button type="button" onClick={() => void closeBasiliskosCodex()} disabled={busy !== null}>Close</button>
+                    ) : (
+                      <button type="button" onClick={() => void openBasiliskosCodex()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}>
+                        <AppWindow size={13} /> Open
+                      </button>
+                    )}
+                  </div>
+                  <label className="settings-row">
+                    <input type="checkbox" checked={snapshot?.openClaudeOnLaunch !== false} onChange={(event) => void setOpenClaudeOnLaunch(event.target.checked)} disabled={busy !== null} />
+                    <span>Open Claude at launch</span>
+                  </label>
+                </div>
+              </section>
             </div>
           </div>
-          <div className="diagnostics-summary">
-            {[snapshot?.controller, snapshot?.relay, snapshot?.backend, snapshot?.credentials, snapshot?.route, snapshot?.oauth, snapshot?.claude].map((status, index) => (
-              <div key={index}><span className={statusTone(status)}><i aria-hidden="true" />{status?.state ?? "unknown"}</span><p>{status?.detail ?? "No status available"}</p></div>
-            ))}
-          </div>
-          <div className="event-list">
-            <DiagnosticEventList events={snapshot?.diagnostics ?? []} />
-          </div>
-        </section>
-      )}
-      </> : (
+
+          {showDiagnostics && (
+            <section className="diagnostics-panel" aria-label="Basiliskos diagnostics">
+              <div className="diagnostics-head">
+                <div><span className="zone-label">DIAGNOSTICS</span><h2>Redacted controller activity</h2></div>
+                <div className="diagnostics-actions">
+                  <button onClick={() => void refresh()}><RefreshCw size={15} /> Refresh</button>
+                  <button onClick={() => void openDiagnosticsFolder()}><FolderOpen size={15} /> Open logs</button>
+                  <button onClick={() => void copyDiagnostics()}><Copy size={15} /> Copy</button>
+                  <button aria-label="Close diagnostics" onClick={() => setShowDiagnostics(false)}><X size={15} /></button>
+                </div>
+              </div>
+              <div className="diagnostics-summary">
+                {[snapshot?.controller, snapshot?.relay, snapshot?.backend, snapshot?.credentials, snapshot?.route, snapshot?.oauth, snapshot?.claude, snapshot?.codex].map((status, index) => (
+                  <div key={index}><span className={statusTone(status)}><i aria-hidden="true" />{status?.state ?? "unknown"}</span><p>{status?.detail ?? "No status available"}</p></div>
+                ))}
+              </div>
+              <div className="event-list">
+                <DiagnosticEventList events={snapshot?.diagnostics ?? []} />
+              </div>
+            </section>
+          )}
+        </>
+      ) : (
         <section className="changes-panel" aria-label="Basiliskos updates and changes">
           <div className="changes-head">
             <div><span className="zone-label">UPDATES</span><h2>{availableUpdate ? `${availableUpdate.name} is available` : "Basiliskos is up to date"}</h2><p>Current version {APP_VERSION}</p></div>
@@ -1825,7 +1986,16 @@ export default function App() {
         </div>
       )}
 
-      <footer><p className={isError ? "error-message" : ""} aria-live="polite" aria-atomic="true">{message} {view === "console" && <button className="activity-link" onClick={() => setShowDiagnostics((current) => !current)}>Activity {showDiagnostics ? "▾" : "▸"}</button>}</p><span>Basiliskos {APP_VERSION} · CLIProxyAPI {snapshot?.version ?? "…"}</span></footer>
+      <footer>
+        <p className={isError ? "error-message" : ""} aria-live="polite" aria-atomic="true">
+          {message} {view === "console" && (
+            <button className="activity-link" onClick={() => setShowDiagnostics((current) => !current)}>
+              Activity {showDiagnostics ? "▾" : "▸"}
+            </button>
+          )}
+        </p>
+        <span>Basiliskos {APP_VERSION} · CLIProxyAPI {snapshot?.version ?? "…"}</span>
+      </footer>
     </main>
   );
 }

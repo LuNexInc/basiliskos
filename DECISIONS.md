@@ -1,7 +1,13 @@
-# DECISIONS — hydra-gateway (Basiliskos)
+# DECISIONS — hydra-gateway (BasiliskOS)
 
 > What is intentionally settled + why + reverse-if. HANDOFF = history; this = standing state.
 > Newest on top. Extracted from AGENTS.md 2026-07-25 — keep in sync when a call changes.
+
+## 2026-08-14 — Public product name is BasiliskOS
+- **Decision:** The product display name is **BasiliskOS**. Keep the workspace folder `hydra-gateway`, the package id `com.threereadylab.hydragateway`, the publish repo slug `LuNexInc/basiliskos`, and the hardcoded GitHub download URL on that slug. Do not rename the GitHub repo for the next ship.
+- **Why:** Charles set the public name. The slug, folder, and updater URL already work. A GitHub rename or a `productName` change moves `C:\Program Files\3ReadyLab\<productName>\` and can leave a second install unless the NSIS hook migrates the old Basiliskos path.
+- **Next ship rule:** user-visible strings (window title, UI, README, release notes) may say BasiliskOS. Leave `tauri.conf.json` `productName` as `Basiliskos` until Charles asks for an installer/exe rename and the hook is tested.
+- **Reverse if:** Charles wants the installer, Start Menu entry, and Program Files folder to say BasiliskOS in the same release.
 
 ## 2026-08-14 — Codex DeepSeek images use the existing OAuth vision sidecar
 - **Decision:** When the Codex DeepSeek hop sees `input_image` (or equivalent) parts, the plugin calls `POST /hydra/vision-describe` on the Basiliskos front proxy. That endpoint runs the existing isolated OAuth sidecar plan (Codex → Kimi → Claude → Grok) and returns a text description. The plugin replaces image parts with `Image details:` text plus the standing presentation guidance, then hops the text-only Responses body to DeepSeek. DeepSeek does not need to be the active controller account.
