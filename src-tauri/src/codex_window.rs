@@ -15,6 +15,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU32, Ordering},
     thread,
     time::Duration,
 };
@@ -106,12 +107,35 @@ pub(crate) fn load_hicons(path: &Path) -> Result<(OwnedIcon, OwnedIcon), String>
     }
 }
 
+/// Chromium parks owner windows around -32000. Those stay "visible" after the
+/// user closes the real Codex window, so they must not count as an open UI.
+pub(crate) fn rect_is_on_screen(left: i32, top: i32, width: i32, height: i32) -> bool {
+    width >= 80 && height >= 40 && left > -10_000 && top > -10_000 && left < 30_000 && top < 30_000
+}
+
+pub(crate) fn should_reap_hidden_codex(
+    seen_open: bool,
+    currently_open: bool,
+    missing_ticks: u32,
+) -> bool {
+    seen_open && !currently_open && missing_ticks >= 4
+}
+
 #[cfg(target_os = "windows")]
 #[derive(Clone, Debug)]
 pub(crate) struct CodexHwndInfo {
     pub(crate) hwnd: isize,
     visible: bool,
+    iconic: bool,
+    on_screen: bool,
     class_name: String,
+}
+
+#[cfg(target_os = "windows")]
+impl CodexHwndInfo {
+    pub(crate) fn counts_as_open(&self) -> bool {
+        self.iconic || (self.visible && self.on_screen)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -157,9 +181,10 @@ fn process_tree(root: u32) -> Vec<u32> {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn enum_codex_hwnds_for_pid(pid: u32) -> Vec<CodexHwndInfo> {
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, TRUE};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, TRUE};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetWindow, GetWindowThreadProcessId, IsWindowVisible, GW_OWNER,
+        EnumWindows, GetClassNameW, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, GW_OWNER,
     };
 
     struct EnumData {
@@ -179,9 +204,15 @@ pub(crate) fn enum_codex_hwnds_for_pid(pid: u32) -> Vec<CodexHwndInfo> {
             } else {
                 String::new()
             };
+            let mut rect = RECT::default();
+            let has_rect = GetWindowRect(hwnd, &mut rect) != 0;
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
             data.windows.push(CodexHwndInfo {
                 hwnd: hwnd as isize,
                 visible: IsWindowVisible(hwnd) != 0,
+                iconic: IsIconic(hwnd) != 0,
+                on_screen: has_rect && rect_is_on_screen(rect.left, rect.top, width, height),
                 class_name,
             });
         }
@@ -201,8 +232,7 @@ pub(crate) fn enum_codex_hwnds_for_pid(pid: u32) -> Vec<CodexHwndInfo> {
 #[cfg(target_os = "windows")]
 pub(crate) fn apply_icons_to_hwnd(hwnd: isize, small: isize, big: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SendMessageW, SetClassLongPtrW, SetWindowPos, GCLP_HICON, GCLP_HICONSM, ICON_BIG,
-        ICON_SMALL, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_SETICON,
+        SendMessageW, SetClassLongPtrW, GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, WM_SETICON,
     };
 
     unsafe {
@@ -211,8 +241,17 @@ pub(crate) fn apply_icons_to_hwnd(hwnd: isize, small: isize, big: isize) {
         let _ = SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big);
         let _ = SetClassLongPtrW(hwnd, GCLP_HICONSM, small);
         let _ = SetClassLongPtrW(hwnd, GCLP_HICON, big);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_frame_changed(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+    unsafe {
         let _ = SetWindowPos(
-            hwnd,
+            hwnd as windows_sys::Win32::Foundation::HWND,
             std::ptr::null_mut(),
             0,
             0,
@@ -470,7 +509,8 @@ pub(crate) fn apply_codex_window_icons(
             continue;
         }
         apply_icons_to_hwnd(info.hwnd, small.0, big.0);
-        if info.visible {
+        if info.counts_as_open() {
+            apply_frame_changed(info.hwnd);
             apply_basiliskos_aumid(info.hwnd, window_ico);
             apply_window_title(info.hwnd, "Basiliskos Codex");
             apply_taskbar_overlay(info.hwnd, small.0);
@@ -487,10 +527,21 @@ pub(crate) fn apply_codex_window_icons(
 }
 
 #[cfg(target_os = "windows")]
+static ICON_REAPPLY_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(target_os = "windows")]
+pub(crate) fn has_open_isolated_codex_window(pid: u32) -> bool {
+    enum_codex_hwnds_for_pid(pid)
+        .iter()
+        .any(CodexHwndInfo::counts_as_open)
+}
+
+#[cfg(target_os = "windows")]
 pub(crate) fn spawn_codex_icon_reapply(pid: u32, window_ico: PathBuf) {
+    let generation = ICON_REAPPLY_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     thread::spawn(move || {
         log_icon_line(&format!(
-            "icon reapply start pid={pid} window={}",
+            "icon reapply start pid={pid} gen={generation} window={}",
             window_ico.display()
         ));
         let Ok((window_small, window_big)) = load_hicons(&window_ico) else {
@@ -498,19 +549,29 @@ pub(crate) fn spawn_codex_icon_reapply(pid: u32, window_ico: PathBuf) {
             return;
         };
         let mut consecutive_hits = 0_u32;
-        // Keep the owned HICON values alive for exactly the isolated process lifetime.
-        // Chromium/Electron can reset its class icons after paint or focus, so reassert
-        // at a low cadence after the initial startup window.
-        for attempt in 0_u32.. {
+        let mut seen_open = false;
+        // Chromium can reset class icons after the first paint. Reassert for a
+        // short startup window only. A lifetime loop + SWP_FRAMECHANGED makes
+        // the pointer hitch after the user has already closed the window.
+        for attempt in 0_u32..48 {
+            if ICON_REAPPLY_GENERATION.load(Ordering::SeqCst) != generation {
+                log_icon_line(&format!(
+                    "icon reapply superseded pid={pid} gen={generation}"
+                ));
+                return;
+            }
             if attempt > 0 {
-                thread::sleep(if attempt < 60 {
-                    Duration::from_millis(500)
-                } else {
-                    Duration::from_secs(5)
-                });
+                thread::sleep(Duration::from_millis(500));
             }
             if !process_alive(pid) {
                 log_icon_line(&format!("icon reapply stop pid={pid} process exited"));
+                return;
+            }
+            let open = has_open_isolated_codex_window(pid);
+            if open {
+                seen_open = true;
+            } else if seen_open {
+                log_icon_line(&format!("icon reapply stop pid={pid} window closed"));
                 return;
             }
             let touched = apply_codex_window_icons(pid, &window_ico, &window_small, &window_big);
@@ -549,4 +610,25 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn spawn_codex_icon_reapply(_pid: u32, _window_ico: PathBuf) {
     // No-op outside Windows; the isolated Codex app is Windows-only.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rect_is_on_screen, should_reap_hidden_codex};
+
+    #[test]
+    fn offscreen_chromium_owner_is_not_on_screen() {
+        assert!(!rect_is_on_screen(-25600, -25600, 159, 27));
+        assert!(!rect_is_on_screen(-32000, -32000, 100, 100));
+        assert!(!rect_is_on_screen(100, 100, 20, 20));
+        assert!(rect_is_on_screen(80, 80, 900, 600));
+    }
+
+    #[test]
+    fn hidden_codex_is_reaped_after_four_missed_ticks() {
+        assert!(!should_reap_hidden_codex(false, false, 10));
+        assert!(!should_reap_hidden_codex(true, true, 10));
+        assert!(!should_reap_hidden_codex(true, false, 3));
+        assert!(should_reap_hidden_codex(true, false, 4));
+    }
 }

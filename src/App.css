@@ -198,6 +198,33 @@ h1, h2, h3, .eyebrow, .zone-label, .health-indicators, label > span { font-famil
   gap: 5px;
   padding: 3px 0;
 }
+.cli-fuels {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+.cli-fuel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cli-fuel-label {
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted-strong);
+  min-width: 58px;
+}
+.cli-fuel .hero-fuel {
+  margin-top: 0;
+  flex: 1;
+  min-width: 0;
+}
+.cli-fuel .hero-fuel .quota-track {
+  width: 100%;
+}
 .eyebrow { display: block; overflow: visible; color: var(--accent-bright); font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap; }
 .token-status { display: inline-flex; align-items: center; gap: 7px; color: #9fe0b4; font-size: 11px; white-space: nowrap; }
 .token-status i { width: 6px; height: 6px; border-radius: 50%; background: var(--success); }

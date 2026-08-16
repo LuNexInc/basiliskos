@@ -229,7 +229,7 @@ type PreparedBasiliskosUpdate = {
 type AppView = "console" | "changes";
 type ProviderFilter = "all" | Provider;
 
-export const APP_VERSION = "2.5.1";
+export const APP_VERSION = "2.5.2";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },
@@ -1430,7 +1430,24 @@ export default function App() {
                 <p title={grokCliAccount ? grokCliAccount.label : "Grok: Not set"}>
                   {grokCliAccount ? `Grok: ${grokCliAccount.label}` : "Grok: Not set"}
                 </p>
-                <HeroFuel percent={grokUsagePercent ?? codexUsagePercent} />
+                {(codexCliAccount || grokCliAccount) ? (
+                  <div className="cli-fuels">
+                    {codexCliAccount && (
+                      <div className="cli-fuel">
+                        <span className="cli-fuel-label">Codex CLI</span>
+                        <HeroFuel percent={codexUsagePercent} />
+                      </div>
+                    )}
+                    {grokCliAccount && (
+                      <div className="cli-fuel">
+                        <span className="cli-fuel-label">Grok CLI</span>
+                        <HeroFuel percent={grokUsagePercent} />
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <span className="usage-state unavailable">No CLI credential selected</span>
+                )}
               </div>
               <div className="target-card-actions">
                 <span className="cli-hint"><Terminal size={12} /> Terminal active</span>
@@ -1485,7 +1502,14 @@ export default function App() {
                         {busy === "cancel-login" ? <LoaderCircle className="spin" size={15} /> : <X size={15} />} Cancel login
                       </button>
                     ) : (
-                      <button className="add-button" onClick={() => void addAccount()} disabled={busy !== null}>
+                      <button
+                        className="add-button"
+                        onClick={() => void addAccount()}
+                        disabled={busy !== null || providerFilter === "all"}
+                        title={providerFilter === "all"
+                          ? "Pick a provider tab above first, then add an account or API key for it."
+                          : undefined}
+                      >
                         {busy === "login" ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />}{" "}
                         {usesApiKeyAuth(provider) ? "Add API key" : "Add account"}
                       </button>
@@ -1592,8 +1616,17 @@ export default function App() {
                   {accounts.length === 0 ? (
                     <div className="empty-state">
                       <ShieldCheck size={26} />
-                      <h3>No {providerFilter === "all" ? "" : PROVIDERS.find((item) => item.id === providerFilter)?.label} accounts yet</h3>
-                      <p>Add one using the official provider login or API key.</p>
+                      {providerFilter === "all" ? (
+                        <>
+                          <h3>No accounts yet</h3>
+                          <p>Pick a provider tab above to add your first account.</p>
+                        </>
+                      ) : (
+                        <>
+                          <h3>No {PROVIDERS.find((item) => item.id === providerFilter)?.label ?? "provider"} accounts yet</h3>
+                          <p>Add one using the official provider login or API key.</p>
+                        </>
+                      )}
                     </div>
                   ) : accounts.map((account) => {
                     const usage = usageByAccount[account.fileName];

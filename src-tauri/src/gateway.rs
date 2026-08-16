@@ -11,7 +11,10 @@ use std::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -189,6 +192,7 @@ struct ControllerRuntime {
     #[cfg(target_os = "windows")]
     codex_job: Option<usize>,
     codex_root_pid: Option<u32>,
+    codex_watcher_generation: Option<u32>,
     codex_executable: Option<PathBuf>,
     codex_home: Option<PathBuf>,
     front_proxy: Option<FrontProxy>,
@@ -3400,8 +3404,70 @@ fn request_codex_window_close(pid: u32) {
     }
 }
 
+/// Codex hides to an off-screen owner window when the user clicks X. The
+/// process stays a child of Basiliskos and keeps burning a CPU core. Reap it
+/// once the last on-screen window has been gone for two seconds.
+///
+/// A generation counter (not the PID) identifies the watcher's own launch:
+/// Windows can recycle a PID within the 500 ms poll window if the user closes
+/// and immediately reopens the window, which would otherwise let a stale
+/// watcher reap the new instance before its window paints. The watcher also
+/// checks the live `Child` handle with `try_wait` for authoritative exit
+/// detection, which is immune to PID reuse.
+static CODEX_WATCHER_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(target_os = "windows")]
+fn spawn_codex_close_watcher(pid: u32, generation: u32) {
+    thread::spawn(move || {
+        use crate::codex_window::{has_open_isolated_codex_window, should_reap_hidden_codex};
+        let mut seen_open = false;
+        let mut missing_ticks = 0_u32;
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            // The runtime must still own this exact launch: same root PID and
+            // same watcher generation. A newer Codex instance (even one that
+            // recycled this PID) supersedes the watcher.
+            let exited = match runtime_lock() {
+                Ok(mut runtime)
+                    if runtime.codex_root_pid == Some(pid)
+                        && runtime.codex_watcher_generation == Some(generation) =>
+                {
+                    match runtime.codex_child.as_mut() {
+                        Some(child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
+                        None => true,
+                    }
+                }
+                _ => return,
+            };
+            if exited {
+                let _ = hydra_codex_running();
+                return;
+            }
+            let currently_open = has_open_isolated_codex_window(pid);
+            if currently_open {
+                seen_open = true;
+                missing_ticks = 0;
+                continue;
+            }
+            if seen_open {
+                missing_ticks = missing_ticks.saturating_add(1);
+            }
+            if should_reap_hidden_codex(seen_open, currently_open, missing_ticks) {
+                codex_log_icon_line(&format!(
+                    "isolated Codex window gone; stopping leftover process pid={pid}"
+                ));
+                stop_hydra_codex_runtime();
+                return;
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_codex_close_watcher(_pid: u32, _generation: u32) {}
+
 fn stop_hydra_codex_runtime() {
-    let (child, job, pid, executable, home) = match runtime_lock() {
+    let (child, job, pid, _watcher_generation, executable, home) = match runtime_lock() {
         Ok(mut runtime) => {
             let child = runtime.codex_child.take();
             #[cfg(target_os = "windows")]
@@ -3412,6 +3478,7 @@ fn stop_hydra_codex_runtime() {
                 child,
                 job,
                 runtime.codex_root_pid.take(),
+                runtime.codex_watcher_generation.take(),
                 runtime.codex_executable.take(),
                 runtime.codex_home.take(),
             )
@@ -3460,6 +3527,7 @@ fn hydra_codex_running() -> bool {
         close_gateway_job(runtime.codex_job.take());
         runtime.codex_child.take().map(|mut child| child.wait());
         runtime.codex_root_pid = None;
+        runtime.codex_watcher_generation = None;
         runtime.codex_executable = None;
         runtime.codex_home = None;
         diagnostics::record(
@@ -7618,15 +7686,18 @@ pub fn launch_hydra_codex_app(app: AppHandle) -> Result<GatewaySnapshot, String>
             let _ = child.wait();
         })?;
         let pid = child.id();
+        let watcher_generation = CODEX_WATCHER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         {
             let mut runtime = runtime_lock()?;
             runtime.codex_child = Some(child);
             runtime.codex_job = job;
             runtime.codex_root_pid = Some(pid);
+            runtime.codex_watcher_generation = Some(watcher_generation);
             runtime.codex_executable = Some(executable);
             runtime.codex_home = Some(home.clone());
         }
         maybe_apply_codex_icons(&app, pid);
+        spawn_codex_close_watcher(pid, watcher_generation);
         std::thread::sleep(Duration::from_millis(900));
         if !hydra_codex_running() {
             return Err(
