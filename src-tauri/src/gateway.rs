@@ -1898,35 +1898,75 @@ pub(crate) fn secure_eq(left: &str, right: &str) -> bool {
         == 0
 }
 
+fn extract_bearer_tokens_from_file(path: &Path, tokens: &mut Vec<String>) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    extract_bearer_tokens_from_value(&value, tokens);
+}
+
+fn extract_bearer_tokens_from_value(value: &Value, tokens: &mut Vec<String>) {
+    for field in [
+        "access_token",
+        "accessToken",
+        "token",
+        "api_key",
+        "apiKey",
+        "key",
+    ] {
+        if let Some(token) = value.get(field).and_then(Value::as_str) {
+            let token = token.trim();
+            if !token.is_empty() {
+                tokens.push(token.to_string());
+            }
+        }
+    }
+    if let Some(tokens_obj) = value.get("tokens").and_then(Value::as_object) {
+        for field in ["access_token", "accessToken", "token", "id_token"] {
+            if let Some(token) = tokens_obj.get(field).and_then(Value::as_str) {
+                let token = token.trim();
+                if !token.is_empty() {
+                    tokens.push(token.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn collect_authorized_tokens(api_key: &str) -> Vec<String> {
+    let mut valid_tokens = vec![api_key.to_string()];
+    if let Ok(isolated_home) = isolated_codex_home() {
+        extract_bearer_tokens_from_file(&isolated_home.join("auth.json"), &mut valid_tokens);
+    }
+    extract_bearer_tokens_from_file(&crate::codex_cli::real_codex_auth_path(), &mut valid_tokens);
+    if let Ok(auth) = auth_dir() {
+        if let Ok(entries) = fs::read_dir(auth) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    extract_bearer_tokens_from_file(&path, &mut valid_tokens);
+                }
+            }
+        }
+    }
+    valid_tokens
+}
+
 fn request_is_authorized(request: &tiny_http::Request, api_key: &str) -> bool {
-    let anchor_token = anchor_codex_access_token();
+    let valid_tokens = collect_authorized_tokens(api_key);
     request.headers().iter().any(|header| {
         let name = header.field.as_str().as_str();
         let value = header.value.as_str().trim();
-        (name.eq_ignore_ascii_case("x-api-key") && secure_eq(value, api_key))
+        (name.eq_ignore_ascii_case("x-api-key")
+            && valid_tokens.iter().any(|valid| secure_eq(value, valid)))
             || (name.eq_ignore_ascii_case("authorization")
-                && value.strip_prefix("Bearer ").is_some_and(|token| {
-                    secure_eq(token, api_key)
-                        || anchor_token
-                            .as_ref()
-                            .is_some_and(|anchor| secure_eq(token, anchor))
-                }))
+                && value
+                    .strip_prefix("Bearer ")
+                    .is_some_and(|token| valid_tokens.iter().any(|valid| secure_eq(token, valid))))
     })
-}
-
-/// The isolated Codex window authenticates to the relay with its anchored
-/// ChatGPT access token (the bearer the app sends for the built-in openai
-/// provider redirected via `openai_base_url`). Accept it alongside the
-/// Basiliskos key so the app's requests pass the listener gate. Read per check;
-/// the file is local and tiny.
-fn anchor_codex_access_token() -> Option<String> {
-    let auth = auth_dir().ok()?;
-    let raw = fs::read_to_string(auth.join(CODEX_ANCHOR_FILE_NAME)).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    value
-        .get("access_token")
-        .and_then(Value::as_str)
-        .map(str::to_string)
 }
 
 fn request_headers_within_budget(request: &tiny_http::Request) -> bool {
@@ -2531,9 +2571,7 @@ fn handle_front_proxy_request(
     // provider redirected at this relay (`openai_base_url`). Enforce the active
     // Basiliskos route by rewriting the request model to the active route's
     // real upstream id (the renderer allowlist only offers native OpenAI slugs,
-    // which cannot map to upstreams directly), and mark the request so its
-    // bearer is normalized to the Basiliskos key for the backend.
-    let mut codex_dial = false;
+    // which cannot map to upstreams directly).
     if request_path == "/v1/responses" {
         let content_type = request
             .headers()
@@ -2617,7 +2655,6 @@ fn handle_front_proxy_request(
             body.len(),
             body_head
         ));
-        codex_dial = true;
     }
 
     let upstream_url = format!("http://127.0.0.1:{BACKEND_PORT}{request_url}");
@@ -2627,10 +2664,13 @@ fn handle_front_proxy_request(
         if is_hop_by_hop_header(name) {
             continue;
         }
-        if codex_dial && name.eq_ignore_ascii_case("authorization") {
-            // The isolated Codex window authenticates with its anchored ChatGPT
-            // bearer; the backend validates the Basiliskos key. Normalize it.
+        if name.eq_ignore_ascii_case("authorization") {
+            // Forward the normalized Basiliskos key to the backend, which validates Bearer {api_key}.
             upstream_headers.push(("authorization".to_owned(), format!("Bearer {api_key}")));
+            continue;
+        }
+        if name.eq_ignore_ascii_case("x-api-key") {
+            upstream_headers.push(("x-api-key".to_owned(), api_key.to_string()));
             continue;
         }
         upstream_headers.push((name.to_owned(), header.value.as_str().to_owned()));
@@ -5372,6 +5412,60 @@ async fn maintain_saved_oauth_credentials_once() {
             // account's credential. The relay must not auto-refresh it, or the
             // rotation would invalidate the seeded login every maintenance cycle.
             if provider == "codex" && name == CODEX_ANCHOR_FILE_NAME {
+                if let (Ok(isolated_home), Ok(auth_dir)) = (isolated_codex_home(), auth_dir()) {
+                    let isolated_auth = isolated_home.join("auth.json");
+                    let anchor_path = auth_dir.join(CODEX_ANCHOR_FILE_NAME);
+                    if let (Ok(iso_raw), Ok(anc_raw)) = (
+                        fs::read_to_string(&isolated_auth),
+                        fs::read_to_string(&anchor_path),
+                    ) {
+                        if let (Ok(iso_val), Ok(mut anc_val)) = (
+                            serde_json::from_str::<Value>(&iso_raw),
+                            serde_json::from_str::<Value>(&anc_raw),
+                        ) {
+                            let new_token = iso_val
+                                .get("tokens")
+                                .and_then(|t| t.get("access_token"))
+                                .or_else(|| iso_val.get("access_token"))
+                                .and_then(Value::as_str);
+                            if let Some(token) = new_token {
+                                if anc_val.get("access_token").and_then(Value::as_str)
+                                    != Some(token)
+                                {
+                                    if let Some(obj) = anc_val.as_object_mut() {
+                                        obj.insert(
+                                            "access_token".into(),
+                                            Value::String(token.to_string()),
+                                        );
+                                        if let Some(rt) = iso_val
+                                            .get("tokens")
+                                            .and_then(|t| t.get("refresh_token"))
+                                            .and_then(Value::as_str)
+                                        {
+                                            obj.insert(
+                                                "refresh_token".into(),
+                                                Value::String(rt.to_string()),
+                                            );
+                                        }
+                                        if let Some(id) = iso_val
+                                            .get("tokens")
+                                            .and_then(|t| t.get("id_token"))
+                                            .and_then(Value::as_str)
+                                        {
+                                            obj.insert(
+                                                "id_token".into(),
+                                                Value::String(id.to_string()),
+                                            );
+                                        }
+                                        if let Ok(bytes) = serde_json::to_vec_pretty(&anc_val) {
+                                            let _ = durable_write(&anchor_path, &bytes);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             let result = match provider {
@@ -10867,5 +10961,29 @@ openai_base_url = "http://127.0.0.1:8317/v1"
             object.keys().filter(|key| *key == "routeVerified").count(),
             1
         );
+    }
+
+    #[test]
+    fn extract_bearer_tokens_finds_top_level_and_nested_codex_tokens() {
+        let mut tokens = Vec::new();
+        let codex_native = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "token-nested-access",
+                "refresh_token": "token-nested-refresh",
+                "id_token": "token-nested-id"
+            }
+        });
+        extract_bearer_tokens_from_value(&codex_native, &mut tokens);
+        assert!(tokens.contains(&"token-nested-access".to_string()));
+        assert!(tokens.contains(&"token-nested-id".to_string()));
+
+        let mut relay_tokens = Vec::new();
+        let relay_format = serde_json::json!({
+            "access_token": "token-top-access",
+            "type": "codex"
+        });
+        extract_bearer_tokens_from_value(&relay_format, &mut relay_tokens);
+        assert!(relay_tokens.contains(&"token-top-access".to_string()));
     }
 }

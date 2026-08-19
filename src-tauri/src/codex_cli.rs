@@ -47,7 +47,7 @@ fn real_codex_home() -> PathBuf {
         })
 }
 
-fn real_codex_auth_path() -> PathBuf {
+pub(crate) fn real_codex_auth_path() -> PathBuf {
     real_codex_home().join("auth.json")
 }
 
