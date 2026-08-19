@@ -13,7 +13,7 @@ import brandArt from "./assets/basiliskos-mark.png";
 import { contextWindowLabel, messageFrom, statusTone, thinkingLabel } from "./ui";
 import { APP_VERSION } from "./App";
 
-type Provider = "claude" | "codex" | "xai" | "kimi";
+type Provider = "claude" | "codex" | "xai" | "kimi" | "deepseek" | "antigravity";
 
 type Account = {
   fileName: string;

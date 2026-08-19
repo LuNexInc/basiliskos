@@ -35,7 +35,7 @@ import {
 import brandArt from "./assets/basiliskos-mark.png";
 import "./App.css";
 
-type Provider = "claude" | "codex" | "xai" | "kimi" | "deepseek";
+type Provider = "claude" | "codex" | "xai" | "kimi" | "deepseek" | "antigravity";
 
 /**
  * DeepSeek is the one provider with no OAuth/device flow — it is authorized with
@@ -229,7 +229,7 @@ type PreparedBasiliskosUpdate = {
 type AppView = "console" | "changes";
 type ProviderFilter = "all" | Provider;
 
-export const APP_VERSION = "2.5.2";
+export const APP_VERSION = "2.6.0";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },
@@ -237,6 +237,7 @@ const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "xai", label: "Grok", detail: "Grok Build OAuth" },
   { id: "kimi", label: "Kimi", detail: "Kimi Code OAuth" },
   { id: "deepseek", label: "DeepSeek", detail: "DeepSeek API key" },
+  { id: "antigravity", label: "Antigravity", detail: "Google Antigravity OAuth" },
 ];
 
 const PROVIDER_NAMES: Record<Provider, string> = {
@@ -245,6 +246,7 @@ const PROVIDER_NAMES: Record<Provider, string> = {
   xai: "Grok",
   kimi: "Kimi",
   deepseek: "DeepSeek",
+  antigravity: "Antigravity",
 };
 
 const THINKING_LEVELS = ["auto", "none", "low", "medium", "high", "xhigh", "max", "ultra"];
@@ -347,7 +349,7 @@ export function accountNeedsRelogin(
 
 export function usageAccountFiles(accounts: Array<Pick<Account, "fileName" | "provider">>): string[] {
   return accounts
-    .filter((account) => account.provider !== "deepseek")
+    .filter((account) => account.provider !== "deepseek" && account.provider !== "antigravity")
     .map((account) => account.fileName);
 }
 
@@ -604,7 +606,7 @@ export default function App() {
   const totalAccountCount = snapshot?.accounts.length ?? 0;
   const allUsageFiles = usageAccountFiles(snapshot?.accounts ?? []);
   const allUsageKey = snapshot?.accounts
-    .filter((account) => account.provider !== "deepseek")
+    .filter((account) => account.provider !== "deepseek" && account.provider !== "antigravity")
     .map((account) => `${account.fileName}|${account.expiresAtMs ?? ""}|${account.credentialStatus}`)
     .join("\u0000") ?? "";
   const allUsageLoading = allUsageFiles.some((fileName) => usageByAccount[fileName]?.loading === true);
@@ -1688,6 +1690,14 @@ export default function App() {
                               </div>
                             )) : usage?.loading ? (
                               <span className="usage-state"><LoaderCircle className="spin" size={11} /> Checking usage…</span>
+                            ) : account.provider === "antigravity" ? (
+                              <span className="usage-state unrecorded" title="Google Cloud / Gemini quota is managed in the Google Cloud or AI Studio console.">
+                                Managed in Google Cloud
+                              </span>
+                            ) : account.provider === "deepseek" ? (
+                              <span className="usage-state unrecorded" title="DeepSeek bills a prepaid API balance at platform.deepseek.com.">
+                                Prepaid API balance
+                              </span>
                             ) : (
                               <span className="usage-state unavailable" title={usage?.error}>
                                 {usage?.error ?? "Usage unavailable"}

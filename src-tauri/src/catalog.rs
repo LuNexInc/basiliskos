@@ -6,7 +6,8 @@ use crate::gateway::RouteSelection;
 
 // Supported live providers, in UI order. Adding a provider here changes the
 // account tabs, route defaults, and the config generation surface.
-pub(crate) const SUPPORTED_PROVIDERS: [&str; 5] = ["claude", "codex", "xai", "kimi", "deepseek"];
+pub(crate) const SUPPORTED_PROVIDERS: [&str; 6] =
+    ["claude", "codex", "xai", "kimi", "deepseek", "antigravity"];
 
 pub(crate) const GROK_4_5_CONTEXT_WINDOW_TOKENS: u64 = 500_000;
 
@@ -19,19 +20,9 @@ pub(crate) struct ModelSpec {
 
 pub(crate) const CLAUDE_MODELS: &[ModelSpec] = &[
     ModelSpec {
-        id: "claude-sonnet-4-5-20250929",
-        label: "Claude Sonnet 4.5",
-        thinking_levels: &["none", "low", "medium", "high", "xhigh", "max"],
-    },
-    ModelSpec {
         id: "claude-sonnet-4-6",
         label: "Claude Sonnet 4.6",
         thinking_levels: &["none", "low", "medium", "high", "max"],
-    },
-    ModelSpec {
-        id: "claude-opus-4-5-20251101",
-        label: "Claude Opus 4.5",
-        thinking_levels: &["none", "low", "medium", "high", "xhigh", "max"],
     },
     ModelSpec {
         id: "claude-opus-4-6",
@@ -39,13 +30,13 @@ pub(crate) const CLAUDE_MODELS: &[ModelSpec] = &[
         thinking_levels: &["none", "low", "medium", "high", "max"],
     },
     ModelSpec {
-        id: "claude-opus-4-7",
-        label: "Claude Opus 4.7",
+        id: "claude-sonnet-4-5-20250929",
+        label: "Claude Sonnet 4.5",
         thinking_levels: &["none", "low", "medium", "high", "xhigh", "max"],
     },
     ModelSpec {
-        id: "claude-opus-4-8",
-        label: "Claude Opus 4.8",
+        id: "claude-opus-4-5-20251101",
+        label: "Claude Opus 4.5",
         thinking_levels: &["none", "low", "medium", "high", "xhigh", "max"],
     },
     ModelSpec {
@@ -104,31 +95,6 @@ pub(crate) const KIMI_MODELS: &[ModelSpec] = &[
         label: "Kimi K2.7 Code",
         thinking_levels: &["low", "high"],
     },
-    ModelSpec {
-        id: "kimi-k2.7-code-highspeed",
-        label: "Kimi K2.7 Code HighSpeed",
-        thinking_levels: &["low", "high"],
-    },
-    ModelSpec {
-        id: "kimi-k2.6",
-        label: "Kimi K2.6",
-        thinking_levels: &["none", "low", "high"],
-    },
-    ModelSpec {
-        id: "kimi-k2.5",
-        label: "Kimi K2.5",
-        thinking_levels: &["none", "low", "high"],
-    },
-    ModelSpec {
-        id: "kimi-k2-thinking",
-        label: "Kimi K2 Thinking",
-        thinking_levels: &["none", "low", "high"],
-    },
-    ModelSpec {
-        id: "kimi-k2",
-        label: "Kimi K2",
-        thinking_levels: &[],
-    },
 ];
 
 // `deepseek-chat` / `deepseek-reasoner` were fully retired on 2026-07-24 and now
@@ -151,6 +117,24 @@ pub(crate) const DEEPSEEK_MODELS: &[ModelSpec] = &[
     },
 ];
 
+pub(crate) const ANTIGRAVITY_MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        id: "gemini-3.7-flash",
+        label: "Gemini 3.7 Flash",
+        thinking_levels: &["none", "low", "medium", "high", "max"],
+    },
+    ModelSpec {
+        id: "gemini-3.7-pro",
+        label: "Gemini 3.7 Pro",
+        thinking_levels: &["none", "low", "medium", "high", "max"],
+    },
+    ModelSpec {
+        id: "gemini-3.7-flash-lite",
+        label: "Gemini 3.7 Flash Lite",
+        thinking_levels: &["none", "low", "high"],
+    },
+];
+
 pub(crate) fn model_specs(provider: &str) -> &'static [ModelSpec] {
     match provider {
         "claude" => CLAUDE_MODELS,
@@ -158,6 +142,7 @@ pub(crate) fn model_specs(provider: &str) -> &'static [ModelSpec] {
         "xai" => XAI_MODELS,
         "kimi" => KIMI_MODELS,
         "deepseek" => DEEPSEEK_MODELS,
+        "antigravity" => ANTIGRAVITY_MODELS,
         _ => &[],
     }
 }
@@ -169,6 +154,7 @@ pub(crate) fn default_model(provider: &str) -> &'static str {
         "xai" => "grok-4.5",
         "kimi" => "kimi-k3",
         "deepseek" => "deepseek-v4-flash",
+        "antigravity" => "gemini-3.7-flash",
         _ => "",
     }
 }

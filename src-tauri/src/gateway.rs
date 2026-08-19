@@ -691,6 +691,20 @@ fn client_effort_choice(request: &serde_json::Map<String, Value>) -> Option<Stri
 /// Applies the provider-specific model transformation (thinking suffix, Grok
 /// 4.5 desktop-effort remap, DeepSeek plain id) to a base model id. The base is
 /// either the Basiliskos route selection or a client-chosen picker model.
+fn backend_model_identifier<'a>(provider: &str, base_model: &'a str) -> &'a str {
+    if provider == "antigravity" {
+        match base_model {
+            "gemini-3.7-flash" | "gemini-3.6-flash-high" => "gemini-3.6-flash-high",
+            "gemini-3.7-pro" | "gemini-3.1-pro-low" => "gemini-3.1-pro-low",
+            "gemini-3.7-flash-lite" | "gemini-3.1-flash-lite" => "gemini-3.1-flash-lite",
+            "gemini-3-flash" => "gemini-3-flash",
+            other => other,
+        }
+    } else {
+        base_model
+    }
+}
+
 fn apply_route_model(
     base_model: &str,
     thinking_override: Option<&str>,
@@ -706,19 +720,20 @@ fn apply_route_model(
     if provider == "deepseek" {
         return base_model.to_string();
     }
+    let target_model = backend_model_identifier(provider, base_model);
     // A picker variant carries its own validated thinking level; otherwise use
     // the route's thinking (validated against the model actually being routed).
     let route_thinking = normalized_route(state, provider).thinking;
     if let Some(level) = thinking_override {
         if level == "auto" {
-            return base_model.to_string();
+            return target_model.to_string();
         }
         if provider == "xai" && base_model == "grok-4.5" {
             let remapped =
                 grok_4_5_thinking_from_desktop_effort(request).unwrap_or_else(|| level.to_string());
-            return format!("{}({})", base_model, remapped);
+            return format!("{}({})", target_model, remapped);
         }
-        return format!("{}({})", base_model, level);
+        return format!("{}({})", target_model, level);
     }
     let thinking = model_specs(provider)
         .iter()
@@ -737,9 +752,9 @@ fn apply_route_model(
         thinking.to_string()
     };
     if thinking == "auto" {
-        base_model.to_string()
+        target_model.to_string()
     } else {
-        format!("{}({})", base_model, thinking)
+        format!("{}({})", target_model, thinking)
     }
 }
 
@@ -847,6 +862,7 @@ fn provider_label(provider: &str) -> &'static str {
         "xai" => "Grok Build",
         "kimi" => "Kimi Code",
         "deepseek" => "DeepSeek",
+        "antigravity" => "Antigravity",
         _ => "Unknown provider",
     }
 }
@@ -1441,6 +1457,17 @@ disable-claude-cloak-mode: true
 streaming:
   keepalive-seconds: 15
   bootstrap-retries: 0
+oauth-model-alias:
+  antigravity:
+    - name: "gemini-3.6-flash-high"
+      alias: "gemini-3.7-flash"
+      force-mapping: true
+    - name: "gemini-3.1-pro-low"
+      alias: "gemini-3.7-pro"
+      force-mapping: true
+    - name: "gemini-3.1-flash-lite"
+      alias: "gemini-3.7-flash-lite"
+      force-mapping: true
 plugins:
   enabled: true
   dir: "~/.hydra-gateway/gateway/plugins"
@@ -2566,6 +2593,21 @@ fn handle_front_proxy_request(
                 correlation_id,
             );
             return;
+        }
+        if let Ok(mut json_val) = serde_json::from_slice::<Value>(&body) {
+            if let Some(obj) = json_val.as_object_mut() {
+                if let Some(model_val) = obj.get_mut("model") {
+                    if let Some(model_str) = model_val.as_str() {
+                        let mapped = backend_model_identifier("antigravity", model_str);
+                        if mapped != model_str {
+                            *model_val = Value::String(mapped.to_string());
+                            if let Ok(new_body) = serde_json::to_vec(&json_val) {
+                                body = new_body;
+                            }
+                        }
+                    }
+                }
+            }
         }
         append_codex_dial_log(&format!(
             "{} | method={} ctype={} body_len={} body_head={} | OK",
@@ -4619,6 +4661,12 @@ fn load_usage_credential(
                 .into(),
         );
     }
+    if account.provider == "antigravity" {
+        return Err(
+            "Antigravity quota usage is managed in the Google Cloud / Gemini developer console."
+                .into(),
+        );
+    }
     let raw = fs::read_to_string(&path)
         .map_err(|error| format!("Could not read account credentials: {error}"))?;
     let value: Value = serde_json::from_str(&raw)
@@ -6069,7 +6117,7 @@ pub fn set_gateway_route(
 ) -> Result<RouteUpdateResult, String> {
     let _mutation = mutation_lock()?;
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return Err("Provider must be claude, codex, xai, kimi, or deepseek".into());
+        return Err("Provider must be claude, codex, xai, kimi, deepseek, or antigravity".into());
     }
     let Some(spec) = model_specs(&provider).iter().find(|spec| spec.id == model) else {
         return Err(format!("{model} is not an available {provider} model"));
@@ -6149,7 +6197,7 @@ pub fn set_open_claude_on_launch(open: bool) -> Result<GatewaySnapshot, String> 
 pub fn get_model_catalog(provider: String) -> Result<Vec<ModelCatalogEntry>, String> {
     let _mutation = mutation_lock()?;
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return Err("Provider must be claude, codex, xai, kimi, or deepseek".into());
+        return Err("Provider must be claude, codex, xai, kimi, deepseek, or antigravity".into());
     }
     let hidden = load_hidden_models()?;
     let live_catalog = runtime_lock()
@@ -6354,6 +6402,7 @@ fn extract_login_url(provider: &str, line: &str) -> Option<String> {
             candidate.starts_with("https://auth.kimi.com/")
                 || candidate.starts_with("https://www.kimi.com/")
         }
+        "antigravity" => candidate.starts_with("https://accounts.google.com/"),
         _ => false,
     };
     allowed.then(|| candidate.to_string())
@@ -6719,13 +6768,14 @@ fn provider_login_flag(provider: &str) -> Result<&'static str, String> {
         "codex" => Ok("-codex-login"),
         "xai" => Ok("-xai-login"),
         "kimi" => Ok("-kimi-login"),
+        "antigravity" => Ok("-antigravity-login"),
         // DeepSeek has no OAuth/device flow — it is added with an API key via
         // `add_deepseek_account`, so routing it here would be a bug, not a
         // user error.
         "deepseek" => {
             Err("DeepSeek accounts are added with an API key, not a browser login.".into())
         }
-        _ => Err("Provider must be claude, codex, xai, or kimi".into()),
+        _ => Err("Provider must be claude, codex, xai, kimi, or antigravity".into()),
     }
 }
 
@@ -7272,13 +7322,25 @@ fn enabled_providers(auth: &Path) -> std::collections::HashSet<String> {
     providers
 }
 
-fn codex_catalog_models(enabled: &std::collections::HashSet<String>) -> Vec<Value> {
+fn codex_catalog_models(
+    enabled: &std::collections::HashSet<String>,
+    active_provider: Option<&str>,
+) -> Vec<Value> {
     let base_instructions = include_str!("../assets/codex-system-prompt.md");
-    let mut models = Vec::new();
-    for provider in SUPPORTED_PROVIDERS {
-        if !enabled.contains(provider) {
-            continue;
+    let mut providers: Vec<&str> = Vec::new();
+    if let Some(active) = active_provider {
+        if enabled.contains(active) && SUPPORTED_PROVIDERS.contains(&active) {
+            providers.push(active);
         }
+    }
+    for provider in SUPPORTED_PROVIDERS {
+        if enabled.contains(provider) && !providers.contains(&provider) {
+            providers.push(provider);
+        }
+    }
+
+    let mut models = Vec::new();
+    for provider in providers {
         for spec in model_specs(provider) {
             let context_window = context_window_for_route(provider, spec.id).unwrap_or(200_000);
             let reasoning_levels = spec
@@ -7291,6 +7353,8 @@ fn codex_catalog_models(enabled: &std::collections::HashSet<String>) -> Vec<Valu
                     })
                 })
                 .collect::<Vec<_>>();
+            let is_primary =
+                spec.id == default_model(provider) || Some(provider) == active_provider;
             models.push(serde_json::json!({
                 "slug": spec.id,
                 "display_name": spec.label,
@@ -7299,7 +7363,7 @@ fn codex_catalog_models(enabled: &std::collections::HashSet<String>) -> Vec<Valu
                 "shell_type": "default",
                 "visibility": "list",
                 "supported_in_api": true,
-                "priority": 0,
+                "priority": if is_primary { 1 } else { 0 },
                 "default_reasoning_summary": "auto",
                 "support_verbosity": false,
                 "web_search_tool_type": "text",
@@ -7336,8 +7400,9 @@ fn write_isolated_codex_config(home: &Path, state: &ControllerState) -> Result<(
         });
     // Picker catalog: only models whose provider is currently authenticated,
     // so an un-authed provider (Claude with no credential) is never offered.
-    let catalog =
-        serde_json::json!({ "models": codex_catalog_models(&enabled_providers(&auth_dir()?)) });
+    let catalog = serde_json::json!({
+        "models": codex_catalog_models(&enabled_providers(&auth_dir()?), Some(&provider))
+    });
     durable_write(
         &home.join("model-catalog.json"),
         serde_json::to_vec_pretty(&catalog)
@@ -8233,12 +8298,13 @@ mod tests {
             .iter()
             .map(|provider| provider.to_string())
             .collect();
-        let models = codex_catalog_models(&all);
+        let models = codex_catalog_models(&all, None);
         let ids = models
             .iter()
             .filter_map(|model| model.get("slug").and_then(Value::as_str))
             .collect::<Vec<_>>();
         // Every advertised model id is a real upstream id the relay routes by.
+        assert!(ids.contains(&"gemini-3.7-flash"));
         assert!(ids.contains(&"grok-4.5"));
         assert!(ids.contains(&"kimi-k3"));
         assert!(ids.contains(&"deepseek-v4-flash"));
@@ -8275,8 +8341,9 @@ mod tests {
         assert!(!enabled.contains("claude"));
         assert!(!enabled.contains("codex"));
         assert!(!enabled.contains("kimi"));
+        assert!(!enabled.contains("antigravity"));
 
-        let models = codex_catalog_models(&enabled);
+        let models = codex_catalog_models(&enabled, None);
         let ids = models
             .iter()
             .filter_map(|model| model.get("slug").and_then(Value::as_str))
@@ -8289,6 +8356,7 @@ mod tests {
         assert!(!ids.contains(&"gpt-5.6-terra"));
         assert!(!ids.contains(&"kimi-k3"));
         assert!(!ids.contains(&"claude-sonnet-4-5-20250929"));
+        assert!(!ids.contains(&"gemini-3.7-flash"));
 
         let _ = fs::remove_dir_all(auth);
     }
@@ -8682,7 +8750,7 @@ mod tests {
     #[test]
     fn provider_is_text_only_marks_deepseek_only() {
         assert!(provider_is_text_only(Some("deepseek")));
-        for provider in ["codex", "claude", "xai", "kimi"] {
+        for provider in ["codex", "claude", "xai", "kimi", "antigravity"] {
             assert!(!provider_is_text_only(Some(provider)));
         }
         assert!(!provider_is_text_only(None));
@@ -8782,6 +8850,8 @@ mod tests {
         assert!(config.contains("max-retry-credentials: 1"));
         assert!(config.contains("bootstrap-retries: 0"));
         assert!(config.contains("disable-claude-cloak-mode: true"));
+        assert!(config.contains("oauth-model-alias:"));
+        assert!(config.contains("gemini-3.7-flash"));
         let _ = fs::remove_dir_all(auth);
     }
 
@@ -9600,6 +9670,14 @@ mod tests {
             .as_deref(),
             Some("https://www.kimi.com/code/device?user_code=KIMI-1234")
         );
+        assert_eq!(
+            extract_login_url(
+                "antigravity",
+                "Visit the following URL to continue authentication:\nhttps://accounts.google.com/o/oauth2/v2/auth?client_id=test"
+            )
+            .as_deref(),
+            Some("https://accounts.google.com/o/oauth2/v2/auth?client_id=test")
+        );
         assert!(extract_login_url("codex", "about:blank").is_none());
         assert!(extract_login_url(
             "codex",
@@ -9609,6 +9687,7 @@ mod tests {
         assert!(extract_login_url("codex", "http://auth.openai.com/oauth/authorize").is_none());
         assert!(extract_login_url("kimi", "https://auth.kimi.com.evil.example/oauth").is_none());
         assert!(extract_login_url("kimi", "https://www.kimi.com.evil.example/oauth").is_none());
+        assert!(extract_login_url("antigravity", "https://accounts.google.com.evil.example/auth").is_none());
     }
 
     #[test]

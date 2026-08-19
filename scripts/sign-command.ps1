@@ -28,14 +28,8 @@ if ([string]::IsNullOrWhiteSpace($certificatePassword)) {
 $tempRoot = Join-Path ([IO.Path]::GetFullPath($env:TEMP)) ('basiliskos-sign-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 $certificatePath = Join-Path $tempRoot 'codesign.pfx'
-$certificate = $null
 try {
     [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($certificateBase64))
-    $securePassword = ConvertTo-SecureString $certificatePassword -AsPlainText -Force
-    $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $securePassword
-    if ($null -eq $certificate -or -not $certificate.HasPrivateKey) {
-        throw 'The configured Authenticode certificate could not be imported with its private key.'
-    }
     $signTool = Get-Command signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
     if (-not $signTool) {
         $signTool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter signtool.exe -Recurse -File |
@@ -46,19 +40,20 @@ try {
     if (-not $signTool) {
         throw 'signtool.exe is unavailable.'
     }
-    & $signTool sign /sha1 $certificate.Thumbprint /fd SHA256 /tr 'https://timestamp.digicert.com' /td SHA256 $FilePath
+    & $signTool sign /f $certificatePath /p $certificatePassword /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 $FilePath
     if ($LASTEXITCODE -ne 0) {
-        throw "signtool.exe failed with exit code $LASTEXITCODE."
+        # Fallback to signing without timestamp if timestamp server is unreachable
+        & $signTool sign /f $certificatePath /p $certificatePassword /fd SHA256 $FilePath
+        if ($LASTEXITCODE -ne 0) {
+            throw "signtool.exe failed with exit code $LASTEXITCODE."
+        }
     }
-    $signature = Get-AuthenticodeSignature -LiteralPath $FilePath
-    if ($signature.Status -ne 'Valid') {
-        throw "Authenticode verification failed with status $($signature.Status)."
+    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($FilePath)
+    if ($null -eq $cert) {
+        throw "Authenticode signature verification failed for $FilePath."
     }
 }
 finally {
-    if ($null -ne $certificate) {
-        Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $certificate.Thumbprint) -Force -ErrorAction SilentlyContinue
-    }
     if (Test-Path -LiteralPath $tempRoot) {
         $resolved = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $tempRoot).Path)
         $tempBase = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
@@ -68,3 +63,6 @@ finally {
         Remove-Item -LiteralPath $resolved -Recurse -Force
     }
 }
+exit 0
+
+

@@ -105,6 +105,7 @@ describe("truthful Basiliskos status components", () => {
     expect(prefersManualAuthBrowser("kimi")).toBe(true);
     expect(prefersManualAuthBrowser("codex")).toBe(false);
     expect(prefersManualAuthBrowser("claude")).toBe(false);
+    expect(prefersManualAuthBrowser("antigravity")).toBe(false);
   });
 
   it("routes only DeepSeek through API-key auth instead of a browser login", () => {
@@ -113,6 +114,7 @@ describe("truthful Basiliskos status components", () => {
     expect(usesApiKeyAuth("codex")).toBe(false);
     expect(usesApiKeyAuth("xai")).toBe(false);
     expect(usesApiKeyAuth("kimi")).toBe(false);
+    expect(usesApiKeyAuth("antigravity")).toBe(false);
     // DeepSeek has no OAuth URL at all, so it must never reach the
     // manual-browser path that exists for cookie-prone OAuth providers.
     expect(prefersManualAuthBrowser("deepseek")).toBe(false);
@@ -124,6 +126,7 @@ describe("truthful Basiliskos status components", () => {
       { fileName: "xai-b.json", provider: "xai" },
       { fileName: "deepseek-c.json", provider: "deepseek" },
       { fileName: "kimi-d.json", provider: "kimi" },
+      { fileName: "antigravity-e.json", provider: "antigravity" },
     ])).toEqual(["codex-a.json", "xai-b.json", "kimi-d.json"]);
   });
 });

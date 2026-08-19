@@ -2,7 +2,7 @@
 
 > Navigation index: where things live / what to open first. NOT behavior docs (that's AGENTS.md).
 > Size cap ~45 lines. Update in the same commit that moves/renames a module.
-> Last verified: 2026-08-14
+> Last verified: 2026-08-16
 
 ## Open first
 - `AGENTS.md` — Basiliskos contract + the **canonical-vs-publish-repo** rules. Read before ANY work here.
@@ -18,7 +18,7 @@
 - `catalog.rs` — pinned model catalogs (ModelSpec + per-provider lists), `SUPPORTED_PROVIDERS`, route defaults, Grok 4.5 context budget.
 - `usage.rs` — provider quota-window parsing (Claude/Codex/xAI/Kimi) + `GatewayUsageWindow`/`GatewayAccountUsage` types.
 - `vision.rs` — DeepSeek vision lane: sidecar spawn/lifecycle, tool-compatibility fixups, bounded 2-slot gate.
-- `claude_window.rs` — Win32 isolated-Claude window icon/title management.
+- `claude_window.rs`, `codex_window.rs` — Win32 window icon, title, and close-watcher management.
 - `codex_cli.rs`, `grok_cli.rs` — provider CLI integration · `codex_switcher_import.rs` — import accounts from the codex switcher.
 - `persistence.rs` — local state/credential store · `diagnostics.rs` — diagnostics · `test_support.rs` — test helpers.
 - `lib.rs` / `main.rs` — Tauri app entry + command registration.
