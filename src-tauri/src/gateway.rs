@@ -9687,7 +9687,11 @@ mod tests {
         assert!(extract_login_url("codex", "http://auth.openai.com/oauth/authorize").is_none());
         assert!(extract_login_url("kimi", "https://auth.kimi.com.evil.example/oauth").is_none());
         assert!(extract_login_url("kimi", "https://www.kimi.com.evil.example/oauth").is_none());
-        assert!(extract_login_url("antigravity", "https://accounts.google.com.evil.example/auth").is_none());
+        assert!(extract_login_url(
+            "antigravity",
+            "https://accounts.google.com.evil.example/auth"
+        )
+        .is_none());
     }
 
     #[test]
