@@ -141,11 +141,16 @@ pub(crate) fn request_vision_description(
         .ok_or_else(|| "The vision provider returned no text description.".into())
 }
 
-pub(crate) fn replace_images_with_description(object: &mut Value, description: &str) {
-    fn replace_in(blocks: &mut [Value], description: &str) {
+pub(crate) fn replace_images_with_descriptions(object: &mut Value, descriptions: &[String]) {
+    fn replace_in(blocks: &mut [Value], descriptions: &[String], index: &mut usize) {
         for block in blocks.iter_mut() {
             match block.get("type").and_then(Value::as_str) {
                 Some("image") => {
+                    let description = descriptions
+                        .get(*index)
+                        .map(String::as_str)
+                        .unwrap_or("[older image omitted: maximum 8 images are described]");
+                    *index += 1;
                     *block = serde_json::json!({
                         "type": "text",
                         "text": format!("Image details:\n{description}"),
@@ -153,20 +158,106 @@ pub(crate) fn replace_images_with_description(object: &mut Value, description: &
                 }
                 Some("tool_result") => {
                     if let Some(nested) = block.get_mut("content").and_then(Value::as_array_mut) {
-                        replace_in(nested, description);
+                        replace_in(nested, descriptions, index);
                     }
                 }
                 _ => {}
             }
         }
     }
+    let mut index = 0;
     if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
             if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
-                replace_in(content, description);
+                replace_in(content, descriptions, &mut index);
             }
         }
     }
+}
+
+fn image_blocks_from_request(request: &Value) -> Vec<Value> {
+    fn collect(blocks: &[Value], output: &mut Vec<Value>) {
+        for block in blocks.iter().rev() {
+            match block.get("type").and_then(Value::as_str) {
+                Some("image") => output.push(block.clone()),
+                Some("tool_result") => {
+                    if let Some(nested) = block.get("content").and_then(Value::as_array) {
+                        collect(nested, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut images = Vec::new();
+    if let Some(messages) = request.get("messages").and_then(Value::as_array) {
+        for message in messages.iter().rev() {
+            if let Some(content) = message.get("content").and_then(Value::as_array) {
+                collect(content, &mut images);
+            }
+        }
+    }
+    images.truncate(MAX_VISION_IMAGES);
+    images
+}
+
+pub(crate) fn resolve_deepseek_vision_per_image(
+    async_runtime: &tokio::runtime::Handle,
+    client: &reqwest::Client,
+    accounts: &[GatewayAccount],
+    request: &Value,
+    correlation_id: &str,
+) -> Result<Vec<String>, String> {
+    let images = image_blocks_from_request(request);
+    if images.is_empty() {
+        return Err("The request contains no supported image blocks.".into());
+    }
+    let plan = crate::gateway::deepseek_vision_plan(accounts);
+    let mut attempted = 0;
+    for candidate in plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.credential_available)
+    {
+        attempted += 1;
+        let mut descriptions = Vec::with_capacity(images.len());
+        let mut failed = None;
+        for image in &images {
+            let sidecar_request = serde_json::json!({
+                "messages": [{"role": "user", "content": [image.clone()]}]
+            });
+            match request_vision_description(
+                async_runtime,
+                client,
+                candidate,
+                &sidecar_request,
+                correlation_id,
+            ) {
+                Ok(description) => descriptions.push(description),
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failed {
+            diagnostics::record(
+                ErrorCode::VisionUnavailable,
+                "warning",
+                &format!("Vision candidate {} failed: {error}", candidate.provider),
+                Some(correlation_id),
+                None,
+                Some(&candidate.provider),
+            );
+        } else {
+            return Ok(descriptions);
+        }
+    }
+    Err(if attempted == 0 {
+        "No eligible OAuth vision credential is available.".into()
+    } else {
+        "Every configured OAuth vision provider failed.".into()
+    })
 }
 
 pub(crate) fn append_vision_presentation_guidance(object: &mut Value) -> Result<(), String> {
@@ -462,26 +553,28 @@ pub(crate) fn flatten_kimi_tool_reference_blocks(object: &mut serde_json::Map<St
 pub(crate) fn strip_xai_incompatible_native_web_search(
     object: &mut serde_json::Map<String, Value>,
 ) {
-    let (removed_native_web_search, no_tools_remain) = {
+    let mut normalized_native_web_search = false;
+    {
         let Some(Value::Array(tools)) = object.get_mut("tools") else {
             return;
         };
-        let original_len = tools.len();
-        tools.retain(|tool| {
+        for tool in tools.iter_mut() {
             let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or_default();
-            tool_type != "web_search" && !tool_type.starts_with("web_search_")
-        });
-        (tools.len() != original_len, tools.is_empty())
-    };
-    if !removed_native_web_search {
+            if tool_type == "web_search" || tool_type.starts_with("web_search_") {
+                *tool = serde_json::json!({"type": "x_search", "name": "x_search"});
+                normalized_native_web_search = true;
+            }
+        }
+    }
+    if !normalized_native_web_search {
         return;
     }
 
-    if no_tools_remain {
-        object.remove("tools");
-    }
     if xai_tool_choice_targets_native_web_search(object.get("tool_choice")) {
-        object.remove("tool_choice");
+        object.insert(
+            "tool_choice".into(),
+            serde_json::json!({"type": "tool", "name": "x_search"}),
+        );
     }
 }
 

@@ -53,6 +53,7 @@ type Account = {
   label: string;
   disabled: boolean;
   active: boolean;
+  activeForCodex: boolean;
   cooldownUntilMs?: number;
   expiresAtMs?: number;
   credentialStatus: "active" | "renewal_due" | "relogin_required" | "expired" | "unknown";
@@ -87,6 +88,8 @@ type Snapshot = {
   accounts: Account[];
   activeAccount?: string;
   routes: ProviderRoute[];
+  activeCodexAccount?: string;
+  codexRoutes: ProviderRoute[];
   autoFailover?: { fromLabel: string; toLabel: string; atMs: number };
   controller: ComponentStatus;
   relay: ComponentStatus;
@@ -229,7 +232,7 @@ type PreparedBasiliskosUpdate = {
 type AppView = "console" | "changes";
 type ProviderFilter = "all" | Provider;
 
-export const APP_VERSION = "2.6.0";
+export const APP_VERSION = "2.6.1";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth" },
@@ -415,6 +418,7 @@ export default function App() {
   // DeepSeek API-key entry. Held only until the key is handed to the backend.
   const [apiKeyPrompt, setApiKeyPrompt] = useState(false);
   const [apiKeyDraft, setApiKeyDraft] = useState("");
+  const [apiKeyReplacementFile, setApiKeyReplacementFile] = useState<string | null>(null);
   const [accountSwitchConfirm, setAccountSwitchConfirm] = useState<{
     open: boolean;
     account: Account | null;
@@ -579,6 +583,7 @@ export default function App() {
           // First account on this machine: make it active and open the window.
           const selected = await invoke<AccountSelectionResult>("select_gateway_account", {
             fileName: login.resultFileName,
+            client: "claude",
           });
           const next = selected.claudeRunning
             ? selected
@@ -612,12 +617,14 @@ export default function App() {
   const allUsageLoading = allUsageFiles.some((fileName) => usageByAccount[fileName]?.loading === true);
   const active = snapshot?.accounts.find((account) => account.active);
   const activeRoute = snapshot?.routes.find((route) => route.provider === active?.provider);
+  const activeCodex = snapshot?.accounts.find((account) => account.activeForCodex);
+  const codexActiveRoute = snapshot?.codexRoutes.find((route) => route.provider === activeCodex?.provider);
   const selectedModel = activeRoute?.modelOptions.find(
     (model) => model.id === activeRoute.selectedModel,
   );
   const loginWaiting = snapshot?.login?.state === "waiting";
-  const codexCliAccount = snapshot?.accounts.find((account) => !!account.email && account.email === activeIdentities?.codexCliEmail);
-  const grokCliAccount = snapshot?.accounts.find((account) => !!account.email && account.email === activeIdentities?.grokCliEmail);
+  const codexCliAccount = snapshot?.accounts.find((account) => account.provider === "codex" && !!account.email && account.email === activeIdentities?.codexCliEmail);
+  const grokCliAccount = snapshot?.accounts.find((account) => account.provider === "xai" && !!account.email && account.email === activeIdentities?.grokCliEmail);
   const providerCounts = PROVIDERS.map((item) => ({
     ...item,
     count: snapshot?.accounts.filter((account) => account.provider === item.id).length ?? 0,
@@ -696,6 +703,7 @@ export default function App() {
     try {
       const result = await invoke<AccountSelectionResult>("select_gateway_account", {
         fileName: account.fileName,
+        client: "claude",
       });
       let next: Snapshot = result;
       if (wasRunning) {
@@ -726,6 +734,7 @@ export default function App() {
     try {
       const result = await invoke<AccountSelectionResult>("select_gateway_account", {
         fileName: account.fileName,
+        client: "codex",
       });
       let next: Snapshot = result;
       if (wasRunning) {
@@ -809,6 +818,7 @@ export default function App() {
         provider: active.provider,
         model,
         thinking,
+        client: "claude",
       });
       setSnapshot(next);
       const route = next.routes.find((item) => item.provider === active.provider);
@@ -819,6 +829,27 @@ export default function App() {
               : "Basiliskos route updated")
           : "Route saved, but the backend was unreachable so it could not be verified. It will be checked on the next request.",
       );
+      setIsError(false);
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function updateCodexRoute(model: string, thinking: string) {
+    if (!activeCodex) return;
+    setBusy("codex-route");
+    try {
+      const next = await invoke<RouteUpdateResult>("set_gateway_route", {
+        provider: activeCodex.provider,
+        model,
+        thinking,
+        client: "codex",
+      });
+      setSnapshot(next);
+      setMessage("ChatGPT route saved. Restart the isolated ChatGPT window to apply it.");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -1033,6 +1064,7 @@ export default function App() {
     // API-key providers have no browser login to launch — collect the key first.
     if (usesApiKeyAuth(provider)) {
       setApiKeyDraft("");
+      setApiKeyReplacementFile(null);
       setApiKeyPrompt(true);
       setMessage("Paste a DeepSeek API key from platform.deepseek.com to authorize it.");
       setIsError(false);
@@ -1063,10 +1095,14 @@ export default function App() {
     try {
       // The backend verifies the key against DeepSeek before saving it, so a
       // bad key fails here rather than during a later relay request.
-      const added = await invoke<DeepseekAccountAdded>("add_deepseek_account", { apiKey: key });
+      const added = await invoke<DeepseekAccountAdded>("add_deepseek_account", {
+        apiKey: key,
+        replaceFileName: apiKeyReplacementFile,
+      });
       setSnapshot(added);
       setApiKeyPrompt(false);
       setApiKeyDraft("");
+      setApiKeyReplacementFile(null);
       setIsError(false);
       // A newly added account is stored disabled, so adding alone never
       // changes what Claude is talking to. Only the first account on this
@@ -1091,6 +1127,7 @@ export default function App() {
   function cancelApiKeyPrompt() {
     setApiKeyPrompt(false);
     setApiKeyDraft("");
+    setApiKeyReplacementFile(null);
   }
 
   async function relogin(account: Account) {
@@ -1099,6 +1136,7 @@ export default function App() {
     if (usesApiKeyAuth(account.provider)) {
       setProvider(account.provider);
       setApiKeyDraft("");
+      setApiKeyReplacementFile(account.fileName);
       setApiKeyPrompt(true);
       setMessage(`Paste a new DeepSeek API key to replace the one on "${account.label}".`);
       setIsError(false);
@@ -1391,15 +1429,15 @@ export default function App() {
                 </span>
               </div>
               <div className="target-card-body">
-                <h3 title={active ? active.label : "No account"}>
-                  {active ? active.label : "No account"}
+                <h3 title={activeCodex ? activeCodex.label : "No account"}>
+                  {activeCodex ? activeCodex.label : "No account"}
                 </h3>
                 <p>
                   {snapshot?.codexRunning
-                    ? `Active on ${active ? active.label : "account"} · Effort ${(activeRoute?.thinking ?? "auto") === "auto" ? "High" : activeRoute?.thinking}`
+                    ? `Active on ${activeCodex ? activeCodex.label : "account"} · Effort ${(codexActiveRoute?.thinking ?? "auto") === "auto" ? "Auto" : codexActiveRoute?.thinking}`
                     : "Isolated ChatGPT window"}
                 </p>
-                <HeroFuel percent={codexUsagePercent} />
+                <HeroFuel percent={getPrimaryUsagePercent(activeCodex?.fileName)} />
               </div>
               <div className="target-card-actions">
                 {snapshot?.codexRunning ? (
@@ -1410,7 +1448,7 @@ export default function App() {
                   <button
                     className="target-btn open"
                     onClick={() => void openBasiliskosCodex()}
-                    disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}
+                    disabled={busy !== null || !snapshot?.activeCodexAccount || snapshot?.backend.state !== "healthy"}
                   >
                     <AppWindow size={13} /> Launch window
                   </button>
@@ -1636,7 +1674,7 @@ export default function App() {
                     const cooling = cooldownRemaining(account.cooldownUntilMs, now);
                     const credentialWarning = credentialAlert(account, now);
                     return (
-                      <article className={`account-row ${account.active ? "active" : ""}`} key={account.fileName}>
+                          <article className={`account-row ${account.active || account.activeForCodex ? "active" : ""}`} key={account.fileName}>
                         <div className="account-avatar-wrapper">
                           <div className="account-avatar">{account.label.slice(0, 1).toUpperCase()}</div>
                           <span className={`provider-mini-badge ${account.provider}`}>
@@ -1733,17 +1771,17 @@ export default function App() {
                             </span>
                           </button>
                           <button
-                            className={`icon-button serve-toggle codex ${account.active ? "active" : ""}`}
-                            aria-label={account.active ? `${account.label} is serving Basiliskos Codex` : `Serve Basiliskos Codex with ${account.label}`}
+                            className={`icon-button serve-toggle codex ${account.activeForCodex ? "active" : ""}`}
+                            aria-label={account.activeForCodex ? `${account.label} is serving Basiliskos Codex` : `Serve Basiliskos Codex with ${account.label}`}
                             onClick={() => requestCodexAccountSelection(account)}
-                            disabled={busy !== null || cooling > 0 || account.active}
+                            disabled={busy !== null || cooling > 0 || account.activeForCodex}
                           >
                             <span className="serve-toggle-fill">
                               <span className="serve-toggle-icon">
                                 {busy === `codex-${account.fileName}` ? <LoaderCircle className="spin" size={15} /> : <CodexMark className="codex-mark-icon" />}
                               </span>
                               <span className="serve-toggle-label">
-                                {account.active ? "Serving Basiliskos Codex" : cooling > 0 ? `Cooling down ${cooldownLabel(cooling)}` : "Use for Basiliskos Codex"}
+                                {account.activeForCodex ? "Serving Basiliskos Codex" : cooling > 0 ? `Cooling down ${cooldownLabel(cooling)}` : "Use for Basiliskos Codex"}
                               </span>
                             </span>
                           </button>
@@ -1862,6 +1900,47 @@ export default function App() {
                       })}
                     </div>
                   </div>
+                  <div className="chip-field codex-route-field">
+                    <div className="chip-field-head"><span>ChatGPT route</span><small>{activeCodex ? activeCodex.label : "Choose a Codex account"}</small></div>
+                    {codexActiveRoute ? (
+                      <>
+                        <div className="chip-row" role="radiogroup" aria-label="ChatGPT model">
+                          {codexActiveRoute.modelOptions.map((model) => (
+                            <button
+                              type="button"
+                              key={model.id}
+                              role="radio"
+                              aria-checked={codexActiveRoute.selectedModel === model.id}
+                              className={`chip ${codexActiveRoute.selectedModel === model.id ? "selected" : ""}`}
+                              onClick={() => void updateCodexRoute(model.id, codexActiveRoute.thinking)}
+                              disabled={busy !== null}
+                            >
+                              {model.label}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="chip-row" role="radiogroup" aria-label="ChatGPT reasoning">
+                          {THINKING_LEVELS.map((level) => {
+                            const supported = level === "auto" || codexActiveRoute.modelOptions.find((item) => item.id === codexActiveRoute.selectedModel)?.thinkingLevels.includes(level);
+                            const checked = codexActiveRoute.thinking === level;
+                            return (
+                              <button
+                                type="button"
+                                key={level}
+                                role="radio"
+                                aria-checked={checked}
+                                className={`chip ${checked ? "selected" : ""}`}
+                                onClick={() => void updateCodexRoute(codexActiveRoute.selectedModel, level)}
+                                disabled={busy !== null || !supported}
+                              >
+                                {thinkingLabel(level)}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </>
+                    ) : <p className="chip-empty">Choose a Codex account first</p>}
+                  </div>
                 </div>
                 <div className="window-strip" aria-label="Isolated windows">
                   <div className="window-strip-row">
@@ -1886,16 +1965,16 @@ export default function App() {
                     </span>
                     <span
                       className="window-strip-meta"
-                      title={active
-                        ? `${active.label} · ${activeRoute?.selectedModelLabel ?? "—"} · restart ChatGPT after a route change`
+                      title={activeCodex
+                        ? `${activeCodex.label} · ${codexActiveRoute?.selectedModelLabel ?? "—"} · restart ChatGPT after a route change`
                         : "Choose an account first"}
                     >
-                      {active ? (activeRoute?.selectedModelLabel ?? active.label) : "No account"}
+                      {activeCodex ? (codexActiveRoute?.selectedModelLabel ?? activeCodex.label) : "No account"}
                     </span>
                     {snapshot?.codexRunning ? (
                       <button type="button" onClick={() => void closeBasiliskosCodex()} disabled={busy !== null}>Close</button>
                     ) : (
-                      <button type="button" onClick={() => void openBasiliskosCodex()} disabled={busy !== null || !snapshot?.activeAccount || snapshot?.backend.state !== "healthy"}>
+                      <button type="button" onClick={() => void openBasiliskosCodex()} disabled={busy !== null || !snapshot?.activeCodexAccount || snapshot?.backend.state !== "healthy"}>
                         <AppWindow size={13} /> Open
                       </button>
                     )}
@@ -1947,7 +2026,7 @@ export default function App() {
               <article className={`release-entry ${release === availableUpdate ? "available" : ""}`} key={release.tagName}>
                 <div className="release-heading"><div><h3>{release.name}</h3><p>{release.tagName} · {release.publishedAt ? new Date(release.publishedAt).toLocaleDateString() : "Published release"}</p></div>{release === availableUpdate && <span>New</span>}</div>
                 <p className="release-notes">{release.body}</p>
-                {release === availableUpdate && <button className="download-inline" onClick={() => void downloadUpdate(release)} disabled={busy !== null}><Download size={14} /> Install ${release.tagName}</button>}
+                {release === availableUpdate && <button className="download-inline" onClick={() => void downloadUpdate(release)} disabled={busy !== null}><Download size={14} /> Install {release.tagName}</button>}
               </article>
             ))}
           </div>

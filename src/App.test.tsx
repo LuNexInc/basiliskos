@@ -68,6 +68,7 @@ describe("truthful Basiliskos status components", () => {
       label: "Kimi account",
       disabled: false,
       active: false,
+      activeForCodex: false,
       credentialStatus: "relogin_required" as const,
     };
     expect(credentialAlert(base, Date.now())).toEqual({ label: "Sign in again", tone: "relogin" });

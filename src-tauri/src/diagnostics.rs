@@ -21,6 +21,7 @@ pub enum ErrorCode {
     BackendRestartFailed,
     ProviderAuthFailed,
     ProviderRateLimited,
+    ProviderQuotaExhausted,
     UpstreamServerError,
     FirstByteTimeout,
     MidstreamIdleTimeout,
@@ -50,6 +51,7 @@ impl ErrorCode {
             Self::BackendRestartFailed => "BAS-BACKEND-003",
             Self::ProviderAuthFailed => "BAS-UPSTREAM-001",
             Self::ProviderRateLimited => "BAS-UPSTREAM-002",
+            Self::ProviderQuotaExhausted => "BAS-UPSTREAM-006",
             Self::UpstreamServerError => "BAS-UPSTREAM-003",
             Self::FirstByteTimeout => "BAS-UPSTREAM-004",
             Self::MidstreamIdleTimeout => "BAS-UPSTREAM-005",
@@ -127,6 +129,10 @@ mod tests {
         assert_eq!(ErrorCode::RelayBusy.as_str(), "BAS-RELAY-005");
         assert_eq!(ErrorCode::BackendExited.as_str(), "BAS-BACKEND-002");
         assert_eq!(ErrorCode::ProviderRateLimited.as_str(), "BAS-UPSTREAM-002");
+        assert_eq!(
+            ErrorCode::ProviderQuotaExhausted.as_str(),
+            "BAS-UPSTREAM-006"
+        );
         assert_eq!(ErrorCode::ClientCancelled.as_str(), "BAS-CLIENT-001");
         assert_eq!(ErrorCode::ContextWindowExceeded.as_str(), "BAS-ROUTE-002");
     }

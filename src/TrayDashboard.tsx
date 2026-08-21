@@ -21,6 +21,7 @@ type Account = {
   email?: string;
   label: string;
   active: boolean;
+  activeForCodex: boolean;
 };
 
 type UsageWindow = {
@@ -55,7 +56,10 @@ type Snapshot = {
   claudeRunning: boolean;
   codexRunning?: boolean;
   accounts: Account[];
+  activeAccount?: string;
   routes: ProviderRoute[];
+  activeCodexAccount?: string;
+  codexRoutes: ProviderRoute[];
   autoFailover?: { fromLabel: string; toLabel: string; atMs: number };
   relay: ComponentStatus;
   backend: ComponentStatus;
@@ -88,6 +92,7 @@ const PREVIEW_SNAPSHOT: Snapshot = {
       email: "charles@preview.local",
       label: "Claude primary",
       active: true,
+      activeForCodex: false,
     },
     {
       fileName: "codex-preview.json",
@@ -95,6 +100,7 @@ const PREVIEW_SNAPSHOT: Snapshot = {
       email: "codex@preview.local",
       label: "Codex worker",
       active: false,
+      activeForCodex: true,
     },
     {
       fileName: "grok-preview.json",
@@ -102,6 +108,7 @@ const PREVIEW_SNAPSHOT: Snapshot = {
       email: "grok@preview.local",
       label: "Grok worker",
       active: false,
+      activeForCodex: false,
     },
   ],
   routes: [
@@ -111,6 +118,17 @@ const PREVIEW_SNAPSHOT: Snapshot = {
       selectedModelLabel: "Claude Fable 5",
       thinking: "high",
       contextWindow: 200000,
+    },
+  ],
+  activeAccount: "claude-preview.json",
+  activeCodexAccount: "codex-preview.json",
+  codexRoutes: [
+    {
+      provider: "codex",
+      selectedModel: "gpt-5.4",
+      selectedModelLabel: "GPT-5.4",
+      thinking: "high",
+      contextWindow: 128000,
     },
   ],
   relay: { state: "healthy", detail: "Preview relay" },
@@ -279,10 +297,10 @@ export default function TrayDashboard() {
   useEffect(() => {
     if (!snapshot) return;
     const codex = snapshot.accounts.find(
-      (account) => !!account.email && account.email === activeIdentities?.codexCliEmail,
+      (account) => account.provider === "codex" && !!account.email && account.email === activeIdentities?.codexCliEmail,
     );
     const grok = snapshot.accounts.find(
-      (account) => !!account.email && account.email === activeIdentities?.grokCliEmail,
+      (account) => account.provider === "xai" && !!account.email && account.email === activeIdentities?.grokCliEmail,
     );
     const active = snapshot.accounts.find((account) => account.active);
     void refreshUsage(
@@ -292,11 +310,13 @@ export default function TrayDashboard() {
 
   const active = snapshot?.accounts.find((account) => account.active);
   const activeRoute = snapshot?.routes.find((route) => route.provider === active?.provider);
+  const activeCodex = snapshot?.accounts.find((account) => account.activeForCodex);
+  const codexActiveRoute = snapshot?.codexRoutes.find((route) => route.provider === activeCodex?.provider);
   const codexCliAccount = snapshot?.accounts.find(
-    (account) => !!account.email && account.email === activeIdentities?.codexCliEmail,
+    (account) => account.provider === "codex" && !!account.email && account.email === activeIdentities?.codexCliEmail,
   );
   const grokCliAccount = snapshot?.accounts.find(
-    (account) => !!account.email && account.email === activeIdentities?.grokCliEmail,
+    (account) => account.provider === "xai" && !!account.email && account.email === activeIdentities?.grokCliEmail,
   );
   const activeUsage = primaryUsagePercent(usageByAccount[active?.fileName ?? ""]);
   const codexUsage = primaryUsagePercent(usageByAccount[codexCliAccount?.fileName ?? ""]);
@@ -493,13 +513,13 @@ export default function TrayDashboard() {
             <span className="eyebrow">ChatGPT</span>
             <span className="tray-service-tag">{snapshot?.codexRunning ? "OPEN" : "CLOSED"}</span>
           </div>
-          <h2>{active && activeRoute ? activeRoute.selectedModelLabel : "No account"}</h2>
+          <h2>{activeCodex && codexActiveRoute ? codexActiveRoute.selectedModelLabel : "No account"}</h2>
           <p>
-            {active
-              ? `${active.label} · ${snapshot?.codexRunning ? "Window open" : "Window closed"}`
+            {activeCodex
+              ? `${activeCodex.label} · ${snapshot?.codexRunning ? "Window open" : "Window closed"}`
               : "Serve from full window"}
           </p>
-          <ReactorCore percent={activeUsage} label="ChatGPT" />
+          <ReactorCore percent={primaryUsagePercent(usageByAccount[activeCodex?.fileName ?? ""])} label="ChatGPT" />
         </article>
 
         <article className="tray-service">

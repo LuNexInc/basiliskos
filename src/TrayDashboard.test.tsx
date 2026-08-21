@@ -35,6 +35,8 @@ describe("tray dashboard preview render", () => {
     render(<TrayDashboard />);
     await act(async () => {});
     expect(screen.getAllByText("Claude Code").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("GPT-5.4").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Codex worker").length).toBeGreaterThan(0);
     expect(screen.getAllByText("PRIMARY").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Stop relay").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Close Claude").length).toBeGreaterThan(0);

@@ -41,8 +41,8 @@ use crate::usage::{
     parse_claude_usage, parse_codex_usage, parse_kimi_usage, parse_xai_usage, GatewayAccountUsage,
 };
 use crate::vision::{
-    append_vision_presentation_guidance, replace_images_with_description, resolve_deepseek_vision,
-    tool_compatibility_fixups, vision_sidecar_request_from_any,
+    append_vision_presentation_guidance, replace_images_with_descriptions, resolve_deepseek_vision,
+    resolve_deepseek_vision_per_image, tool_compatibility_fixups, vision_sidecar_request_from_any,
 };
 
 use crate::persistence::{
@@ -210,6 +210,23 @@ struct ControllerRuntime {
     gateway_job: Option<usize>,
 }
 
+/// Identifies the client whose account and route state a command or request uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientSurface {
+    Claude,
+    Codex,
+}
+
+impl ClientSurface {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            _ => Err("Client must be claude or codex".into()),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ControllerManager {
     runtime: Mutex<ControllerRuntime>,
@@ -350,6 +367,7 @@ pub struct GatewayAccount {
     pub label: String,
     pub disabled: bool,
     pub active: bool,
+    pub active_for_codex: bool,
     pub cooldown_until_ms: Option<i64>,
     /// The provider access-token expiry when the saved credential exposes one.
     /// This is metadata only: no token material ever leaves the local backend.
@@ -398,6 +416,8 @@ pub struct GatewaySnapshot {
     pub accounts: Vec<GatewayAccount>,
     pub active_account: Option<String>,
     pub routes: Vec<ProviderRoute>,
+    pub active_codex_account: Option<String>,
+    pub codex_routes: Vec<ProviderRoute>,
     pub deepseek_vision: DeepseekVisionPlan,
     /// Latest same-provider auto-failover, when one happened this session.
     /// The UI shows this once so a silent credential switch is not invisible.
@@ -556,8 +576,12 @@ struct ControllerState {
     previous_claude_applied_id: Option<String>,
     #[serde(default)]
     active_account: Option<String>,
+    #[serde(default)]
+    active_codex_account: Option<String>,
     #[serde(default = "default_routes")]
     routes: BTreeMap<String, RouteSelection>,
+    #[serde(default = "default_routes")]
+    codex_routes: BTreeMap<String, RouteSelection>,
     /// Basiliskos-owned preference: recolor the isolated Claude window/tray icons.
     /// Never written into Claude's own profile. Default black (distinct from stock Claude).
     #[serde(default = "default_claude_window_icon")]
@@ -588,9 +612,61 @@ struct KimiRefreshState {
     relogin_required: BTreeSet<String>,
 }
 
-fn normalized_route(state: &ControllerState, provider: &str) -> RouteSelection {
+fn migrate_controller_state(mut state: ControllerState) -> ControllerState {
+    if state.routes.is_empty() {
+        state.routes = default_routes();
+    }
+    if state.codex_routes.is_empty() {
+        state.codex_routes = default_routes();
+    }
+    state
+}
+
+fn client_routes(
+    state: &ControllerState,
+    client: ClientSurface,
+) -> &BTreeMap<String, RouteSelection> {
+    match client {
+        ClientSurface::Claude => &state.routes,
+        ClientSurface::Codex => &state.codex_routes,
+    }
+}
+
+fn client_routes_mut(
+    state: &mut ControllerState,
+    client: ClientSurface,
+) -> &mut BTreeMap<String, RouteSelection> {
+    match client {
+        ClientSurface::Claude => &mut state.routes,
+        ClientSurface::Codex => &mut state.codex_routes,
+    }
+}
+
+fn active_account_for(state: &ControllerState, client: ClientSurface) -> Option<&str> {
+    match client {
+        ClientSurface::Claude => state.active_account.as_deref(),
+        ClientSurface::Codex => state.active_codex_account.as_deref(),
+    }
+}
+
+fn set_active_account_for(
+    state: &mut ControllerState,
+    client: ClientSurface,
+    file_name: Option<String>,
+) {
+    match client {
+        ClientSurface::Claude => state.active_account = file_name,
+        ClientSurface::Codex => state.active_codex_account = file_name,
+    }
+}
+
+fn normalized_route_for(
+    state: &ControllerState,
+    client: ClientSurface,
+    provider: &str,
+) -> RouteSelection {
     let specs = model_specs(provider);
-    let stored = state.routes.get(provider);
+    let stored = client_routes(state, client).get(provider);
     let model = stored
         .map(|route| route.model.as_str())
         .filter(|model| specs.iter().any(|spec| spec.id == *model))
@@ -609,8 +685,16 @@ fn normalized_route(state: &ControllerState, provider: &str) -> RouteSelection {
     }
 }
 
-fn provider_route(state: &ControllerState, provider: &str) -> ProviderRoute {
-    let route = normalized_route(state, provider);
+fn normalized_route(state: &ControllerState, provider: &str) -> RouteSelection {
+    normalized_route_for(state, ClientSurface::Claude, provider)
+}
+
+fn provider_route_for(
+    state: &ControllerState,
+    client: ClientSurface,
+    provider: &str,
+) -> ProviderRoute {
+    let route = normalized_route_for(state, client, provider);
     let specs = model_specs(provider);
     let selected = specs
         .iter()
@@ -620,19 +704,24 @@ fn provider_route(state: &ControllerState, provider: &str) -> ProviderRoute {
     let live_catalog = runtime_lock()
         .ok()
         .and_then(|runtime| runtime.last_known_model_catalog.get(provider).cloned());
-    let model_options =
-        filter_visible_models(specs, &route.model, &hidden, live_catalog.as_deref())
-            .into_iter()
-            .map(|spec| RouteModelOption {
-                id: spec.id.to_string(),
-                label: spec.label.to_string(),
-                thinking_levels: spec
-                    .thinking_levels
-                    .iter()
-                    .map(|level| level.to_string())
-                    .collect(),
-            })
-            .collect();
+    let model_options = filter_visible_models(
+        provider,
+        specs,
+        &route.model,
+        &hidden,
+        live_catalog.as_deref(),
+    )
+    .into_iter()
+    .map(|spec| RouteModelOption {
+        id: spec.id.to_string(),
+        label: spec.label.to_string(),
+        thinking_levels: spec
+            .thinking_levels
+            .iter()
+            .map(|level| level.to_string())
+            .collect(),
+    })
+    .collect();
     let context_window = context_window_for_route(provider, selected.id);
     let selected_model_label = selected.label.to_string();
     ProviderRoute {
@@ -643,6 +732,10 @@ fn provider_route(state: &ControllerState, provider: &str) -> ProviderRoute {
         context_window,
         model_options,
     }
+}
+
+fn provider_route(state: &ControllerState, provider: &str) -> ProviderRoute {
+    provider_route_for(state, ClientSurface::Claude, provider)
 }
 
 /// Returns the (model, thinking) pair the client chose in Claude's picker,
@@ -1131,7 +1224,8 @@ pub fn initialize_controller_storage() -> Result<(), String> {
 fn load_state() -> Result<ControllerState, String> {
     let path = controller_path()?;
     if path.exists() || crate::persistence::backup_path(&path)?.exists() {
-        return load_json_with_recovery(&path, "Basiliskos controller state");
+        let state = load_json_with_recovery(&path, "Basiliskos controller state")?;
+        return Ok(migrate_controller_state(state));
     }
     let state = ControllerState {
         api_key: format!(
@@ -1142,7 +1236,9 @@ fn load_state() -> Result<ControllerState, String> {
         claude_config_id: Uuid::new_v4().to_string(),
         previous_claude_applied_id: None,
         active_account: None,
+        active_codex_account: None,
         routes: default_routes(),
+        codex_routes: default_routes(),
         claude_window_icon: default_claude_window_icon(),
         skip_model_switch_confirmation: false,
         open_claude_on_launch: default_open_claude_on_launch(),
@@ -1297,8 +1393,12 @@ fn prepare_codex_compaction_plugin(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn active_provider_from_auth(auth: &Path, state: &ControllerState) -> Option<String> {
-    let file_name = state.active_account.as_deref()?;
+fn active_provider_from_auth_for(
+    auth: &Path,
+    state: &ControllerState,
+    client: ClientSurface,
+) -> Option<String> {
+    let file_name = active_account_for(state, client)?;
     let raw = fs::read_to_string(auth.join(file_name)).ok()?;
     let value = serde_json::from_str::<Value>(&raw).ok()?;
     account_provider(&value, file_name)
@@ -1586,6 +1686,7 @@ fn refresh_model_catalog_cache(provider: &str, api_key: &str) {
 // The currently-selected model is always kept visible regardless of either
 // filter, so an existing route selection never disappears out from under it.
 fn filter_visible_models<'a>(
+    provider: &str,
     specs: &'a [ModelSpec],
     selected_id: &str,
     hidden: &BTreeSet<String>,
@@ -1595,8 +1696,10 @@ fn filter_visible_models<'a>(
         .iter()
         .filter(|spec| spec.id == selected_id || !hidden.contains(spec.id))
         .filter(|spec| {
+            let backend_id = backend_model_identifier(provider, spec.id);
             spec.id == selected_id
-                || live_catalog.is_none_or(|live| live.iter().any(|id| id == spec.id))
+                || live_catalog
+                    .is_none_or(|live| live.iter().any(|id| id == spec.id || id == backend_id))
         })
         .collect()
 }
@@ -1610,7 +1713,12 @@ fn validated_route_for_request(
     let Ok(models) = backend_model_ids(&state.api_key) else {
         return selected;
     };
-    if models.is_empty() || models.iter().any(|model| model == &selected.model) {
+    let target_backend_model = backend_model_identifier(provider, &selected.model);
+    if models.is_empty()
+        || models
+            .iter()
+            .any(|model| model == target_backend_model || model == &selected.model)
+    {
         if let Ok(mut runtime) = runtime_lock() {
             runtime
                 .last_known_good_models
@@ -1621,11 +1729,19 @@ fn validated_route_for_request(
     let fallback = runtime_lock()
         .ok()
         .and_then(|runtime| runtime.last_known_good_models.get(provider).cloned())
-        .filter(|model| models.contains(model))
+        .filter(|model| {
+            let target = backend_model_identifier(provider, model);
+            models.iter().any(|m| m == target || m == model)
+        })
         .or_else(|| {
             model_specs(provider)
                 .iter()
-                .find(|spec| models.iter().any(|model| model == spec.id))
+                .find(|spec| {
+                    let target = backend_model_identifier(provider, spec.id);
+                    models
+                        .iter()
+                        .any(|model| model == target || model == spec.id)
+                })
                 .map(|spec| spec.id.to_owned())
         });
     let Some(model) = fallback else {
@@ -1963,9 +2079,12 @@ fn request_is_authorized(request: &tiny_http::Request, api_key: &str) -> bool {
         (name.eq_ignore_ascii_case("x-api-key")
             && valid_tokens.iter().any(|valid| secure_eq(value, valid)))
             || (name.eq_ignore_ascii_case("authorization")
-                && value
-                    .strip_prefix("Bearer ")
-                    .is_some_and(|token| valid_tokens.iter().any(|valid| secure_eq(token, valid))))
+                && if value.len() >= 7 && value[..7].eq_ignore_ascii_case("bearer ") {
+                    let token = value[7..].trim();
+                    valid_tokens.iter().any(|valid| secure_eq(token, valid))
+                } else {
+                    false
+                })
     })
 }
 
@@ -2261,8 +2380,22 @@ fn begin_upstream_request_with_timeouts(
         .unwrap_or(Err(FirstResponseFailure::Timeout))
 }
 
+fn request_surface(path: &str) -> Option<ClientSurface> {
+    if path == "/v1/messages" || path == "/v1/messages/count_tokens" {
+        Some(ClientSurface::Claude)
+    } else if path == "/v1/chat/completions"
+        || path == "/v1/responses"
+        || path.starts_with("/v1/responses/")
+    {
+        Some(ClientSurface::Codex)
+    } else {
+        None
+    }
+}
+
 fn classify_upstream_status(status: u16) -> Option<ErrorCode> {
     match status {
+        402 => Some(ErrorCode::ProviderQuotaExhausted),
         401..=403 => Some(ErrorCode::ProviderAuthFailed),
         429 => Some(ErrorCode::ProviderRateLimited),
         500..=599 => Some(ErrorCode::UpstreamServerError),
@@ -2374,6 +2507,7 @@ fn handle_front_proxy_request(
         .split('?')
         .next()
         .unwrap_or(request_url.as_str());
+    let surface = request_surface(request_path);
 
     // Codex Desktop prefers the Responses WebSocket transport. The Basiliskos
     // relay is HTTP/SSE only, so a WebSocket upgrade would hang forever in
@@ -2465,12 +2599,13 @@ fn handle_front_proxy_request(
     // images with a safety placeholder, give the ordered OAuth vision lane a
     // bounded chance to describe them. This happens only while DeepSeek is the
     // selected primary route; other providers receive their native images.
-    if request_path == "/v1/messages" || request_path == "/v1/messages/count_tokens" {
+    if surface == Some(ClientSurface::Claude) {
         let vision_result = (|| -> Result<(), String> {
             let (provider, accounts) = {
                 let _mutation = mutation_lock()?;
                 let state = load_state()?;
-                let provider = active_provider_from_auth(&auth_dir()?, &state);
+                let provider =
+                    active_provider_from_auth_for(&auth_dir()?, &state, ClientSurface::Claude);
                 let accounts = list_accounts_inner(&state)?;
                 (provider, accounts)
             };
@@ -2482,9 +2617,18 @@ fn handle_front_proxy_request(
             if vision_content_from_request(&json).is_none() {
                 return Ok(());
             }
-            let description =
-                resolve_deepseek_vision(async_runtime, client, &accounts, &json, correlation_id)?;
-            replace_images_with_description(&mut json, &description);
+            let mut descriptions = resolve_deepseek_vision_per_image(
+                async_runtime,
+                client,
+                &accounts,
+                &json,
+                correlation_id,
+            )?;
+            // The sidecar works newest-first so the bounded eight-image budget
+            // keeps the latest context. Restore conversation order for the
+            // replacement walk, which also marks older omitted images.
+            descriptions.reverse();
+            replace_images_with_descriptions(&mut json, &descriptions);
             append_vision_presentation_guidance(&mut json)?;
             body = serde_json::to_vec(&json).map_err(|error| {
                 format!("The vision-enriched request could not be serialized: {error}")
@@ -2506,14 +2650,16 @@ fn handle_front_proxy_request(
     let mut provider_for_event = None;
     let mut active_account_for_event = None;
     let mut context_budget = None;
-    if request_path == "/v1/messages" || request_path == "/v1/messages/count_tokens" {
+    if surface == Some(ClientSurface::Claude) {
         let rewrite_result = (|| -> Result<(), String> {
             let _mutation = mutation_lock()?;
             let mut state = load_state()?;
-            let provider = active_provider_from_auth(&auth_dir()?, &state)
-                .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
+            let provider =
+                active_provider_from_auth_for(&auth_dir()?, &state, ClientSurface::Claude)
+                    .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
             provider_for_event = Some(provider.clone());
-            active_account_for_event = state.active_account.clone();
+            active_account_for_event =
+                active_account_for(&state, ClientSurface::Claude).map(str::to_owned);
             let validated = validated_route_for_request(&state, &provider, correlation_id);
             state.routes.insert(provider.clone(), validated);
             let mut json: Value = serde_json::from_slice(&body)
@@ -2545,7 +2691,6 @@ fn handle_front_proxy_request(
                     // Regenerate the Claude config so the picker follows the
                     // new selected model's thinking variants.
                     let _ = write_isolated_claude_config(&isolated_claude_profile_dir()?, &state);
-                    let _ = write_isolated_codex_config(&isolated_codex_home()?, &state);
                 }
             }
             rewrite_claude_request(&mut json, &state, &provider, request_path == "/v1/messages")?;
@@ -2572,7 +2717,7 @@ fn handle_front_proxy_request(
     // Basiliskos route by rewriting the request model to the active route's
     // real upstream id (the renderer allowlist only offers native OpenAI slugs,
     // which cannot map to upstreams directly).
-    if request_path == "/v1/responses" {
+    if surface == Some(ClientSurface::Codex) {
         let content_type = request
             .headers()
             .iter()
@@ -2599,10 +2744,12 @@ fn handle_front_proxy_request(
         let rewrite_result = (|| -> Result<(), String> {
             let _mutation = mutation_lock()?;
             let state = load_state()?;
-            let provider = active_provider_from_auth(&auth_dir()?, &state)
-                .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
+            let provider =
+                active_provider_from_auth_for(&auth_dir()?, &state, ClientSurface::Codex)
+                    .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
             provider_for_event = Some(provider.clone());
-            active_account_for_event = state.active_account.clone();
+            active_account_for_event =
+                active_account_for(&state, ClientSurface::Codex).map(str::to_owned);
             Ok(())
         })();
         if let Err(message) = rewrite_result {
@@ -2709,7 +2856,7 @@ fn handle_front_proxy_request(
                 request,
                 ErrorCode::ContextWindowExceeded,
                 413,
-                "This Grok 4.5 request exceeds its 500K context window after reserving output tokens. Start a new session or compact the conversation.",
+                "This Grok request exceeds its 500K context window after reserving output tokens. Start a new session or compact the conversation.",
                 correlation_id,
             );
             return;
@@ -2772,13 +2919,25 @@ fn handle_front_proxy_request(
                 ErrorCode::ProviderRateLimited => {
                     "The provider rate-limited the selected credential."
                 }
+                ErrorCode::ProviderQuotaExhausted => {
+                    "The provider quota or billing limit was exhausted for the selected credential."
+                }
                 _ => "The provider returned a server error.",
             },
             Some(correlation_id),
             Some(upstream_status),
             provider_for_event.as_deref(),
         );
-        if code == ErrorCode::ProviderRateLimited {
+        let local_concurrency_fault = code == ErrorCode::ProviderRateLimited
+            && upstream.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-basiliskos-fault")
+                    && String::from_utf8_lossy(value).eq_ignore_ascii_case("local-concurrency")
+            });
+        if matches!(
+            code,
+            ErrorCode::ProviderRateLimited | ErrorCode::ProviderQuotaExhausted
+        ) && !local_concurrency_fault
+        {
             if let Some(account_file) = active_account_for_event.clone() {
                 let retry_after_seconds = upstream
                     .headers
@@ -2787,7 +2946,11 @@ fn handle_front_proxy_request(
                     .and_then(|(_, value)| {
                         parse_retry_after_seconds(&String::from_utf8_lossy(value))
                     })
-                    .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN_SECS);
+                    .unwrap_or(if code == ErrorCode::ProviderQuotaExhausted {
+                        DEFAULT_RATE_LIMIT_COOLDOWN_SECS.saturating_mul(4)
+                    } else {
+                        DEFAULT_RATE_LIMIT_COOLDOWN_SECS
+                    });
                 if let Ok(mut runtime) = runtime_lock() {
                     runtime.account_cooldowns.insert(
                         account_file.clone(),
@@ -2795,9 +2958,23 @@ fn handle_front_proxy_request(
                     );
                 }
                 if let Some(provider) = provider_for_event.as_deref() {
-                    attempt_same_provider_failover(&account_file, provider);
+                    attempt_same_provider_failover(
+                        &account_file,
+                        provider,
+                        surface.unwrap_or(ClientSurface::Claude),
+                    );
                 }
             }
+        }
+        if local_concurrency_fault {
+            diagnostics::record(
+                ErrorCode::RelayBusy,
+                "warning",
+                "The local provider gate is busy; the selected account was not cooled down.",
+                Some(correlation_id),
+                Some(upstream_status),
+                provider_for_event.as_deref(),
+            );
         }
     }
     let status = StatusCode(upstream_status);
@@ -3938,6 +4115,7 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
                 "codex" => "Codex account".into(),
                 "kimi" => "Kimi account".into(),
                 "deepseek" => "DeepSeek account".into(),
+                "antigravity" => "Antigravity account".into(),
                 _ => "Claude account".into(),
             })
         });
@@ -3948,6 +4126,8 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
         let credential_status = credential_status(&provider, &file_name, expiry, now);
         accounts.push(GatewayAccount {
             active: state.active_account.as_deref() == Some(file_name.as_str()) && !disabled,
+            active_for_codex: state.active_codex_account.as_deref() == Some(file_name.as_str())
+                && !disabled,
             file_name,
             provider,
             email,
@@ -4465,6 +4645,10 @@ fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
         .iter()
         .map(|provider| provider_route(&state, provider))
         .collect::<Vec<_>>();
+    let codex_routes = SUPPORTED_PROVIDERS
+        .iter()
+        .map(|provider| provider_route_for(&state, ClientSurface::Codex, provider))
+        .collect::<Vec<_>>();
     let running = gateway_running();
     let claude_running = hydra_claude_running();
     let codex_running = hydra_codex_running();
@@ -4512,6 +4696,8 @@ fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
         accounts,
         active_account: state.active_account,
         routes,
+        active_codex_account: state.active_codex_account,
+        codex_routes,
         deepseek_vision,
         auto_failover,
         controller: ComponentStatus {
@@ -5437,6 +5623,10 @@ async fn maintain_saved_oauth_credentials_once() {
                                             "access_token".into(),
                                             Value::String(token.to_string()),
                                         );
+                                        for key in ["expired", "expires_at", "expiresAt", "expiry"]
+                                        {
+                                            obj.remove(key);
+                                        }
                                         if let Some(rt) = iso_val
                                             .get("tokens")
                                             .and_then(|t| t.get("refresh_token"))
@@ -5456,6 +5646,13 @@ async fn maintain_saved_oauth_credentials_once() {
                                                 "id_token".into(),
                                                 Value::String(id.to_string()),
                                             );
+                                        }
+                                        if let Some(expiry) = iso_val
+                                            .get("tokens")
+                                            .and_then(|tokens| tokens.get("expires_at"))
+                                            .or_else(|| iso_val.get("expires_at"))
+                                        {
+                                            obj.insert("expires_at".into(), expiry.clone());
                                         }
                                         if let Ok(bytes) = serde_json::to_vec_pretty(&anc_val) {
                                             let _ = durable_write(&anchor_path, &bytes);
@@ -5652,14 +5849,18 @@ fn parse_codex_config_toml(raw: &str) -> Option<(String, String)> {
     model.map(|m| (m, effort))
 }
 
+fn codex_config_model_at(home: &Path) -> Option<(String, String)> {
+    let raw = fs::read_to_string(home.join("config.toml")).ok()?;
+    parse_codex_config_toml(&raw)
+}
+
 /// Reads the isolated Codex window's current picker choice from its
 /// config.toml (`model = "..."`, `model_reasoning_effort = "..."`). The app
 /// persists the picker selection there on change; the encrypted dial body is
 /// not visible to the relay, so this file is the sync signal.
 fn codex_config_model() -> Option<(String, String)> {
     let home = isolated_codex_home().ok()?;
-    let raw = fs::read_to_string(home.join("config.toml")).ok()?;
-    parse_codex_config_toml(&raw)
+    codex_config_model_at(&home)
 }
 
 /// Finds the Basiliskos provider that advertises the given model id.
@@ -5682,7 +5883,8 @@ fn pick_codex_sync_account<'a>(
         .collect::<Vec<_>>();
     candidates
         .iter()
-        .find(|account| !account.disabled)
+        .find(|account| account.active_for_codex && !account.disabled)
+        .or_else(|| candidates.iter().find(|account| !account.disabled))
         .or_else(|| {
             candidates.iter().find(|account| {
                 !matches!(
@@ -5695,14 +5897,9 @@ fn pick_codex_sync_account<'a>(
         .copied()
 }
 
-/// Applies the isolated Codex window's picker model to the Basiliskos active
-/// route so Claude Desktop and the Basiliskos GUI follow the window (option 1:
-/// the window's switcher is the source of truth while it is open). The
-/// encrypted dial cannot be inspected, so the relay reads the persisted
-/// config.toml choice. Same-provider picks update the route model; a pick of a
-/// different provider's model switches the active account. Runs on the
-/// supervision timer; best-effort (any failure leaves the route untouched).
-fn sync_route_from_codex_window(app: &AppHandle) {
+/// Refreshes the model catalog cache for the model currently selected in the
+/// isolated Codex window without mutating Claude's active account or route.
+fn sync_route_from_codex_window(_app: &AppHandle) {
     let Ok(_mutation) = mutation_lock() else {
         return;
     };
@@ -5713,102 +5910,40 @@ fn sync_route_from_codex_window(app: &AppHandle) {
         return;
     };
     let Some(provider) = model_to_provider(&model) else {
-        return; // a model Basiliskos does not advertise — leave the route alone
+        return;
     };
     let Ok(mut state) = load_state() else { return };
     let Ok(accounts) = list_accounts_inner(&state) else {
         return;
     };
-    let active_provider = state
-        .active_account
-        .as_deref()
-        .and_then(|file| accounts.iter().find(|a| a.file_name == file))
-        .map(|account| account.provider.as_str());
-    // Sync the MODEL only. The config.toml reasoning effort is the launch
-    // default ("high" even when the route says auto), not a reliable user
-    // intent, so syncing thinking from it would make spurious route changes.
-    let existing_thinking = state
-        .routes
-        .get(provider)
-        .map(|route| route.thinking.clone())
-        .unwrap_or_else(|| "auto".to_string());
-    let target_route = RouteSelection {
-        model: model.clone(),
-        thinking: existing_thinking,
-    };
-
-    if active_provider == Some(provider) {
-        // Same provider: update the route model only, preserving thinking.
-        let current = state.routes.get(provider);
-        if current == Some(&target_route) {
-            return;
-        }
-        state.routes.insert(provider.to_string(), target_route);
-        let _ = save_state(&state);
-        if let Ok(profile) = isolated_claude_profile_dir() {
-            let _ = write_isolated_claude_config(&profile, &state);
-        }
-        return;
-    }
-
-    // Different provider: switch the active account to that provider's pinned
-    // (or first usable) account, then set the route to the picked model.
-    let Some(target) = pick_codex_sync_account(&accounts, provider) else {
-        return;
-    };
-    let target_file = target.file_name.clone();
-    let Ok(root) = root_dir() else { return };
-    let Ok(directory) = auth_dir() else { return };
-    let Ok(state_path) = controller_path() else {
-        return;
-    };
-    let restart_backend = selection_requires_backend_restart(
-        &accounts,
-        state.active_account.as_deref(),
-        &target_file,
-    );
-    let Ok((mutations, mut switched)) = selection_transaction(
-        &root,
-        &directory,
-        &state_path,
-        &accounts,
-        &state,
-        &target_file,
-    ) else {
-        return;
-    };
-    if run_transaction(&root, &mutations, || {
-        validate_account_invariant(&directory, &state_path)
-    })
-    .is_err()
-    {
-        return;
-    }
-    switched.routes.insert(provider.to_string(), target_route);
-    if let Ok(mut runtime) = runtime_lock() {
-        runtime.last_known_good_models.clear();
-    }
-    let _ = save_state(&switched);
-    let _ = prepare_config();
-    if restart_backend {
-        if let Err(error) = restart_backend_for_provider_config(app, &switched) {
-            diagnostics::record(
-                ErrorCode::BackendRestartFailed,
-                "warning",
-                &format!("Codex route sync backend restart failed: {error}"),
-                None,
-                None,
-                Some(provider),
-            );
+    if let Some(account) = pick_codex_sync_account(&accounts, provider) {
+        let selected = account.file_name.clone();
+        if state.active_codex_account.as_deref() != Some(selected.as_str()) {
+            let active_provider = state
+                .active_codex_account
+                .as_deref()
+                .and_then(|file| accounts.iter().find(|account| account.file_name == file))
+                .map(|account| account.provider.as_str());
+            if active_provider.is_none() || active_provider == Some(provider) {
+                state.active_codex_account = Some(selected);
+            }
         }
     }
-    if let Ok(profile) = isolated_claude_profile_dir() {
-        let _ = write_isolated_claude_config(&profile, &switched);
+    if let Some(route) = state.codex_routes.get_mut(provider) {
+        let spec = model_specs(provider).iter().find(|spec| spec.id == model);
+        if let Some(spec) = spec {
+            route.model = spec.id.to_string();
+            if route.thinking != "auto" && !spec.thinking_levels.contains(&route.thinking.as_str())
+            {
+                route.thinking = "auto".to_string();
+            }
+        }
     }
+    let _ = save_state(&state);
     if let Ok(home) = isolated_codex_home() {
-        let _ = write_isolated_codex_config(&home, &switched);
+        let _ = write_isolated_codex_config(&home, &state);
     }
-    refresh_model_catalog_cache(provider, &switched.api_key);
+    refresh_model_catalog_cache(provider, &state.api_key);
 }
 
 /// Runs backend crash recovery on a fixed timer instead of only on idle
@@ -5824,13 +5959,9 @@ pub fn start_backend_supervision(app: AppHandle) {
         loop {
             tokio::time::sleep(BACKEND_SUPERVISION_INTERVAL).await;
             supervise_backend(&app);
-            // The Codex window is the live control surface when it is open:
-            // its picker drives the active route, so the Claude-session sync
-            // yields to it. When the Codex window is closed, the Claude
-            // session drives as before.
-            if !hydra_codex_running() {
-                sync_route_from_claude_session();
-            }
+            // Each client owns a separate route. A Codex window must not pause
+            // synchronization of a live Claude session.
+            sync_route_from_claude_session();
             sync_route_from_codex_window(&app);
         }
     });
@@ -5886,6 +6017,17 @@ fn validate_account_invariant(directory: &Path, state_path: &Path) -> Result<(),
             ));
         }
     }
+    if let Some(active) = state.active_codex_account.as_deref() {
+        if !supported.iter().any(|file| file == active) {
+            return Err("The selected Codex account disappeared during the transaction".into());
+        }
+        if !enabled.iter().any(|file| file == active) {
+            return Err(format!(
+                "Account transaction invariant failed: the selected Codex account {active} is not enabled (enabled: {})",
+                enabled.join(", ")
+            ));
+        }
+    }
     // The relay keeps at most one enabled account per provider. The selected
     // (active) account drives the Claude path, while the other providers' last-
     // selected accounts stay enabled so the isolated Codex window can route a
@@ -5922,12 +6064,29 @@ fn selection_transaction(
     state_path: &Path,
     accounts: &[GatewayAccount],
     state: &ControllerState,
+    client: ClientSurface,
     file_name: &str,
 ) -> Result<(Vec<FileMutation>, ControllerState), String> {
     let selected_provider = accounts
         .iter()
         .find(|account| account.file_name == file_name)
-        .map(|account| account.provider.as_str());
+        .map(|account| account.provider.as_str())
+        .ok_or_else(|| "Unsupported account file".to_string())?;
+    let other_client = match client {
+        ClientSurface::Claude => ClientSurface::Codex,
+        ClientSurface::Codex => ClientSurface::Claude,
+    };
+    if let Some(other_file) = active_account_for(state, other_client) {
+        let other_provider = accounts
+            .iter()
+            .find(|account| account.file_name == other_file)
+            .map(|account| account.provider.as_str());
+        if other_provider == Some(selected_provider) && other_file != file_name {
+            return Err(format!(
+                "Claude and Codex share one enabled {selected_provider} credential. Select the current account or switch the other client to another provider first."
+            ));
+        }
+    }
     let mut mutations = Vec::with_capacity(accounts.len() + 1);
     for account in accounts {
         let selected = account.file_name == file_name;
@@ -5938,7 +6097,7 @@ fn selection_transaction(
         // provider whose credential is enabled.
         let disabled = if selected {
             false
-        } else if selected_provider == Some(account.provider.as_str()) {
+        } else if selected_provider == account.provider.as_str() {
             true
         } else {
             account.disabled
@@ -5952,7 +6111,7 @@ fn selection_transaction(
         });
     }
     let mut after_state = state.clone();
-    after_state.active_account = Some(file_name.to_string());
+    set_active_account_for(&mut after_state, client, Some(file_name.to_string()));
     mutations.push(FileMutation {
         path: state_path.to_path_buf(),
         after: Some(
@@ -6003,6 +6162,7 @@ fn removal_transaction(
     file_name: &str,
 ) -> Result<(Vec<FileMutation>, ControllerState), String> {
     let removing_active = state.active_account.as_deref() == Some(file_name);
+    let removing_codex_active = state.active_codex_account.as_deref() == Some(file_name);
     let mut mutations = vec![FileMutation {
         path: paths.directory.join(file_name),
         after: None,
@@ -6023,6 +6183,11 @@ fn removal_transaction(
     let mut after_state = state.clone();
     if removing_active {
         after_state.active_account = None;
+    }
+    if removing_codex_active {
+        after_state.active_codex_account = None;
+    }
+    if removing_active || removing_codex_active {
         mutations.push(FileMutation {
             path: paths.state.to_path_buf(),
             after: Some(
@@ -6052,6 +6217,10 @@ fn pick_failover_candidate<'a>(
     accounts.iter().find(|account| {
         account.provider == provider
             && account.file_name != rate_limited_account
+            && !matches!(
+                account.credential_status.as_str(),
+                "expired" | "relogin_required"
+            )
             && cooling
                 .get(&account.file_name)
                 .is_none_or(|until| *until <= now)
@@ -6068,7 +6237,11 @@ fn pick_failover_candidate<'a>(
 // the new credential. Silently does nothing if any step fails or no eligible
 // candidate exists; the caller (the relay's 429 path) still returns the
 // original rate-limit response to the client either way.
-fn attempt_same_provider_failover(rate_limited_account: &str, provider: &str) {
+fn attempt_same_provider_failover(
+    rate_limited_account: &str,
+    provider: &str,
+    client: ClientSurface,
+) {
     let Ok(_mutation) = mutation_lock() else {
         return;
     };
@@ -6103,6 +6276,7 @@ fn attempt_same_provider_failover(rate_limited_account: &str, provider: &str) {
         &state_path,
         &accounts,
         &state,
+        client,
         &candidate_file,
     ) else {
         return;
@@ -6144,6 +6318,7 @@ fn attempt_same_provider_failover(rate_limited_account: &str, provider: &str) {
 pub async fn select_gateway_account(
     app: AppHandle,
     file_name: String,
+    client: Option<String>,
 ) -> Result<AccountSelectionResult, String> {
     let refreshed = refresh_xai_relay_credential_if_needed(&file_name).await?;
     if refreshed {
@@ -6152,6 +6327,7 @@ pub async fn select_gateway_account(
         crate::grok_cli::sync_grok_cli_account_from_relay(&file_name)?;
     }
     let _mutation = mutation_lock()?;
+    let client = ClientSurface::parse(client.as_deref().unwrap_or("claude"))?;
     let selected = exact_auth_path(&file_name)?;
     if !selected.is_file() {
         return Err("Account not found".into());
@@ -6167,14 +6343,18 @@ pub async fn select_gateway_account(
     let root = root_dir()?;
     let directory = auth_dir()?;
     let state_path = controller_path()?;
-    let restart_backend =
-        selection_requires_backend_restart(&accounts, state.active_account.as_deref(), &file_name);
+    let restart_backend = selection_requires_backend_restart(
+        &accounts,
+        active_account_for(&state, client),
+        &file_name,
+    );
     let (mutations, state) = selection_transaction(
         &root,
         &directory,
         &state_path,
         &accounts,
         &state,
+        client,
         &file_name,
     )?;
     run_transaction(&root, &mutations, || {
@@ -6185,11 +6365,15 @@ pub async fn select_gateway_account(
     if restart_backend {
         restart_backend_for_provider_config(&app, &state)?;
     }
-    let claude_config_changed =
-        write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
-    // Keep the isolated Codex window's model honest: it follows the active
-    // route, so an account switch must refresh the dial's config.toml too.
-    let _ = write_isolated_codex_config(&isolated_codex_home()?, &state);
+    let claude_config_changed = match client {
+        ClientSurface::Claude => {
+            write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?
+        }
+        ClientSurface::Codex => {
+            write_isolated_codex_config(&isolated_codex_home()?, &state)?;
+            false
+        }
+    };
     if let Some(newly_active_provider) = accounts
         .iter()
         .find(|account| account.file_name == file_name)
@@ -6208,8 +6392,10 @@ pub fn set_gateway_route(
     provider: String,
     model: String,
     thinking: String,
+    client: Option<String>,
 ) -> Result<RouteUpdateResult, String> {
     let _mutation = mutation_lock()?;
+    let client = ClientSurface::parse(client.as_deref().unwrap_or("claude"))?;
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
         return Err("Provider must be claude, codex, xai, kimi, deepseek, or antigravity".into());
     }
@@ -6223,15 +6409,24 @@ pub fn set_gateway_route(
         ));
     }
     let mut state = load_state()?;
-    let account_is_active = list_accounts_inner(&state)?
-        .iter()
-        .any(|account| account.active && account.provider == provider);
+    let account_is_active = list_accounts_inner(&state)?.iter().any(|account| {
+        let selected = match client {
+            ClientSurface::Claude => account.active,
+            ClientSurface::Codex => account.active_for_codex,
+        };
+        selected && account.provider == provider
+    });
     // True unless an active account exists and the backend was unreachable, so
     // the saved route could not be validated against the live model catalog.
     let mut route_verified = true;
     if account_is_active {
         if let Ok(models) = backend_model_ids(&state.api_key) {
-            if !models.is_empty() && !models.contains(&model) {
+            let target_backend_model = backend_model_identifier(&provider, &model);
+            if !models.is_empty()
+                && !models
+                    .iter()
+                    .any(|m| m == target_backend_model || m == &model)
+            {
                 return Err(format!(
                     "{} is not available for the selected {} credential. Choose a model advertised by the backend.",
                     spec.label,
@@ -6245,7 +6440,10 @@ pub fn set_gateway_route(
                         .insert(provider.clone(), models.clone());
                 }
             }
-            if models.contains(&model) {
+            if models
+                .iter()
+                .any(|m| m == target_backend_model || m == &model)
+            {
                 runtime_lock()?
                     .last_known_good_models
                     .insert(provider.clone(), model.clone());
@@ -6254,14 +6452,19 @@ pub fn set_gateway_route(
             route_verified = false;
         }
     }
-    state
-        .routes
+    client_routes_mut(&mut state, client)
         .insert(provider.clone(), RouteSelection { model, thinking });
     save_state(&state)?;
     prepare_config()?;
     if account_is_active {
-        write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
-        let _ = write_isolated_codex_config(&isolated_codex_home()?, &state);
+        match client {
+            ClientSurface::Claude => {
+                write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?;
+            }
+            ClientSurface::Codex => {
+                write_isolated_codex_config(&isolated_codex_home()?, &state)?;
+            }
+        }
     }
     Ok(RouteUpdateResult {
         snapshot: gateway_snapshot_locked()?,
@@ -6299,13 +6502,16 @@ pub fn get_model_catalog(provider: String) -> Result<Vec<ModelCatalogEntry>, Str
         .and_then(|runtime| runtime.last_known_model_catalog.get(&provider).cloned());
     Ok(model_specs(&provider)
         .iter()
-        .map(|spec| ModelCatalogEntry {
-            id: spec.id.to_string(),
-            label: spec.label.to_string(),
-            hidden: hidden.contains(spec.id),
-            live: live_catalog
-                .as_ref()
-                .map(|live| live.iter().any(|id| id == spec.id)),
+        .map(|spec| {
+            let backend_id = backend_model_identifier(&provider, spec.id);
+            ModelCatalogEntry {
+                id: spec.id.to_string(),
+                label: spec.label.to_string(),
+                hidden: hidden.contains(spec.id),
+                live: live_catalog
+                    .as_ref()
+                    .map(|live| live.iter().any(|id| id == spec.id || id == backend_id)),
+            }
         })
         .collect())
 }
@@ -6347,7 +6553,7 @@ pub fn remove_gateway_account(file_name: String) -> Result<GatewaySnapshot, Stri
     let labels_path = account_labels_path()?;
     debug_assert_eq!(path, directory.join(&file_name));
     let labels = load_account_labels()?;
-    let (mutations, _state) = removal_transaction(
+    let (mutations, next_state) = removal_transaction(
         AccountPaths {
             root: &root,
             directory: &directory,
@@ -6362,6 +6568,19 @@ pub fn remove_gateway_account(file_name: String) -> Result<GatewaySnapshot, Stri
     run_transaction(&root, &mutations, || {
         validate_account_invariant(&directory, &state_path)
     })?;
+    prepare_config()?;
+    if state.active_account.as_deref() == Some(file_name.as_str()) {
+        stop_hydra_claude_runtime();
+    }
+    if state.active_codex_account.as_deref() == Some(file_name.as_str()) {
+        stop_hydra_codex_runtime();
+    }
+    if next_state.active_account.is_some() {
+        let _ = write_isolated_claude_config(&isolated_claude_profile_dir()?, &next_state);
+    }
+    if next_state.active_codex_account.is_some() {
+        let _ = write_isolated_codex_config(&isolated_codex_home()?, &next_state);
+    }
     gateway_snapshot_locked()
 }
 
@@ -6429,7 +6648,10 @@ async fn verify_deepseek_api_key(api_key: &str) -> Result<(), String> {
 /// returned `fileName` lets the caller activate it right away through
 /// `select_gateway_account`.
 #[tauri::command]
-pub async fn add_deepseek_account(api_key: String) -> Result<DeepseekAccountAdded, String> {
+pub async fn add_deepseek_account(
+    api_key: String,
+    replace_file_name: Option<String>,
+) -> Result<DeepseekAccountAdded, String> {
     let api_key = api_key.trim().to_string();
     if !is_valid_deepseek_api_key(&api_key) {
         return Err("Enter a valid DeepSeek API key (letters, digits, '-' and '_' only).".into());
@@ -6444,19 +6666,74 @@ pub async fn add_deepseek_account(api_key: String) -> Result<DeepseekAccountAdde
     let existing = fs::read(&path)
         .ok()
         .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
-    let credential = deepseek_credential_value(&api_key, existing.as_ref());
+    let replacement = replace_file_name.as_deref();
+    if let Some(old_file) = replacement {
+        let _ = exact_auth_path(old_file)?;
+    }
+    let replacement_value = replacement
+        .and_then(|file_name| fs::read(directory.join(file_name)).ok())
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+    if replacement.is_some()
+        && replacement != Some(file_name.as_str())
+        && replacement_value
+            .as_ref()
+            .and_then(|value| account_provider(value, replacement.unwrap_or_default()))
+            .as_deref()
+            != Some("deepseek")
+    {
+        return Err("The DeepSeek account to replace was not found.".into());
+    }
+    let credential =
+        deepseek_credential_value(&api_key, existing.as_ref().or(replacement_value.as_ref()));
     let after = serde_json::to_vec_pretty(&credential)
         .map_err(|_| "The DeepSeek credential could not be serialized")?;
     let root = root_dir()?;
     let state_path = controller_path()?;
-    run_transaction(
-        &root,
-        &[FileMutation {
-            path,
-            after: Some(after),
-        }],
-        || validate_account_invariant(&directory, &state_path),
-    )
+    let state = load_state()?;
+    let labels_path = account_labels_path()?;
+    let mut labels = load_account_labels()?;
+    let mut after_state = state.clone();
+    let mut mutations = vec![FileMutation {
+        path: path.clone(),
+        after: Some(after),
+    }];
+    if let Some(old_file) = replacement.filter(|old| *old != file_name) {
+        mutations.push(FileMutation {
+            path: directory.join(old_file),
+            after: None,
+        });
+        if let Some(label) = labels.remove(old_file) {
+            labels.insert(file_name.clone(), label);
+            mutations.push(FileMutation {
+                path: labels_path.clone(),
+                after: Some(
+                    serde_json::to_vec_pretty(&labels)
+                        .map_err(|error| format!("Could not serialize profile names: {error}"))?,
+                ),
+            });
+        }
+        if after_state.active_account.as_deref() == Some(old_file) {
+            after_state.active_account = Some(file_name.clone());
+        }
+        if after_state.active_codex_account.as_deref() == Some(old_file) {
+            after_state.active_codex_account = Some(file_name.clone());
+        }
+        if after_state.active_account != state.active_account
+            || after_state.active_codex_account != state.active_codex_account
+        {
+            mutations.push(FileMutation {
+                path: state_path.clone(),
+                after: Some(
+                    serde_json::to_vec_pretty(&after_state).map_err(|error| {
+                        format!("Could not serialize controller state: {error}")
+                    })?,
+                ),
+            });
+        }
+    }
+    run_transaction(&root, &mutations, || {
+        validate_account_invariant(&directory, &state_path)
+    })
     .inspect_err(|_| {
         diagnostics::record(
             ErrorCode::ConfigTransactionFailed,
@@ -6468,6 +6745,12 @@ pub async fn add_deepseek_account(api_key: String) -> Result<DeepseekAccountAdde
         );
     })?;
     prepare_config()?;
+    if after_state.active_account.is_some() {
+        let _ = write_isolated_claude_config(&isolated_claude_profile_dir()?, &after_state);
+    }
+    if after_state.active_codex_account.is_some() {
+        let _ = write_isolated_codex_config(&isolated_codex_home()?, &after_state);
+    }
     Ok(DeepseekAccountAdded {
         snapshot: gateway_snapshot_locked()?,
         file_name,
@@ -7353,26 +7636,119 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
 /// provider, over the OpenAI Responses wire API. Pure so tests can assert the
 /// golden shape without touching any real state.
 fn codex_config_toml(model: &str, thinking: &str, port: u16, catalog_path: &str) -> String {
-    let thinking = if thinking == "auto" { "high" } else { thinking };
+    let reasoning_line = if thinking == "auto" {
+        String::new()
+    } else {
+        format!(
+            "model_reasoning_effort = \"{}\"\n",
+            thinking.replace('"', "")
+        )
+    };
+    let compact_limit = model_to_provider(model)
+        .and_then(|provider| context_window_for_route(provider, model))
+        .map(|window| window.saturating_mul(80) / 100)
+        .unwrap_or(160_000);
     format!(
         r#"# Generated by Basiliskos for the isolated Codex client only.
 # Global ~/.codex is not modified.
 model = "{model}"
-model_reasoning_effort = "{thinking}"
-# Stream the model's reasoning live instead of a post-hoc summary.
+{reasoning_line}# Stream the model's reasoning live instead of a post-hoc summary.
 model_reasoning_summary = "detailed"
-# Routed models cannot serve Codex's compaction protocol (DeepSeek's response
-# shape does not match compaction v2), so disable automatic compaction.
-model_auto_compact_token_limit = 9000000000000
+# Compact at 80% of the selected model context window so long sessions do not
+# disable compaction or run into the provider limit.
+model_auto_compact_token_limit = {compact_limit}
 model_catalog_json = "{catalog_path}"
 # Auto-injected by Basiliskos: point the built-in OpenAI provider at the relay.
 openai_base_url = "http://127.0.0.1:{port}/v1"
 "#,
         model = model.replace('"', ""),
-        thinking = thinking.replace('"', ""),
+        reasoning_line = reasoning_line,
+        compact_limit = compact_limit,
         port = port,
         catalog_path = catalog_path.replace('\\', "/"),
     )
+}
+
+const CODEX_OWNED_CONFIG_KEYS: [&str; 7] = [
+    "model",
+    "model_reasoning_effort",
+    "model_reasoning_summary",
+    "model_auto_compact_token_limit",
+    "model_catalog_json",
+    "openai_base_url",
+    "model_provider",
+];
+
+fn top_level_toml_key(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') || trimmed.starts_with('[') || trimmed.starts_with(']') {
+        return None;
+    }
+    let key = trimmed.split_once('=')?.0.trim();
+    (!key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+    .then_some(key)
+}
+
+/// Updates only Basiliskos-owned top-level keys. Codex app settings and tables
+/// outside this allowlist remain byte-for-byte intact across route refreshes.
+fn merge_codex_config(existing: Option<&str>, generated: &str) -> String {
+    let generated_lines = generated
+        .lines()
+        .filter(|line| {
+            top_level_toml_key(line).is_some_and(|key| CODEX_OWNED_CONFIG_KEYS.contains(&key))
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let Some(existing) = existing else {
+        return generated.to_string();
+    };
+    let mut output = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut in_table = false;
+    let mut inserted_missing = false;
+    for line in existing.lines() {
+        if line.trim_start().starts_with('[') {
+            if !inserted_missing {
+                for generated_line in &generated_lines {
+                    if let Some(key) = top_level_toml_key(generated_line) {
+                        if seen.insert(key.to_string()) {
+                            output.push(generated_line.clone());
+                        }
+                    }
+                }
+                inserted_missing = true;
+            }
+            in_table = true;
+        }
+        if !in_table {
+            if let Some(key) = top_level_toml_key(line) {
+                if CODEX_OWNED_CONFIG_KEYS.contains(&key) {
+                    if let Some(replacement) = generated_lines
+                        .iter()
+                        .find(|candidate| top_level_toml_key(candidate) == Some(key))
+                    {
+                        output.push(replacement.clone());
+                        seen.insert(key.to_string());
+                    }
+                    continue;
+                }
+            }
+        }
+        output.push(line.to_string());
+    }
+    if !inserted_missing {
+        for line in generated_lines {
+            if let Some(key) = top_level_toml_key(&line) {
+                if seen.insert(key.to_string()) {
+                    output.push(line);
+                }
+            }
+        }
+    }
+    format!("{}\n", output.join("\n"))
 }
 
 /// Builds the `ModelsResponse` catalog for the isolated Codex picker: one
@@ -7421,6 +7797,7 @@ fn codex_catalog_models(
     active_provider: Option<&str>,
 ) -> Vec<Value> {
     let base_instructions = include_str!("../assets/codex-system-prompt.md");
+    let hidden = load_hidden_models().unwrap_or_default();
     let mut providers: Vec<&str> = Vec::new();
     if let Some(active) = active_provider {
         if enabled.contains(active) && SUPPORTED_PROVIDERS.contains(&active) {
@@ -7436,6 +7813,9 @@ fn codex_catalog_models(
     let mut models = Vec::new();
     for provider in providers {
         for spec in model_specs(provider) {
+            if hidden.contains(spec.id) {
+                continue;
+            }
             let context_window = context_window_for_route(provider, spec.id).unwrap_or(200_000);
             let reasoning_levels = spec
                 .thinking_levels
@@ -7480,18 +7860,19 @@ fn codex_catalog_models(
 fn write_isolated_codex_config(home: &Path, state: &ControllerState) -> Result<(), String> {
     secure_create_dir_all(home)?;
     let provider = state
-        .active_account
+        .active_codex_account
         .as_deref()
         .and_then(|file_name| account_provider(&Value::Null, file_name))
-        .ok_or_else(|| "Choose an account before opening Basiliskos Codex.".to_string())?;
-    let route = state
-        .routes
+        .ok_or_else(|| "Choose a Codex account before opening Basiliskos Codex.".to_string())?;
+    let default_route = state
+        .codex_routes
         .get(&provider)
         .cloned()
         .unwrap_or_else(|| RouteSelection {
             model: default_model(&provider).to_string(),
             thinking: "auto".into(),
         });
+    let (model, thinking) = (default_route.model, default_route.thinking);
     // Picker catalog: only models whose provider is currently authenticated,
     // so an un-authed provider (Claude with no credential) is never offered.
     let catalog = serde_json::json!({
@@ -7507,10 +7888,10 @@ fn write_isolated_codex_config(home: &Path, state: &ControllerState) -> Result<(
         .join("model-catalog.json")
         .to_string_lossy()
         .replace('\\', "/");
-    durable_write(
-        &home.join("config.toml"),
-        codex_config_toml(&route.model, &route.thinking, GATEWAY_PORT, &catalog_path).as_bytes(),
-    )?;
+    let generated_config = codex_config_toml(&model, &thinking, GATEWAY_PORT, &catalog_path);
+    let existing_config = fs::read_to_string(home.join("config.toml")).ok();
+    let merged_config = merge_codex_config(existing_config.as_deref(), &generated_config);
+    durable_write(&home.join("config.toml"), merged_config.as_bytes())?;
     // Seed auth.json only if missing — the provider authenticates to the
     // Basiliskos relay via env_key; the app's own login state is anchored
     // separately (anchored-account milestone).
@@ -7551,7 +7932,22 @@ fn seed_isolated_codex_auth_at(
     native["auth_mode"] = Value::String("chatgpt".into());
     let bytes = serde_json::to_vec_pretty(&native)
         .map_err(|error| format!("Could not serialize the anchored Codex credential: {error}"))?;
-    durable_write(&home.join("auth.json"), &bytes)?;
+    let destination = home.join("auth.json");
+    if let Ok(existing_raw) = fs::read_to_string(&destination) {
+        if let Ok(existing) = serde_json::from_str::<Value>(&existing_raw) {
+            let existing_access = existing
+                .get("tokens")
+                .and_then(|tokens| tokens.get("access_token"))
+                .or_else(|| existing.get("access_token"));
+            let native_access = native
+                .get("tokens")
+                .and_then(|tokens| tokens.get("access_token"));
+            if existing_access == native_access {
+                return Ok(false);
+            }
+        }
+    }
+    durable_write(&destination, &bytes)?;
     Ok(true)
 }
 
@@ -7791,9 +8187,9 @@ pub fn launch_hydra_codex_app(app: AppHandle) -> Result<GatewaySnapshot, String>
         restore_legacy_shared_config_if_needed(&mut state)?;
         if !list_accounts_inner(&state)?
             .iter()
-            .any(|account| account.active)
+            .any(|account| account.active_for_codex)
         {
-            return Err("Choose an account before opening Basiliskos Codex.".into());
+            return Err("Choose a Codex account before opening Basiliskos Codex.".into());
         }
         let home = isolated_codex_home()?;
         write_isolated_codex_config(&home, &state)?;
@@ -7898,7 +8294,7 @@ mod tests {
     use super::*;
     use crate::catalog::base_alias;
     use crate::usage::{unrecorded_usage_window, usage_window};
-    use crate::vision::text_from_vision_response;
+    use crate::vision::{replace_images_with_descriptions, text_from_vision_response};
 
     #[test]
     fn direct_update_requires_the_canonical_installer_and_checksum_entry() {
@@ -7949,6 +8345,7 @@ mod tests {
             label: label.into(),
             disabled,
             active: !disabled,
+            active_for_codex: false,
             cooldown_until_ms: None,
             expires_at_ms: None,
             credential_status: credential_status.into(),
@@ -8038,11 +8435,16 @@ mod tests {
                 .count(),
             2
         );
-        replace_images_with_description(&mut request, "A red square.");
+        replace_images_with_descriptions(
+            &mut request,
+            &["newest details".into(), "older details".into()],
+        );
         append_vision_presentation_guidance(&mut request).unwrap();
         let serialized = serde_json::to_string(&request).unwrap();
         assert!(!serialized.contains("base64"));
         assert_eq!(serialized.matches("Image details:").count(), 2);
+        assert!(serialized.contains("newest details"));
+        assert!(serialized.contains("older details"));
         assert!(!serialized.contains("Vision sidecar"));
         assert!(serialized.contains("Do not mention image processing"));
     }
@@ -8340,6 +8742,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: Some(auth_file_name.into()),
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -8373,7 +8777,7 @@ mod tests {
         assert!(config.contains("model = \"kimi-k3\""));
         assert!(config.contains("model_reasoning_effort = \"high\""));
         assert!(config.contains("model_reasoning_summary = \"detailed\""));
-        assert!(config.contains("model_auto_compact_token_limit = 9000000000000"));
+        assert!(config.contains("model_auto_compact_token_limit = 160000"));
         assert!(config.contains("model_catalog_json = \"C:/codex-profile/model-catalog.json\""));
         // opencodex-proven loopback form: keep the built-in openai provider and
         // redirect it with root openai_base_url (the app's renderer allowlist
@@ -8381,9 +8785,30 @@ mod tests {
         assert!(config.contains("openai_base_url = \"http://127.0.0.1:8317/v1\""));
         assert!(!config.contains("model_provider"));
         assert!(!config.contains("[model_providers."));
-        // "auto" thinking (the Basiliskos default) maps to a concrete Codex effort.
+        // "auto" omits the effort key so the model's native default applies.
         let auto = codex_config_toml("grok-4.5", "auto", 8317, "C:/model-catalog.json");
-        assert!(auto.contains("model_reasoning_effort = \"high\""));
+        assert!(!auto.contains("model_reasoning_effort"));
+    }
+
+    #[test]
+    fn codex_config_merge_preserves_user_settings_and_replaces_only_owned_keys() {
+        let generated = codex_config_toml("gpt-5.6-terra", "auto", 8317, "C:/catalog.json");
+        let existing = "approval_policy = \"never\"\nmodel = \"old\"\nopenai_base_url = \"https://old.invalid/v1\"\n[profiles.default]\nmodel = \"user-model\"\n";
+        let merged = merge_codex_config(Some(existing), &generated);
+        assert!(merged.contains("approval_policy = \"never\""));
+        assert!(merged.contains("[profiles.default]"));
+        assert!(merged.contains("model = \"gpt-5.6-terra\""));
+        assert!(!merged.contains("model = \"old\""));
+        assert!(!merged.contains("https://old.invalid"));
+        assert!(merged.contains("model_auto_compact_token_limit = 160000"));
+        let table_first = merge_codex_config(
+            Some("[profiles.default]\nmodel = \"user-model\"\n"),
+            &generated,
+        );
+        assert!(
+            table_first.find("model = \"gpt-5.6-terra\"").unwrap()
+                < table_first.find("[profiles.default]").unwrap()
+        );
     }
 
     #[test]
@@ -8466,6 +8891,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: Some("kimi-1.json".into()),
+            active_codex_account: Some("kimi-1.json".into()),
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -8506,6 +8933,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: Some("kimi-1.json".into()),
+            active_codex_account: Some("kimi-1.json".into()),
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -8538,6 +8967,9 @@ mod tests {
         let seeded =
             seed_isolated_codex_auth_at(&home, &auth, "codex-anchor@example.com.json").unwrap();
         assert!(seeded);
+        assert!(
+            !seed_isolated_codex_auth_at(&home, &auth, "codex-anchor@example.com.json").unwrap()
+        );
         let native: Value =
             serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(native["auth_mode"], "chatgpt");
@@ -8564,6 +8996,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -8930,6 +9364,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: Some("xai-test.json".into()),
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -8960,6 +9396,8 @@ mod tests {
             claude_config_id: "hydra-id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9011,6 +9449,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9087,6 +9527,8 @@ mod tests {
             claude_config_id: "hydra-id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9204,6 +9646,8 @@ mod tests {
             claude_config_id: "hydra-id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9226,6 +9670,8 @@ mod tests {
             claude_config_id: "hydra-id".into(),
             previous_claude_applied_id: None,
             active_account: Some("xai-test.json".into()),
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9267,6 +9713,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: Some("xai-test.json".into()),
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9397,6 +9845,7 @@ mod tests {
             label: provider.into(),
             disabled,
             active: false,
+            active_for_codex: false,
             cooldown_until_ms: None,
             expires_at_ms: None,
             credential_status: "unknown".into(),
@@ -9412,15 +9861,24 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
             open_claude_on_launch: true,
         };
         fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
-        let (mutations, _) =
-            selection_transaction(&root, &auth, &state_path, &accounts, &state, "xai-b.json")
-                .unwrap();
+        let (mutations, _) = selection_transaction(
+            &root,
+            &auth,
+            &state_path,
+            &accounts,
+            &state,
+            ClientSurface::Claude,
+            "xai-b.json",
+        )
+        .unwrap();
         run_transaction(&root, &mutations, || {
             validate_account_invariant(&auth, &state_path)
         })
@@ -9454,6 +9912,7 @@ mod tests {
             label: provider.into(),
             disabled: true,
             active: false,
+            active_for_codex: false,
             cooldown_until_ms: None,
             expires_at_ms: None,
             credential_status: "unknown".into(),
@@ -9493,6 +9952,151 @@ mod tests {
     }
 
     #[test]
+    fn controller_state_migration_adds_codex_defaults_without_changing_claude_state() {
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: Some("claude-a.json".into()),
+            active_codex_account: None,
+            routes: BTreeMap::from([(
+                "claude".into(),
+                RouteSelection {
+                    model: "claude-sonnet-4-5-20250929".into(),
+                    thinking: "high".into(),
+                },
+            )]),
+            codex_routes: BTreeMap::new(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+            open_claude_on_launch: true,
+        };
+        let migrated = migrate_controller_state(state);
+        assert_eq!(migrated.active_account.as_deref(), Some("claude-a.json"));
+        assert_eq!(
+            migrated
+                .routes
+                .get("claude")
+                .map(|route| route.model.as_str()),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert_eq!(migrated.codex_routes, default_routes());
+    }
+
+    #[test]
+    fn codex_selection_changes_only_codex_surface_state() {
+        let root = temp_dir("codex-selection-surface");
+        let auth = root.join("auth");
+        fs::create_dir_all(&auth).unwrap();
+        for (file_name, provider) in [("claude-a.json", "claude"), ("xai-b.json", "xai")] {
+            fs::write(
+                auth.join(file_name),
+                serde_json::json!({ "type": provider, "disabled": false }).to_string(),
+            )
+            .unwrap();
+        }
+        let accounts = vec![
+            GatewayAccount {
+                file_name: "claude-a.json".into(),
+                provider: "claude".into(),
+                email: None,
+                label: "Claude".into(),
+                disabled: false,
+                active: true,
+                active_for_codex: false,
+                cooldown_until_ms: None,
+                expires_at_ms: None,
+                credential_status: "unknown".into(),
+            },
+            GatewayAccount {
+                file_name: "xai-b.json".into(),
+                provider: "xai".into(),
+                email: None,
+                label: "Grok".into(),
+                disabled: false,
+                active: false,
+                active_for_codex: false,
+                cooldown_until_ms: None,
+                expires_at_ms: None,
+                credential_status: "unknown".into(),
+            },
+        ];
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: Some("claude-a.json".into()),
+            active_codex_account: None,
+            routes: default_routes(),
+            codex_routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+            open_claude_on_launch: true,
+        };
+        let state_path = root.join("controller.json");
+        let (_, next) = selection_transaction(
+            &root,
+            &auth,
+            &state_path,
+            &accounts,
+            &state,
+            ClientSurface::Codex,
+            "xai-b.json",
+        )
+        .unwrap();
+        assert_eq!(next.active_account.as_deref(), Some("claude-a.json"));
+        assert_eq!(next.active_codex_account.as_deref(), Some("xai-b.json"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cross_surface_same_provider_selection_requires_same_account() {
+        let root = temp_dir("codex-selection-conflict");
+        let auth = root.join("auth");
+        fs::create_dir_all(&auth).unwrap();
+        for file_name in ["xai-a.json", "xai-b.json"] {
+            fs::write(auth.join(file_name), br#"{"type":"xai","disabled":false}"#).unwrap();
+        }
+        let account = |file_name: &str| GatewayAccount {
+            file_name: file_name.into(),
+            provider: "xai".into(),
+            email: None,
+            label: file_name.into(),
+            disabled: false,
+            active: file_name == "xai-a.json",
+            active_for_codex: false,
+            cooldown_until_ms: None,
+            expires_at_ms: None,
+            credential_status: "unknown".into(),
+        };
+        let accounts = vec![account("xai-a.json"), account("xai-b.json")];
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: Some("xai-a.json".into()),
+            active_codex_account: None,
+            routes: default_routes(),
+            codex_routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+            open_claude_on_launch: true,
+        };
+        let error = selection_transaction(
+            &root,
+            &auth,
+            &root.join("controller.json"),
+            &accounts,
+            &state,
+            ClientSurface::Codex,
+            "xai-b.json",
+        )
+        .unwrap_err();
+        assert!(error.contains("share one enabled xai credential"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn account_selection_rolls_back_every_write_failure() {
         for fail_after in 0..3 {
             let root = temp_dir("account-selection-failure");
@@ -9510,6 +10114,8 @@ mod tests {
                 claude_config_id: "id".into(),
                 previous_claude_applied_id: None,
                 active_account: Some("codex-a.json".into()),
+                active_codex_account: None,
+                codex_routes: default_routes(),
                 routes: default_routes(),
                 claude_window_icon: default_claude_window_icon(),
                 skip_model_switch_confirmation: false,
@@ -9525,6 +10131,7 @@ mod tests {
                     label: "Codex".into(),
                     disabled: false,
                     active: true,
+                    active_for_codex: false,
                     cooldown_until_ms: None,
                     expires_at_ms: None,
                     credential_status: "unknown".into(),
@@ -9536,14 +10143,22 @@ mod tests {
                     label: "Grok".into(),
                     disabled: true,
                     active: false,
+                    active_for_codex: false,
                     cooldown_until_ms: None,
                     expires_at_ms: None,
                     credential_status: "unknown".into(),
                 },
             ];
-            let (mutations, _) =
-                selection_transaction(&root, &auth, &state_path, &accounts, &state, "xai-b.json")
-                    .unwrap();
+            let (mutations, _) = selection_transaction(
+                &root,
+                &auth,
+                &state_path,
+                &accounts,
+                &state,
+                ClientSurface::Claude,
+                "xai-b.json",
+            )
+            .unwrap();
             assert!(crate::persistence::run_transaction_with_fault(
                 &root,
                 &mutations,
@@ -9586,6 +10201,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: Some("codex-a.json".into()),
+            active_codex_account: Some("codex-a.json".into()),
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9607,6 +10224,7 @@ mod tests {
                 label: "Codex".into(),
                 disabled: false,
                 active: true,
+                active_for_codex: true,
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: "unknown".into(),
@@ -9618,6 +10236,7 @@ mod tests {
                 label: "Grok".into(),
                 disabled: true,
                 active: false,
+                active_for_codex: false,
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: "unknown".into(),
@@ -9853,6 +10472,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9870,8 +10491,9 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "web_search"}
         });
         rewrite_claude_request(&mut request, &state, "xai", true).unwrap();
-        assert!(request.get("tools").is_none());
-        assert!(request.get("tool_choice").is_none());
+        assert_eq!(request["tools"][0]["type"].as_str(), Some("x_search"));
+        assert_eq!(request["tools"][0]["name"].as_str(), Some("x_search"));
+        assert_eq!(request["tool_choice"]["name"].as_str(), Some("x_search"));
         let identity = request["system"][0]["text"].as_str().unwrap();
         assert!(identity.contains("Grok Build"));
     }
@@ -9883,6 +10505,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9898,9 +10522,10 @@ mod tests {
         });
         rewrite_claude_request(&mut request, &state, "xai", true).unwrap();
         let tools = request.get("tools").and_then(Value::as_array).unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"].as_str(), Some("some_other_tool"));
-        assert!(request.get("tool_choice").is_none());
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"].as_str(), Some("x_search"));
+        assert_eq!(tools[1]["name"].as_str(), Some("some_other_tool"));
+        assert_eq!(request["tool_choice"]["name"].as_str(), Some("x_search"));
     }
 
     #[test]
@@ -9910,6 +10535,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -9945,6 +10572,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -10065,6 +10694,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: Some("xai-test.json".into()),
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -10097,6 +10728,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -10130,6 +10763,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -10157,6 +10792,20 @@ mod tests {
 
     #[test]
     fn relay_faults_have_stable_upstream_classifications() {
+        assert_eq!(request_surface("/v1/messages"), Some(ClientSurface::Claude));
+        assert_eq!(
+            request_surface("/v1/messages/count_tokens"),
+            Some(ClientSurface::Claude)
+        );
+        assert_eq!(request_surface("/v1/responses"), Some(ClientSurface::Codex));
+        assert_eq!(
+            request_surface("/v1/responses/compact"),
+            Some(ClientSurface::Codex)
+        );
+        assert_eq!(
+            request_surface("/v1/chat/completions"),
+            Some(ClientSurface::Codex)
+        );
         assert_eq!(
             classify_upstream_status(401),
             Some(ErrorCode::ProviderAuthFailed)
@@ -10172,7 +10821,7 @@ mod tests {
         assert_eq!(classify_upstream_status(200), None);
         assert_eq!(
             classify_upstream_status(402),
-            Some(ErrorCode::ProviderAuthFailed)
+            Some(ErrorCode::ProviderQuotaExhausted)
         );
         assert_eq!(
             classify_upstream_status(403),
@@ -10235,18 +10884,28 @@ mod tests {
         let none_hidden = BTreeSet::new();
         let ids = |visible: Vec<&ModelSpec>| visible.iter().map(|spec| spec.id).collect::<Vec<_>>();
         assert_eq!(
-            ids(filter_visible_models(SPECS, "model-a", &none_hidden, None)),
+            ids(filter_visible_models(
+                "provider",
+                SPECS,
+                "model-a",
+                &none_hidden,
+                None
+            )),
             vec!["model-a", "model-b", "model-c"]
         );
 
         // A manually-hidden model disappears, unless it's the current selection.
         let hidden_b = BTreeSet::from(["model-b".to_string()]);
         assert_eq!(
-            ids(filter_visible_models(SPECS, "model-a", &hidden_b, None)),
+            ids(filter_visible_models(
+                "provider", SPECS, "model-a", &hidden_b, None
+            )),
             vec!["model-a", "model-c"]
         );
         assert_eq!(
-            ids(filter_visible_models(SPECS, "model-b", &hidden_b, None)),
+            ids(filter_visible_models(
+                "provider", SPECS, "model-b", &hidden_b, None
+            )),
             vec!["model-a", "model-b", "model-c"]
         );
 
@@ -10254,6 +10913,7 @@ mod tests {
         let live = vec!["model-a".to_string(), "model-c".to_string()];
         assert_eq!(
             ids(filter_visible_models(
+                "provider",
                 SPECS,
                 "model-a",
                 &none_hidden,
@@ -10263,6 +10923,7 @@ mod tests {
         );
         assert_eq!(
             ids(filter_visible_models(
+                "provider",
                 SPECS,
                 "model-b",
                 &none_hidden,
@@ -10274,6 +10935,7 @@ mod tests {
         // Both filters combine.
         assert_eq!(
             ids(filter_visible_models(
+                "provider",
                 SPECS,
                 "model-a",
                 &hidden_b,
@@ -10293,6 +10955,7 @@ mod tests {
                 label: file_name.into(),
                 disabled: true,
                 active: false,
+                active_for_codex: false,
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: "unknown".into(),
@@ -10363,10 +11026,41 @@ mod tests {
             "codex-c.json".to_string(),
             now + chrono::Duration::seconds(30),
         );
-        assert!(
-            pick_failover_candidate(&accounts, "codex-a.json", "codex", &all_cooling, now)
-                .is_none()
+        // Expired or relogin_required candidates are skipped.
+        let mut expired_b = accounts.clone();
+        expired_b[1].credential_status = "expired".into();
+        assert_eq!(
+            pick_failover_candidate(&expired_b, "codex-a.json", "codex", &none_cooling, now)
+                .map(|account| account.file_name.as_str()),
+            Some("codex-c.json")
         );
+        let mut relogin_b = accounts.clone();
+        relogin_b[1].credential_status = "relogin_required".into();
+        assert_eq!(
+            pick_failover_candidate(&relogin_b, "codex-a.json", "codex", &none_cooling, now)
+                .map(|account| account.file_name.as_str()),
+            Some("codex-c.json")
+        );
+    }
+
+    #[test]
+    fn antigravity_model_mapping_keeps_models_visible_against_live_backend() {
+        let none_hidden = BTreeSet::new();
+        let live = vec![
+            "gemini-3.6-flash-high".to_string(),
+            "gemini-3.1-pro-low".to_string(),
+        ];
+        let visible = filter_visible_models(
+            "antigravity",
+            crate::catalog::ANTIGRAVITY_MODELS,
+            "gemini-3.7-flash",
+            &none_hidden,
+            Some(&live),
+        );
+        let ids: Vec<&str> = visible.iter().map(|s| s.id).collect();
+        assert!(ids.contains(&"gemini-3.7-flash"));
+        assert!(ids.contains(&"gemini-3.7-pro"));
+        assert!(!ids.contains(&"gemini-3.7-flash-lite"));
     }
 
     #[test]
@@ -10486,6 +11180,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: false,
@@ -10535,6 +11231,8 @@ mod tests {
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: default_routes(),
             claude_window_icon: default_claude_window_icon(),
             skip_model_switch_confirmation: true,
@@ -10802,6 +11500,7 @@ openai_base_url = "http://127.0.0.1:8317/v1"
                 label: provider.into(),
                 disabled,
                 active: false,
+                active_for_codex: false,
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: status.into(),
@@ -10853,6 +11552,8 @@ openai_base_url = "http://127.0.0.1:8317/v1"
             claude_config_id: "id".into(),
             previous_claude_applied_id: None,
             active_account: Some("kimi-a.json".into()),
+            active_codex_account: None,
+            codex_routes: default_routes(),
             routes: BTreeMap::from([(
                 "kimi".to_string(),
                 RouteSelection {
@@ -10901,6 +11602,8 @@ openai_base_url = "http://127.0.0.1:8317/v1"
             accounts: Vec::new(),
             active_account: None,
             routes: Vec::new(),
+            active_codex_account: None,
+            codex_routes: Vec::new(),
             deepseek_vision: DeepseekVisionPlan {
                 enabled: false,
                 transport: "none".into(),

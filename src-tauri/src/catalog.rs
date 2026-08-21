@@ -176,7 +176,7 @@ pub(crate) fn default_routes() -> BTreeMap<String, RouteSelection> {
 
 pub(crate) fn context_window_for_route(provider: &str, model: &str) -> Option<u64> {
     match (provider, model) {
-        ("xai", "grok-4.5") => Some(GROK_4_5_CONTEXT_WINDOW_TOKENS),
+        ("xai", "grok-4.5" | "grok-4.6") => Some(GROK_4_5_CONTEXT_WINDOW_TOKENS),
         _ => None,
     }
 }
@@ -189,7 +189,7 @@ pub(crate) struct ContextBudget {
 
 pub(crate) fn context_budget_for_request(provider: &str, request: &Value) -> Option<ContextBudget> {
     let model = request.get("model")?.as_str()?;
-    if provider != "xai" || !model.starts_with("grok-4.5") {
+    if provider != "xai" || !(model.starts_with("grok-4.5") || model.starts_with("grok-4.6")) {
         return None;
     }
     Some(ContextBudget {
