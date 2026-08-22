@@ -4,10 +4,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$version = '7.2.131'
+$version = '7.2.139'
 $archiveName = "CLIProxyAPI_${version}_windows_amd64.zip"
-$archiveSha256 = '99cc6a185012f01396e2bad3f3ba902bf1455e82fa1630d652ab818b77ed2384'
-$exeSha256 = '05f0c7bc700c54e0b031838c52b753a052e3ce167fdb7b47b99c3b1ee4d26f34'
+$archiveSha256 = 'e35a473db154d32358d5a4127c8df2e75f9a1a3a7e2d2c334942363ab91d263e'
+$exeSha256 = '457d717382189c38a2641dd5ae3b467c86b4cdb5b1833d5c289375fb4a86cf0b'
 $downloadUrl = "https://github.com/router-for-me/CLIProxyAPI/releases/download/v$version/$archiveName"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $resourceDir = Join-Path $projectRoot 'src-tauri\resources\gateway'

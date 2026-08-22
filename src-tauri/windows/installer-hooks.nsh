@@ -11,28 +11,31 @@
 !macro NSIS_HOOK_PREINSTALL
   ; Tauri's generated downgrade comparison is populated by a UI page that does
   ; not run for /S installs. Enforce the same policy before touching any files
-  ; so unattended deployment cannot replace a newer Basiliskos installation.
+  ; so unattended deployment cannot replace a newer BasiliskOS installation.
   ReadRegStr $R8 SHCTX "${UNINSTKEY}" "DisplayVersion"
   ${If} $R8 != ""
     nsis_tauri_utils::SemverCompare "${VERSION}" $R8
     Pop $R7
     ${If} $R7 = -1
-      Abort "A newer Basiliskos version is already installed."
+      Abort "A newer BasiliskOS version is already installed."
     ${EndIf}
   ${EndIf}
 
-  ; Tauri's per-machine default is Program Files\Basiliskos. Basiliskos ships
+  ; Tauri's per-machine default is Program Files\BasiliskOS. BasiliskOS ships
   ; under the shared 3ReadyLab publisher directory. Preserve a genuinely custom
   ; user-selected directory, but migrate either historical default first so the
   ; machine cannot retain duplicate binaries or stale shortcuts.
+  StrCpy $R9 0
   ${If} "$INSTDIR" == "$PROGRAMFILES64\${PRODUCTNAME}"
     !insertmacro BASILISKOS_REMOVE_LEGACY "$PROGRAMFILES64\${PRODUCTNAME}"
     !insertmacro BASILISKOS_REMOVE_LEGACY "$LOCALAPPDATA\${PRODUCTNAME}"
     StrCpy $INSTDIR "$PROGRAMFILES64\3ReadyLab\${PRODUCTNAME}"
+    StrCpy $R9 1
   ${ElseIf} "$INSTDIR" == "$PROGRAMFILES\${PRODUCTNAME}"
     !insertmacro BASILISKOS_REMOVE_LEGACY "$PROGRAMFILES\${PRODUCTNAME}"
     !insertmacro BASILISKOS_REMOVE_LEGACY "$LOCALAPPDATA\${PRODUCTNAME}"
     StrCpy $INSTDIR "$PROGRAMFILES\3ReadyLab\${PRODUCTNAME}"
+    StrCpy $R9 1
   ${ElseIf} "$INSTDIR" == "$LOCALAPPDATA\${PRODUCTNAME}"
     !insertmacro BASILISKOS_REMOVE_LEGACY "$LOCALAPPDATA\${PRODUCTNAME}"
     ${If} ${RunningX64}
@@ -40,14 +43,33 @@
     ${Else}
       StrCpy $INSTDIR "$PROGRAMFILES\3ReadyLab\${PRODUCTNAME}"
     ${EndIf}
+    StrCpy $R9 1
   ${ElseIf} "$INSTDIR" == "$PROGRAMFILES64\3ReadyLab\${PRODUCTNAME}"
     ; A repair or an interrupted migration can already have persisted the new
     ; install directory while leaving a historical binary behind.
     !insertmacro BASILISKOS_REMOVE_LEGACY "$PROGRAMFILES64\${PRODUCTNAME}"
     !insertmacro BASILISKOS_REMOVE_LEGACY "$LOCALAPPDATA\${PRODUCTNAME}"
+    StrCpy $R9 1
   ${ElseIf} "$INSTDIR" == "$PROGRAMFILES\3ReadyLab\${PRODUCTNAME}"
     !insertmacro BASILISKOS_REMOVE_LEGACY "$PROGRAMFILES\${PRODUCTNAME}"
     !insertmacro BASILISKOS_REMOVE_LEGACY "$LOCALAPPDATA\${PRODUCTNAME}"
+    StrCpy $R9 1
+  ${EndIf}
+
+  ; The product renamed from "Basiliskos" to "BasiliskOS". Windows paths are
+  ; case-insensitive, so an upgrade reuses the historical directory but NTFS
+  ; keeps its original on-disk casing. When installing into a PRODUCTNAME path,
+  ; read the real casing back via GetLongPathNameW and bounce the directory
+  ; through a temporary name so Program Files shows "BasiliskOS". A locked
+  ; directory keeps the old casing - cosmetic only, never fatal.
+  ${If} $R9 = 1
+    System::Call 'kernel32::GetLongPathNameW(t "$INSTDIR", t .R7, i ${NSIS_MAX_STRLEN}) i .R6'
+    ${If} $R6 > 0
+      StrCmpS "$R7" "$INSTDIR" basiliskos_recase_done 0
+      Rename "$INSTDIR" "$INSTDIR._basiliskos-recase"
+      Rename "$INSTDIR._basiliskos-recase" "$INSTDIR"
+      basiliskos_recase_done:
+    ${EndIf}
   ${EndIf}
 
   ; Tauri calls SetOutPath before this hook. If the hook changes $INSTDIR,

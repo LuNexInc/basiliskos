@@ -16,6 +16,7 @@ mod persistence;
 #[cfg(test)]
 mod test_support;
 mod usage;
+mod vault;
 mod vision;
 
 const TRAY_DASHBOARD_LABEL: &str = "tray-dashboard";
@@ -87,7 +88,7 @@ fn ensure_tray_dashboard(app: &AppHandle) -> Result<tauri::WebviewWindow, String
         TRAY_DASHBOARD_LABEL,
         WebviewUrl::App("index.html".into()),
     )
-    .title("Basiliskos")
+    .title("BasiliskOS")
     .inner_size(TRAY_DASHBOARD_WIDTH, TRAY_DASHBOARD_HEIGHT)
     .decorations(false)
     .resizable(false)
@@ -208,7 +209,7 @@ pub fn run() {
 
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().cloned().expect("app icon"))
-                .tooltip("Basiliskos")
+                .tooltip("BasiliskOS")
                 // Right-click opens the visual dashboard; do not attach a native menu.
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {
@@ -251,12 +252,13 @@ pub fn run() {
             gateway::stop_gateway,
             gateway::select_gateway_account,
             gateway::rename_gateway_account,
+            gateway::add_api_key_account,
+            gateway::get_api_key_account_models,
             gateway::get_gateway_account_usage,
             gateway::set_gateway_route,
             gateway::remove_gateway_account,
             gateway::launch_provider_login,
             gateway::cancel_provider_login,
-            gateway::add_deepseek_account,
             gateway::set_skip_model_switch_confirmation,
             gateway::set_open_claude_on_launch,
             gateway::get_model_catalog,

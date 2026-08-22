@@ -41,6 +41,6 @@ describe("tray dashboard preview render", () => {
     expect(screen.getAllByText("Stop relay").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Close Claude").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Open full window").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Quit Basiliskos").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Quit BasiliskOS").length).toBeGreaterThan(0);
   });
 });

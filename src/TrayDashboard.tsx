@@ -13,7 +13,17 @@ import brandArt from "./assets/basiliskos-mark.png";
 import { contextWindowLabel, messageFrom, statusTone, thinkingLabel } from "./ui";
 import { APP_VERSION } from "./App";
 
-type Provider = "claude" | "codex" | "xai" | "kimi" | "deepseek" | "antigravity";
+type Provider =
+  | "claude"
+  | "codex"
+  | "xai"
+  | "kimi"
+  | "antigravity"
+  | "deepseek"
+  | "opencode"
+  | "openrouter"
+  | "litellm"
+  | "custom";
 
 type Account = {
   fileName: string;
@@ -22,6 +32,8 @@ type Account = {
   label: string;
   active: boolean;
   activeForCodex: boolean;
+  auth?: "oauth" | "api_key";
+  baseUrl?: string;
 };
 
 type UsageWindow = {
@@ -365,13 +377,13 @@ export default function TrayDashboard() {
             }
           : current,
       );
-      setMessage("Opened Basiliskos Claude");
+      setMessage("Opened BasiliskOS Claude");
       return;
     }
     setBusy("claude");
     try {
       setSnapshot(await invoke<Snapshot>("launch_hydra_claude"));
-      setMessage("Opened Basiliskos Claude");
+      setMessage("Opened BasiliskOS Claude");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -392,13 +404,13 @@ export default function TrayDashboard() {
             }
           : current,
       );
-      setMessage("Closed Basiliskos Claude");
+      setMessage("Closed BasiliskOS Claude");
       return;
     }
     setBusy("claude");
     try {
       setSnapshot(await invoke<Snapshot>("stop_hydra_claude"));
-      setMessage("Closed Basiliskos Claude");
+      setMessage("Closed BasiliskOS Claude");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -449,7 +461,7 @@ export default function TrayDashboard() {
   }
 
   return (
-    <main className={`tray-shell${systemsLive ? " systems-live" : ""}`} aria-label="Basiliskos tray dashboard">
+    <main className={`tray-shell${systemsLive ? " systems-live" : ""}`} aria-label="BasiliskOS tray dashboard">
       <div className="tray-starfield" aria-hidden="true" />
       <div className="tray-scan" aria-hidden="true" />
 
@@ -575,7 +587,7 @@ export default function TrayDashboard() {
         </button>
         <button type="button" className="danger" onClick={() => void quit()} disabled={busy !== null}>
           {busy === "quit" ? <LoaderCircle className="spin" size={15} /> : <Power size={15} />}
-          Quit Basiliskos
+          Quit BasiliskOS
         </button>
       </section>
 

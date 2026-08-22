@@ -22,15 +22,26 @@ foreach ($required in @(
     'ReadRegStr $R8 SHCTX "${UNINSTKEY}" "DisplayVersion"',
     'nsis_tauri_utils::SemverCompare "${VERSION}" $R8',
     '${If} $R7 = -1',
-    'Abort "A newer Basiliskos version is already installed."',
+    'Abort "A newer BasiliskOS version is already installed."',
     '$PROGRAMFILES64\3ReadyLab\${PRODUCTNAME}',
     '$PROGRAMFILES\3ReadyLab\${PRODUCTNAME}',
     '$PROGRAMFILES64\${PRODUCTNAME}',
-    '$LOCALAPPDATA\${PRODUCTNAME}'
+    '$LOCALAPPDATA\${PRODUCTNAME}',
+    'GetLongPathNameW',
+    'StrCmpS "$R7" "$INSTDIR"',
+    'Rename "$INSTDIR" "$INSTDIR._basiliskos-recase"'
 )) {
     if ($body.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
         throw "The installer migration hook is missing required path coverage: $required"
     }
+}
+
+# The case-only rename (Basiliskos -> BasiliskOS) needs the recase bounce to
+# run before extraction, and extraction must still target the final $INSTDIR.
+$recaseIndex = $body.IndexOf('basiliskos_recase_done', [StringComparison]::Ordinal)
+if ($recaseIndex -lt 0 -or
+    $recaseIndex -gt $resetExtractionDirectory) {
+    throw 'The directory recase step must exist inside PREINSTALL before SetOutPath.'
 }
 
 $postInstallMatch = [regex]::Match(

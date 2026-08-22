@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="docs/media/basiliskos-hero.svg" alt="Basiliskos — one isolated Claude Code window, five switchable backends: Claude, Codex, Grok, Kimi, and DeepSeek" width="100%">
+  <img src="docs/media/basiliskos-hero.svg" alt="Basiliskos — one isolated Claude Code window, four switchable backends: Claude, Codex, Grok, and Kimi" width="100%">
 </p>
 
 Open a separate Basiliskos-owned Claude Code Windows app and switch the
-authorized account serving it: Claude, Codex, Grok Build, Kimi Code, or DeepSeek. Your normal Claude
+authorized account serving it: Claude, Codex, Grok Build, Kimi Code, or Antigravity. Your normal Claude
 app remains untouched.
 
 Inside that isolated window, Basiliskos keeps the selected real engine visible
@@ -21,7 +21,7 @@ limits, or automate approval pages.
 ## How it works
 
 <p align="center">
-  <img src="docs/media/basiliskos-flow.svg" alt="Basiliskos's isolated Claude Code Windows app talks to the Basiliskos relay on 127.0.0.1:8317, which forwards to the selected backend: a Claude OAuth account, a Codex OAuth account, a Grok OAuth account, a Kimi Code OAuth account, or a DeepSeek API key" width="760">
+  <img src="docs/media/basiliskos-flow.svg" alt="Basiliskos's isolated Claude Code Windows app talks to the Basiliskos relay on 127.0.0.1:8317, which forwards to the selected backend: a Claude OAuth account, a Codex OAuth account, a Grok OAuth account, a Kimi Code OAuth account, or a Google Antigravity OAuth account" width="760">
 </p>
 
 Basiliskos launches the installed Claude app with `CLAUDE_USER_DATA_DIR`
@@ -40,9 +40,6 @@ request.
 2. Choose **Claude**, **Codex**, **Grok**, or **Kimi**, then select **Add account**.
 3. Basiliskos opens the provider's validated HTTPS OAuth URL in your default
    browser. Kimi also shows its one-time device code. Finish the official login
-   there. **DeepSeek** has no OAuth flow: choose it and select **Add API key**,
-   then paste a key from platform.deepseek.com. Basiliskos verifies the key with
-   DeepSeek before saving it locally.
 4. Basiliskos automatically opens its own isolated Claude window after an
    account is selected. You can also choose **Open Basiliskos Claude**.
 5. Use **Use account** whenever you want to change the backend underneath the
@@ -54,7 +51,7 @@ request.
    including Kimi Code's weekly and rolling quota windows when Kimi returns
    them. If a signed-in Kimi account has no Kimi Code subscription, the
    account card shows **No active Kimi Code subscription** instead of a
-   misleading re-auth error. DeepSeek bills a prepaid balance rather than a
+   misleading re-auth error. Antigravity quota is managed externally rather than a
    quota window, so it reports no usage percentage.
 
 Basiliskos never applies its relay to `%LOCALAPPDATA%\Claude-3p`. Version 1.0.1
@@ -86,7 +83,7 @@ pnpm test:all
 pnpm bundle
 ```
 
-`prepare-gateway.ps1` downloads CLIProxyAPI v7.2.128 at build time and verifies
+`prepare-gateway.ps1` downloads CLIProxyAPI v7.2.139 at build time and verifies
 both the release archive and executable SHA-256 before bundling it. The binary
 is not committed to Git. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -100,15 +97,15 @@ evidence. Windows will show `Unknown publisher` for unsigned installers.
 
 This fork is isolated from `../grok-hydra`; the original project remains
 unchanged. Basiliskos is MIT licensed and is not affiliated with Anthropic,
-OpenAI, xAI, Moonshot AI, DeepSeek, or CLIProxyAPI.
+OpenAI, xAI, Moonshot AI, or CLIProxyAPI.
 
 ## Roadmap
 
-A multi-provider catalog scaffold (OpenRouter, Ollama, Gemini, Azure, and
-custom OpenAI-compatible providers) is designed but not shipped. Its spec
-lives in [docs/OPENCODEX-SCAFFOLD.md](docs/OPENCODEX-SCAFFOLD.md). Live
-requests use only the five backends above until a later milestone enables
-catalog routing.
+API-key providers (DeepSeek, OpenCode Go, OpenRouter, LiteLLM, and custom
+OpenAI-compatible endpoints) are first-class behind the `Provider × Auth`
+model, alongside the OAuth accounts above. See
+[docs/PROVIDER-BACKEND-ADAPTERS.md](docs/PROVIDER-BACKEND-ADAPTERS.md) for the
+adapter seam and the known gaps pending CLIProxyAPI verification.
 
 ## Support
 

@@ -111,7 +111,7 @@ describe("login completion respects the active account", () => {
         case "latest_basiliskos_release":
           return {
             tagName: "v2.2.9",
-            name: "Basiliskos v2.2.9",
+            name: "BasiliskOS v2.2.9",
             body: "",
             publishedAt: "",
             releaseUrl: "https://github.com/LuNexInc/basiliskos/releases/tag/v2.2.9",

@@ -1,11 +1,12 @@
 {
   "name": "hydra-gateway",
   "private": true,
-  "version": "2.6.1",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
     "prepare:gateway": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-gateway.ps1",
     "test:gateway": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-gateway.ps1",
+    "test:cliproxy": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-cliproxy.ps1",
     "test:format": "cargo fmt --manifest-path src-tauri/Cargo.toml -- --check",
     "test:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
     "test:surface": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-command-surface.ps1",
@@ -14,7 +15,7 @@
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features",
     "test:secrets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-sensitive-data.ps1 -SelfTest",
     "test:log-secrets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-runtime-log-secrets.ps1 -SelfTest",
-    "test:all": "pnpm build && pnpm test:ui && pnpm test:format && pnpm test:clippy && pnpm test:rust && pnpm test:surface && pnpm test:installer && pnpm test:gateway && pnpm test:secrets && pnpm test:log-secrets",
+    "test:all": "pnpm build && pnpm test:ui && pnpm test:format && pnpm test:clippy && pnpm test:rust && pnpm test:surface && pnpm test:installer && pnpm test:gateway && pnpm test:cliproxy && pnpm test:secrets && pnpm test:log-secrets",
     "bundle": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri-build.ps1",
     "dev": "vite",
     "build": "tsc && vite build",

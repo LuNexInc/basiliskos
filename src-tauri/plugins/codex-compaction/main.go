@@ -65,10 +65,7 @@ type pluginState struct {
 }
 
 type pluginConfig struct {
-	MaxConcurrency       int    `yaml:"max_concurrency"`
-	AuthDir              string `yaml:"auth_dir"`
-	DeepSeekResponsesURL string `yaml:"deepseek_responses_url"`
-	VisionURL            string `yaml:"vision_url"`
+	MaxConcurrency int `yaml:"max_concurrency"`
 }
 
 type envelope struct {
@@ -263,53 +260,10 @@ func interceptBeforeAuth(raw []byte) ([]byte, error) {
 		return terminatedResponse(http.StatusTooManyRequests, "plugin concurrency limit reached", http.Header{"Retry-After": {"1"}})
 	}
 	state.active[req.RequestID] = struct{}{}
-	authDir := state.config.AuthDir
-	hopURL := state.config.DeepSeekResponsesURL
-	visionURL := state.config.VisionURL
 	state.mu.Unlock()
 
 	merged := mergeCodexAppTools(req.Body)
-	if hop, handled, hopErr := maybeHopDeepSeekResponses(req, merged, authDir, hopURL, visionURL); handled {
-		return hop, hopErr
-	}
 	return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: merged})
-}
-
-func maybeHopDeepSeekResponses(req pluginapi.RequestInterceptRequest, body []byte, authDir, hopURL, visionURL string) ([]byte, bool, error) {
-	model := requestModel(pluginapiRequestModel{Model: req.Model, RequestedModel: req.RequestedModel}, body)
-	if !isDeepSeekResponsesRequest(model, body) {
-		return nil, false, nil
-	}
-	sanitized, errSanitize := sanitizeDeepSeekResponsesBody(body)
-	if errSanitize != nil {
-		return nil, true, errSanitize
-	}
-	if responsesHasImages(sanitized) {
-		token := requestRelayToken(req.Headers)
-		described, errVision := describeAndReplaceResponsesImages(sanitized, visionURL, token, deepSeekHTTP)
-		if errVision != nil {
-			appendMarker("DEEPSEEK_RESPONSES_HOP vision_failed model=" + model)
-			raw, errTerm := terminatedResponse(http.StatusBadGateway, "Basiliskos could not obtain an image description from any configured OAuth vision provider.", nil)
-			return raw, true, errTerm
-		}
-		sanitized = described
-		appendMarker("DEEPSEEK_RESPONSES_HOP vision_ok model=" + model)
-	}
-	key, errKey := loadEnabledDeepSeekAPIKey(authDir)
-	if errKey != nil {
-		appendMarker("DEEPSEEK_RESPONSES_HOP missing_key model=" + model)
-		raw, errTerm := terminatedResponse(http.StatusUnauthorized, "DeepSeek Responses hop has no enabled API key.", nil)
-		return raw, true, errTerm
-	}
-	status, headers, payload, errHop := hopDeepSeekResponses(sanitized, key, hopURL, deepSeekHTTP)
-	if errHop != nil {
-		appendMarker("DEEPSEEK_RESPONSES_HOP transport_error model=" + model)
-		raw, errTerm := terminatedResponse(http.StatusBadGateway, "DeepSeek Responses hop failed.", nil)
-		return raw, true, errTerm
-	}
-	appendMarker(fmt.Sprintf("DEEPSEEK_RESPONSES_HOP model=%s status=%d", model, status))
-	raw, errTerm := terminatedRawResponse(status, headers, payload)
-	return raw, true, errTerm
 }
 
 func passThroughRequest(raw []byte) ([]byte, error) {

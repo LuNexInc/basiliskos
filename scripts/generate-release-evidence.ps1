@@ -8,12 +8,16 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $version = (Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json).version
 $application = Join-Path $ArtifactRoot 'hydra-gateway.exe'
-$installer = Join-Path $ArtifactRoot "bundle\nsis\Basiliskos_${version}_x64-setup.exe"
+# The installer file name follows productName (BasiliskOS since the 2.6.x
+# rename). Resolve it by pattern so a future product-name tweak cannot break
+# evidence generation again.
+$installer = Get-ChildItem -LiteralPath (Join-Path $ArtifactRoot 'bundle\nsis') -Filter '*_x64-setup.exe' -File -ErrorAction SilentlyContinue |
+    Select-Object -First 1 -ExpandProperty FullName
 $artifacts = @(
     if (Test-Path -LiteralPath $application -PathType Leaf) {
         Get-Item -LiteralPath $application
     }
-    if (Test-Path -LiteralPath $installer -PathType Leaf) {
+    if ($installer -and (Test-Path -LiteralPath $installer -PathType Leaf)) {
         Get-Item -LiteralPath $installer
     }
 )

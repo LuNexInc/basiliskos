@@ -57,9 +57,10 @@ func TestSynthesizeCompactionSSE(t *testing.T) {
 	if !strings.Contains(s, "response.completed") {
 		t.Fatal("response.completed missing")
 	}
-	// exactly one compaction item
-	if strings.Count(s, `"type":"compaction"`) != 2 { // added + done
-		t.Fatalf("expected 2 compaction item occurrences (added+done), got %d", strings.Count(s, `"type":"compaction"`))
+	// exactly one compaction item, emitted three times: added + done +
+	// embedded in the response.completed output array
+	if strings.Count(s, `"type":"compaction"`) != 3 {
+		t.Fatalf("expected 3 compaction item occurrences (added+done+completed), got %d", strings.Count(s, `"type":"compaction"`))
 	}
 }
 

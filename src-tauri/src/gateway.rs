@@ -25,9 +25,9 @@ use uuid::Uuid;
 use crate::diagnostics::{self, DiagnosticEvent, ErrorCode};
 
 use crate::catalog::{
-    alias_to_picker_entry, context_budget_for_request, context_window_for_route, default_model,
-    default_routes, model_specs, picker_entries, thinking_level_label, ModelSpec, CLAUDE_MODELS,
-    DEEPSEEK_MODELS, SUPPORTED_PROVIDERS,
+    alias_to_picker_entry, all_providers, auth_kinds_for, context_budget_for_request,
+    context_window_for_route, default_api_base_url, default_model, default_routes, model_specs,
+    picker_entries, thinking_level_label, ModelSpec, ProviderAuth, SUPPORTED_PROVIDERS,
 };
 use crate::claude_window::{
     claude_icon_path, enum_claude_hwnds_for_pid, log_icon_line, spawn_claude_icon_reapply,
@@ -40,25 +40,23 @@ use crate::codex_window::{
 use crate::usage::{
     parse_claude_usage, parse_codex_usage, parse_kimi_usage, parse_xai_usage, GatewayAccountUsage,
 };
-use crate::vision::{
-    append_vision_presentation_guidance, replace_images_with_descriptions, resolve_deepseek_vision,
-    resolve_deepseek_vision_per_image, tool_compatibility_fixups, vision_sidecar_request_from_any,
-};
+use crate::vision::tool_compatibility_fixups;
 
 use crate::persistence::{
     durable_write, load_json_with_recovery, recover_pending_transactions, run_transaction,
     secure_create_dir_all, secure_existing_path, FileMutation,
 };
 
-// Pin CLIProxyAPI 7.2.131 (2026-08-13). Upstream issue #4339 (x_search
-// injection vs client web_search) is now a configurable injector rather than
-// unconditional; re-verified against this pin during the 2.3.0 upgrade smoke
-// test. Kimi K3 (`kimi-k3`) registry support confirmed still present. The
-// 7.2.131 xAI registry adds grok-4.6 (verified: routes 200 with the saved
-// xAI OAuth; 7.2.128 and 7.2.130 predate it).
-const GATEWAY_VERSION: &str = "7.2.131";
+// Pin CLIProxyAPI 7.2.139 (2026-08-22). Re-audited against the 7.2.139 windows
+// release: config contract (auth-dir, api-keys, api-key-entries, oauth-model-alias,
+// xai.inject-x-search, codex.optimize-multi-agent-v2, plugins) and the
+// api-key-entries shape hold; gateway smoke + log-redaction green. The
+// `-<provider>-login` flags and the model alias registry are unchanged. If a
+// future bump changes any of that, the new pin guard (`scripts/check-cliproxy.ps1`)
+// and `render_config_keeps_the_cliproxy_contract` test should be updated together.
+const GATEWAY_VERSION: &str = "7.2.139";
 pub(crate) const GATEWAY_EXE_SHA256: &str =
-    "05f0c7bc700c54e0b031838c52b753a052e3ce167fdb7b47b99c3b1ee4d26f34";
+    "457d717382189c38a2641dd5ae3b467c86b4cdb5b1833d5c289375fb4a86cf0b";
 const GATEWAY_PORT: u16 = 8317;
 const BACKEND_PORT: u16 = 8318;
 const MAX_RELAY_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -69,10 +67,6 @@ const RELAY_QUEUE_CAPACITY: usize = 32;
 const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) const VISION_SIDECAR_START_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const MAX_VISION_DESCRIPTION_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_VISION_PROMPT_CHARS: usize = 8 * 1024;
-pub(crate) const MAX_VISION_IMAGES: usize = 8;
 const BASILISKOS_CONFIG_NAME: &str = "Basiliskos";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -104,23 +98,10 @@ const KIMI_TOKEN_ENDPOINT: &str = "https://auth.kimi.com/api/oauth/token";
 const KIMI_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const KIMI_RELOGIN_REQUIRED: &str =
     "This saved Kimi authorization was revoked. Sign in again to renew it.";
-// DeepSeek is the one supported provider with no OAuth/device flow: it is an
-// API-key upstream reached through CLIProxyAPI's generic `openai-compatibility`
-// block (verified against the pinned 7.2.128 binary — the key must sit under
-// `api-key-entries`, not `api-keys`, or the provider loads zero clients).
-// Credentials are stored as normal `deepseek-*.json` auth files so every
-// existing account operation (label / activate / disable / remove) applies.
-// Its generated compatibility provider must use a separate internal name: the
-// stored `type: deepseek` file has no base_url and would otherwise be selected
-// before the generated client, causing "missing provider baseURL" at runtime.
-const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
-const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
-const DEEPSEEK_COMPAT_NAME: &str = "basiliskos-deepseek";
-const MAX_DEEPSEEK_API_KEY_LEN: usize = 200;
 
 /// The relay codex account that anchors the isolated Basiliskos Codex window's
 /// login. It is EXCLUDED from the relay's automatic refresh (one-refresher
-/// rule — the isolated app owns it), so the normal app's or the relay's
+/// rule â€” the isolated app owns it), so the normal app's or the relay's
 /// refreshes can never rotate away the seeded credential. The account must be
 /// one the user's normal Codex app does NOT use.
 const CODEX_ANCHOR_FILE_NAME: &str = "codex-charles.3ready@gmail.com.json";
@@ -248,63 +229,8 @@ static BACKEND_SUPERVISION_STARTED: OnceLock<()> = OnceLock::new();
 static KIMI_REFRESH_LOCKS: AccountRefreshLocks = OnceLock::new();
 static KIMI_REFRESH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static KIMI_CREDENTIAL_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
-pub(crate) static VISION_SIDECAR_SLOTS: OnceLock<VisionSlots> = OnceLock::new();
-
 fn controller() -> &'static ControllerManager {
     CONTROLLER.get_or_init(ControllerManager::default)
-}
-
-/// Bounded counting gate for concurrent DeepSeek vision sidecars. Replaces the
-/// old global serial lock: parallel describes are safe (each sidecar is
-/// isolated; credential persist is hash-guarded), but the number of spawned
-/// sidecar processes stays bounded. `acquire` blocks the calling worker thread
-/// until a slot frees, so a burst of image requests queues instead of
-/// unboundedly spawning processes.
-const VISION_SIDECAR_PARALLELISM: usize = 2;
-
-pub(crate) struct VisionSlots {
-    available: Mutex<usize>,
-    waiters: Condvar,
-}
-
-impl VisionSlots {
-    pub(crate) fn new() -> Self {
-        VisionSlots {
-            available: Mutex::new(VISION_SIDECAR_PARALLELISM),
-            waiters: Condvar::new(),
-        }
-    }
-
-    pub(crate) fn acquire(&self) -> VisionSlotGuard<'_> {
-        let mut available = self
-            .available
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *available == 0 {
-            available = self
-                .waiters
-                .wait(available)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        *available -= 1;
-        VisionSlotGuard { slots: self }
-    }
-}
-
-pub(crate) struct VisionSlotGuard<'a> {
-    slots: &'a VisionSlots,
-}
-
-impl Drop for VisionSlotGuard<'_> {
-    fn drop(&mut self) {
-        let mut available = self
-            .slots
-            .available
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *available += 1;
-        self.slots.waiters.notify_one();
-    }
 }
 
 fn runtime_lock() -> Result<MutexGuard<'static, ControllerRuntime>, String> {
@@ -375,34 +301,10 @@ pub struct GatewayAccount {
     /// A small, user-facing credential health state. `relogin_required` is
     /// deliberately reserved for a provider-confirmed terminal refresh error.
     pub credential_status: String,
-}
-
-/// A single ordered candidate in the DeepSeek image-understanding plan.
-///
-/// These candidates are intentionally independent of `active_account`: the
-/// primary relay still has one selected account, while the future vision lane
-/// may use any saved OAuth credential in this ordered list. `credential_status`
-/// describes the local credential only; request-level failures are reported
-/// separately by the relay and do not mutate this plan.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeepseekVisionCandidate {
-    pub provider: String,
-    pub model: String,
-    pub thinking: String,
-    pub account_file_name: Option<String>,
-    pub account_label: Option<String>,
-    pub credential_status: String,
-    pub credential_available: bool,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeepseekVisionPlan {
-    pub enabled: bool,
-    pub transport: String,
-    pub candidates: Vec<DeepseekVisionCandidate>,
+    /// `oauth` or `api_key` — which auth method this account uses.
+    pub auth: String,
+    /// Upstream base URL for API-key accounts; None for OAuth accounts.
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -418,7 +320,6 @@ pub struct GatewaySnapshot {
     pub routes: Vec<ProviderRoute>,
     pub active_codex_account: Option<String>,
     pub codex_routes: Vec<ProviderRoute>,
-    pub deepseek_vision: DeepseekVisionPlan,
     /// Latest same-provider auto-failover, when one happened this session.
     /// The UI shows this once so a silent credential switch is not invisible.
     pub auto_failover: Option<AutoFailoverInfo>,
@@ -459,18 +360,6 @@ pub struct RouteUpdateResult {
     #[serde(flatten)]
     pub snapshot: GatewaySnapshot,
     pub route_verified: bool,
-}
-
-/// Result of adding a DeepSeek API key. Carries the stored account's file name so
-/// the caller can immediately activate it through the normal selection path — a
-/// newly added account is always written disabled, so adding alone never changes
-/// what Claude is talking to.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeepseekAccountAdded {
-    #[serde(flatten)]
-    pub snapshot: GatewaySnapshot,
-    pub file_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -666,18 +555,33 @@ fn normalized_route_for(
     provider: &str,
 ) -> RouteSelection {
     let specs = model_specs(provider);
+    let spec_is_pinned = !specs.is_empty();
     let stored = client_routes(state, client).get(provider);
     let model = stored
         .map(|route| route.model.as_str())
-        .filter(|model| specs.iter().any(|spec| spec.id == *model))
+        .filter(|model| {
+            !model.is_empty() && (!spec_is_pinned || specs.iter().any(|spec| spec.id == *model))
+        })
         .unwrap_or_else(|| default_model(provider));
-    let spec = specs
-        .iter()
-        .find(|spec| spec.id == model)
-        .expect("every supported provider has a default model");
+    if model.is_empty() {
+        // Guard against a provider with no default (never happens today, but
+        // keeps the caller from building an empty route).
+        return RouteSelection {
+            model: String::new(),
+            thinking: "auto".into(),
+        };
+    }
+    // For live-catalog providers (routers/custom) there are no pinned specs; the
+    // stored or default model id is accepted as-is and validated against the
+    // backend's live catalog later in `validated_route_for_request`.
+    let spec = specs.iter().find(|spec| spec.id == model);
     let thinking = stored
         .map(|route| route.thinking.as_str())
-        .filter(|thinking| *thinking == "auto" || spec.thinking_levels.contains(thinking))
+        .filter(|thinking| {
+            spec.map_or(*thinking == "auto", |spec| {
+                *thinking == "auto" || spec.thinking_levels.contains(thinking)
+            })
+        })
         .unwrap_or("auto");
     RouteSelection {
         model: model.to_string(),
@@ -696,15 +600,12 @@ fn provider_route_for(
 ) -> ProviderRoute {
     let route = normalized_route_for(state, client, provider);
     let specs = model_specs(provider);
-    let selected = specs
-        .iter()
-        .find(|spec| spec.id == route.model)
-        .expect("normalized routes always select a catalog model");
+    let selected = specs.iter().find(|spec| spec.id == route.model);
     let hidden = load_hidden_models().unwrap_or_default();
     let live_catalog = runtime_lock()
         .ok()
         .and_then(|runtime| runtime.last_known_model_catalog.get(provider).cloned());
-    let model_options = filter_visible_models(
+    let mut model_options: Vec<RouteModelOption> = filter_visible_models(
         provider,
         specs,
         &route.model,
@@ -722,8 +623,37 @@ fn provider_route_for(
             .collect(),
     })
     .collect();
-    let context_window = context_window_for_route(provider, selected.id);
-    let selected_model_label = selected.label.to_string();
+    // Live-catalog providers (routers/custom, API-key accounts) have no pinned
+    // specs, so the route panel's model picker is sourced from the live
+    // `/v1/models` list instead of an empty options list.
+    if model_options.is_empty() {
+        for id in live_catalog.iter().flatten() {
+            if hidden.contains(id) {
+                continue;
+            }
+            model_options.push(RouteModelOption {
+                id: id.clone(),
+                label: id.clone(),
+                thinking_levels: vec!["auto".into()],
+            });
+        }
+        if !model_options.iter().any(|option| option.id == route.model) {
+            model_options.insert(
+                0,
+                RouteModelOption {
+                    id: route.model.clone(),
+                    label: route.model.clone(),
+                    thinking_levels: vec!["auto".into()],
+                },
+            );
+        }
+    }
+    // Live-catalog providers (routers/custom) have no pinned label; show the
+    // model id as its own label rather than an empty options list.
+    let context_window = context_window_for_route(provider, &route.model);
+    let selected_model_label = selected
+        .map(|spec| spec.label.to_string())
+        .unwrap_or_else(|| route.model.clone());
     ProviderRoute {
         provider: provider.to_string(),
         selected_model: route.model,
@@ -805,14 +735,6 @@ fn apply_route_model(
     state: &ControllerState,
     provider: &str,
 ) -> String {
-    // DeepSeek reaches the backend through the generic openai-compatibility
-    // path, which matches credentials on the literal model name. A `model(effort)`
-    // suffix there fails selection outright ("auth_unavailable: no auth
-    // available"), so DeepSeek always routes the plain id and carries its effort
-    // in the request body instead — see `apply_deepseek_thinking`.
-    if provider == "deepseek" {
-        return base_model.to_string();
-    }
     let target_model = backend_model_identifier(provider, base_model);
     // A picker variant carries its own validated thinking level; otherwise use
     // the route's thinking (validated against the model actually being routed).
@@ -848,54 +770,6 @@ fn apply_route_model(
         target_model.to_string()
     } else {
         format!("{}({})", target_model, thinking)
-    }
-}
-
-/// Expresses the selected DeepSeek thinking level as Anthropic adaptive thinking,
-/// which CLIProxyAPI converts to DeepSeek's OpenAI-compatible `reasoning_effort`.
-///
-/// DeepSeek V4 accepts off, low, high, and max. The old numeric-budget bridge
-/// could not represent max because its budget conversion saturated at high.
-/// Sampling controls do not affect a thinking request, so remove them rather
-/// than implying that they tune the selected reasoning level. `none` explicitly
-/// disables thinking and leaves sampling controls intact. On auto, keep the
-/// client request unchanged for a non-thinking or client-managed request.
-fn apply_deepseek_thinking(
-    object: &mut serde_json::Map<String, Value>,
-    state: &ControllerState,
-    thinking_override: Option<&str>,
-) {
-    let route = normalized_route(state, "deepseek");
-    let thinking = thinking_override.unwrap_or(&route.thinking);
-    if thinking == "none" {
-        object.insert("thinking".into(), serde_json::json!({ "type": "disabled" }));
-        if let Some(output_config) = object
-            .get_mut("output_config")
-            .and_then(Value::as_object_mut)
-        {
-            output_config.remove("effort");
-            if output_config.is_empty() {
-                object.remove("output_config");
-            }
-        }
-        return;
-    }
-    let effort = match thinking {
-        "low" | "high" | "max" => thinking,
-        _ => return,
-    };
-    object.insert("thinking".into(), serde_json::json!({ "type": "adaptive" }));
-    object.insert(
-        "output_config".into(),
-        serde_json::json!({ "effort": effort }),
-    );
-    for parameter in [
-        "temperature",
-        "top_p",
-        "presence_penalty",
-        "frequency_penalty",
-    ] {
-        object.remove(parameter);
     }
 }
 
@@ -954,7 +828,6 @@ fn provider_label(provider: &str) -> &'static str {
         "codex" => "Codex",
         "xai" => "Grok Build",
         "kimi" => "Kimi Code",
-        "deepseek" => "DeepSeek",
         "antigravity" => "Antigravity",
         _ => "Unknown provider",
     }
@@ -983,6 +856,34 @@ pub(crate) fn gateway_dir() -> Result<PathBuf, String> {
 
 fn auth_dir() -> Result<PathBuf, String> {
     Ok(gateway_dir()?.join("auth"))
+}
+
+/// Where API-key credentials live, separate from OAuth auth files so the OAuth
+/// refresh/maintenance paths never touch them.
+fn keys_dir() -> Result<PathBuf, String> {
+    Ok(gateway_dir()?.join("keys"))
+}
+
+/// The auth kind a credential file represents. OAuth credentials are objects
+/// whose `type` is a provider map; API-key credentials carry a top-level
+/// `"kind": "api_key"` discriminator (and `type` may be a plain string).
+fn account_auth_kind(value: &Value) -> ProviderAuth {
+    let is_api_key = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(|kind| kind.eq_ignore_ascii_case("api_key"))
+        .unwrap_or(false);
+    if is_api_key {
+        ProviderAuth::ApiKey
+    } else {
+        ProviderAuth::Oauth
+    }
+}
+
+/// The account file name that holds the active account for a client, or None
+/// when no account is selected.
+fn account_file_name(account: Option<&str>) -> Option<&str> {
+    account.filter(|name| !name.is_empty())
 }
 
 fn controller_path() -> Result<PathBuf, String> {
@@ -1156,7 +1057,22 @@ fn remove_private_child_directories(root: &Path) -> Result<usize, String> {
 fn cleanup_stale_secret_workspaces() -> Result<usize, String> {
     let login_removed = remove_private_child_directories(&login_staging_root()?)?;
     let vision_removed = remove_private_child_directories(&gateway_dir()?.join("vision-sidecars"))?;
-    Ok(login_removed + vision_removed)
+    let mut deepseek_removed = 0;
+    if let Ok(auth_dir) = auth_dir() {
+        if let Ok(entries) = std::fs::read_dir(&auth_dir) {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if name.starts_with("deepseek-")
+                        && name.ends_with(".json")
+                        && std::fs::remove_file(entry.path()).is_ok()
+                    {
+                        deepseek_removed += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(login_removed + vision_removed + deepseek_removed)
 }
 
 pub fn initialize_controller_storage() -> Result<(), String> {
@@ -1393,68 +1309,45 @@ fn prepare_codex_compaction_plugin(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn active_provider_from_auth_for(
-    auth: &Path,
-    state: &ControllerState,
-    client: ClientSurface,
-) -> Option<String> {
-    let file_name = active_account_for(state, client)?;
-    let raw = fs::read_to_string(auth.join(file_name)).ok()?;
+fn active_provider_from_auth_for(state: &ControllerState, client: ClientSurface) -> Option<String> {
+    let file_name = account_file_name(active_account_for(state, client))?;
+    let raw = fs::read_to_string(exact_account_path(file_name).ok()?).ok()?;
     let value = serde_json::from_str::<Value>(&raw).ok()?;
     account_provider(&value, file_name)
 }
 
-/// Reads the API key of the *active* DeepSeek account, if one is selected.
-///
-/// Only the selected account's key is ever rendered into the backend config:
-/// CLIProxyAPI load-balances across every `api-key-entries` entry, so emitting
-/// all saved DeepSeek keys would silently route through an account the user did
-/// not choose. It also keeps unselected keys off disk outside their auth file.
-fn active_deepseek_api_key(auth: &Path, state: &ControllerState) -> Option<String> {
-    let file_name = state.active_account.as_deref()?;
-    let raw = fs::read_to_string(auth.join(file_name)).ok()?;
-    let value = serde_json::from_str::<Value>(&raw).ok()?;
-    if account_provider(&value, file_name).as_deref() != Some("deepseek") {
-        return None;
-    }
-    if value
-        .get("disabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    nested_string(&value, &["api_key"]).filter(|key| is_valid_deepseek_api_key(key))
-}
-
-/// Returns the API key of an enabled DeepSeek account, preferring the active
-/// account when it is a DeepSeek account, and falling back to any other enabled
-/// DeepSeek account. The fallback keeps the isolated Codex window's model
-/// switcher real: a DeepSeek pick routes to real DeepSeek even when another
-/// provider is the active account (the one-enabled-per-provider invariant means
-/// there is at most one such account in steady state).
-fn enabled_deepseek_api_key(auth: &Path, state: &ControllerState) -> Option<String> {
-    if let Some(key) = active_deepseek_api_key(auth, state) {
-        return Some(key);
-    }
-    let Ok(entries) = fs::read_dir(auth) else {
-        return None;
+/// Emit the `openai-compatibility` provider list for every enabled API-key-only
+/// account (DeepSeek, routers, custom endpoints). Verified against the pinned
+/// 7.2.139 `config.example.yaml`: the block is a LIST under `openai-compatibility:`
+/// with `name`, `base-url`, `api-key-entries` (an object list), and an explicit
+/// `models` list. OAuth providers used by key are routed through their native
+/// sections (`claude-api-key`, `xai-api-key`, `codex-api-key`, `gemini-api-key`)
+/// and are not emitted here.
+fn render_api_key_provider_blocks(auth: &Path) -> String {
+    let _ = auth;
+    let Ok(directory) = keys_dir() else {
+        return String::new();
     };
-    let mut keys = Vec::new();
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return String::new();
+    };
+    // Only the enabled accounts are emitted; per-account base-url falls back to
+    // the catalog default. Routers/custom declare only their pinned models (the
+    // live model list is surfaced in the route panel). Do not take the runtime
+    // lock here: render_config can be reached while it is held.
+    let mut providers: Vec<(String, String, String)> = Vec::new();
     for entry in entries.flatten() {
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        if !(file_name.starts_with("deepseek-") && file_name.ends_with(".json")) {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(entry.path()) else {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
-        if account_provider(&value, &file_name).as_deref() != Some("deepseek") {
-            continue;
-        }
         if value
             .get("disabled")
             .and_then(Value::as_bool)
@@ -1462,78 +1355,69 @@ fn enabled_deepseek_api_key(auth: &Path, state: &ControllerState) -> Option<Stri
         {
             continue;
         }
-        if let Some(key) =
-            nested_string(&value, &["api_key"]).filter(|key| is_valid_deepseek_api_key(key))
-        {
-            keys.push(key);
+        let Some(provider) = account_provider(&value, &file_name) else {
+            continue;
+        };
+        if !crate::catalog::API_KEY_PROVIDERS.contains(&provider.as_str()) {
+            continue;
         }
+        let Some(key) = nested_string(&value, &["api_key"]) else {
+            continue;
+        };
+        let base_url = nested_string(&value, &["base_url"])
+            .or_else(|| default_api_base_url(&provider).map(str::to_string))
+            .unwrap_or_default();
+        if base_url.is_empty() {
+            continue;
+        }
+        providers.push((provider, base_url, key));
     }
-    keys.sort();
-    keys.into_iter().next()
-}
-
-/// Renders the CLIProxyAPI `openai-compatibility` provider block for DeepSeek,
-/// or an empty string when no enabled DeepSeek account exists.
-///
-/// The key belongs under `api-key-entries`; `api-keys` parses without error but
-/// yields zero loaded clients (verified against the pinned 7.2.128 runtime).
-///
-/// Only DeepSeek model ids are registered as aliases. Other providers' models
-/// (grok-4.x, gpt-5.6-*, kimi-k*) route through CLIProxyAPI's native provider
-/// catalog instead, so the isolated Codex window's model switcher is real: the
-/// picked model runs its own provider (credentials permitting) instead of
-/// being hijacked to the active route.
-fn deepseek_compat_block(auth: &Path, state: &ControllerState) -> String {
-    let Some(api_key) = enabled_deepseek_api_key(auth, state) else {
+    if providers.is_empty() {
         return String::new();
-    };
-    let route_model = state
-        .routes
-        .get("deepseek")
-        .map(|route| route.model.clone())
-        .unwrap_or_else(|| default_model("deepseek").to_string());
-    let mut aliases: Vec<&str> = Vec::new();
-    for spec in DEEPSEEK_MODELS {
-        if !aliases.contains(&spec.id) {
-            aliases.push(spec.id);
-        }
     }
-    let models = aliases
-        .iter()
-        .map(|alias| {
-            format!(
-                "      - name: {name}\n        alias: {alias}\n",
-                name = yaml_quote(&route_model),
-                alias = yaml_quote(alias)
-            )
-        })
-        .collect::<String>();
-    format!(
-        r#"openai-compatibility:
-  - name: {name}
-    base-url: {base_url}
-    api-key-entries:
-      - api-key: {api_key}
-    models:
-{models}"#,
-        name = yaml_quote(DEEPSEEK_COMPAT_NAME),
-        base_url = yaml_quote(DEEPSEEK_BASE_URL),
-        api_key = yaml_quote(&api_key),
-    )
+    let mut out = String::from("\nopenai-compatibility:\n");
+    for (provider, base_url, key) in providers {
+        let model_ids: Vec<String> = model_specs(&provider)
+            .iter()
+            .map(|spec| spec.id.to_string())
+            .collect();
+        out.push_str(&openai_compat_provider_yaml(
+            &provider, &base_url, &key, &model_ids,
+        ));
+    }
+    out
 }
 
-/// DeepSeek keys are `sk-` followed by URL-safe token characters. Validating the
-/// charset keeps a pasted key from breaking out of the quoted YAML scalar it is
-/// rendered into (`yaml_quote` also rewrites `\`, which would corrupt a key).
-fn is_valid_deepseek_api_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= MAX_DEEPSEEK_API_KEY_LEN
-        && key
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+/// One `openai-compatibility` list item, matching the pinned CLIProxyAPI
+/// `config.example.yaml`: `name`, `base-url`, an object list under
+/// `api-key-entries`, and an explicit `models` list. Pure and unit-testable so
+/// the schema can't drift silently on a CLIProxyAPI bump.
+fn openai_compat_provider_yaml(
+    provider: &str,
+    base_url: &str,
+    key: &str,
+    model_ids: &[String],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("  - name: {}\n", yaml_quote(provider)));
+    out.push_str(&format!("    base-url: {}\n", yaml_quote(base_url)));
+    out.push_str("    api-key-entries:\n");
+    out.push_str(&format!("      - api-key: {}\n", yaml_quote(key)));
+    if !model_ids.is_empty() {
+        out.push_str("    models:\n");
+        let mut seen = std::collections::BTreeSet::new();
+        for id in model_ids {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            out.push_str(&format!("      - name: {}\n", yaml_quote(id)));
+        }
+    }
+    out
 }
 
 fn render_config(auth: &Path, state: &ControllerState) -> String {
+    let api_key_blocks = render_api_key_provider_blocks(auth);
     format!(
         r#"host: "127.0.0.1"
 port: {BACKEND_PORT}
@@ -1574,9 +1458,6 @@ plugins:
   configs:
     basiliskos-codex-compaction:
       enabled: true
-      auth_dir: {auth_dir}
-      deepseek_responses_url: "https://api.deepseek.com/responses"
-      vision_url: "http://127.0.0.1:{GATEWAY_PORT}/hydra/vision-describe"
 # Explicit: upstream default since v7.2.128; keeps it fixed even if the
 # upstream default flips. Prevents native x_search injection into Grok
 # requests (issue #4339) regardless of client tool declarations.
@@ -1587,10 +1468,13 @@ xai:
 # requests for upstream providers (verified 7.2.128 behavior).
 codex:
   optimize-multi-agent-v2: true
-{deepseek}"#,
+# API-key provider accounts (DeepSeek, routers, custom endpoints). Best-effort
+# and YAML-valid; verify field names against CLIProxyAPI 7.2.139 before relying
+# on live API-key routing.
+{api_key_blocks}"#,
         auth_dir = yaml_quote(&auth.to_string_lossy()),
         api_key = yaml_quote(&state.api_key),
-        deepseek = deepseek_compat_block(auth, state),
+        api_key_blocks = api_key_blocks,
     )
 }
 
@@ -1666,7 +1550,7 @@ fn backend_model_ids(api_key: &str) -> Result<Vec<String>, String> {
 }
 
 // Best-effort: refreshes the cached "what does the backend actually report as
-// available" list for a provider. Never fails the caller — if the backend is
+// available" list for a provider. Never fails the caller Ã¢â‚¬â€ if the backend is
 // unreachable or returns nothing, the previous cached catalog (or no catalog,
 // meaning no live filtering) is left in place.
 fn refresh_model_catalog_cache(provider: &str, api_key: &str) {
@@ -1888,10 +1772,6 @@ fn rewrite_claude_request(
     let routed_model = apply_route_model(base_model, thinking_override, object, state, provider);
     object.insert("model".into(), Value::String(routed_model));
 
-    if provider == "deepseek" {
-        apply_deepseek_thinking(object, state, thinking_override);
-    }
-
     for fixup in tool_compatibility_fixups(provider) {
         fixup(object);
     }
@@ -1928,64 +1808,6 @@ fn rewrite_claude_request(
         }
     }
     Ok(())
-}
-
-fn collect_vision_blocks(
-    blocks: &[Value],
-    output: &mut Vec<Value>,
-    image_count: &mut usize,
-    text_chars: &mut usize,
-) {
-    for block in blocks {
-        match block.get("type").and_then(Value::as_str) {
-            Some("image") => {
-                if *image_count < MAX_VISION_IMAGES {
-                    output.push(block.clone());
-                    *image_count += 1;
-                }
-            }
-            Some("text") => {
-                let Some(text) = block.get("text").and_then(Value::as_str) else {
-                    continue;
-                };
-                if *text_chars >= MAX_VISION_PROMPT_CHARS {
-                    continue;
-                }
-                let remaining = MAX_VISION_PROMPT_CHARS.saturating_sub(*text_chars);
-                let clipped = text.chars().take(remaining).collect::<String>();
-                *text_chars += clipped.chars().count();
-                output.push(serde_json::json!({"type": "text", "text": clipped}));
-            }
-            Some("tool_result") => {
-                if let Some(nested) = block.get("content").and_then(Value::as_array) {
-                    collect_vision_blocks(nested, output, image_count, text_chars);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-pub(crate) fn vision_content_from_request(request: &Value) -> Option<Vec<Value>> {
-    let messages = request.get("messages")?.as_array()?;
-    let mut content = Vec::new();
-    let mut image_count = 0;
-    let mut text_chars = 0;
-    for message in messages {
-        match message.get("content") {
-            Some(Value::Array(blocks)) => {
-                collect_vision_blocks(blocks, &mut content, &mut image_count, &mut text_chars)
-            }
-            Some(Value::String(text)) if text_chars < MAX_VISION_PROMPT_CHARS => {
-                let remaining = MAX_VISION_PROMPT_CHARS.saturating_sub(text_chars);
-                let clipped = text.chars().take(remaining).collect::<String>();
-                text_chars += clipped.chars().count();
-                content.push(serde_json::json!({"type": "text", "text": clipped}));
-            }
-            _ => {}
-        }
-    }
-    (image_count > 0).then_some(content)
 }
 
 fn is_hop_by_hop_header(name: &str) -> bool {
@@ -2124,77 +1946,6 @@ fn proxy_error(
         response.add_header(header);
     }
     response
-}
-
-fn json_proxy_response(
-    status: u16,
-    body: Value,
-    correlation_id: &str,
-) -> Response<std::io::Cursor<Vec<u8>>> {
-    let mut response = Response::from_string(body.to_string()).with_status_code(StatusCode(status));
-    if let Ok(header) = Header::from_bytes("content-type", "application/json") {
-        response.add_header(header);
-    }
-    if let Ok(header) = Header::from_bytes("x-basiliskos-correlation-id", correlation_id) {
-        response.add_header(header);
-    }
-    response
-}
-
-/// Describe images for the Codex DeepSeek hop. Does not require DeepSeek to be
-/// the active Basiliskos route — the Codex picker can select DeepSeek while
-/// another provider is selected in the controller.
-fn handle_hydra_vision_describe(
-    request: tiny_http::Request,
-    body: &[u8],
-    async_runtime: &tokio::runtime::Handle,
-    client: &reqwest::Client,
-    correlation_id: &str,
-) {
-    let result = (|| -> Result<String, String> {
-        let json: Value = serde_json::from_slice(body)
-            .map_err(|_| "The vision request body is invalid JSON".to_string())?;
-        let sidecar_request = vision_sidecar_request_from_any(&json)
-            .ok_or_else(|| "The request contains no supported image blocks.".to_string())?;
-        let accounts = {
-            let _mutation = mutation_lock()?;
-            let state = load_state()?;
-            list_accounts_inner(&state)?
-        };
-        resolve_deepseek_vision(
-            async_runtime,
-            client,
-            &accounts,
-            &sidecar_request,
-            correlation_id,
-        )
-    })();
-    match result {
-        Ok(description) => {
-            let _ = request.respond(json_proxy_response(
-                200,
-                serde_json::json!({ "description": description }),
-                correlation_id,
-            ));
-        }
-        Err(error) => {
-            diagnostics::record(
-                ErrorCode::VisionUnavailable,
-                "warning",
-                &error,
-                Some(correlation_id),
-                Some(502),
-                None,
-            );
-            respond_proxy_error(
-                request,
-                ErrorCode::VisionUnavailable,
-                502,
-                "Basiliskos could not obtain an image description from any configured OAuth vision provider.",
-                correlation_id,
-            );
-        }
-    }
 }
 
 fn respond_proxy_error(
@@ -2512,7 +2263,7 @@ fn handle_front_proxy_request(
     // Codex Desktop prefers the Responses WebSocket transport. The Basiliskos
     // relay is HTTP/SSE only, so a WebSocket upgrade would hang forever in
     // retries. Return 426 Upgrade Required so the client falls back to
-    // HTTP/SSE — the same signal opencodex uses for the Codex app.
+    // HTTP/SSE Ã¢â‚¬â€ the same signal opencodex uses for the Codex app.
     let is_websocket_upgrade = request.method() == &tiny_http::Method::Get
         && request.headers().iter().any(|header| {
             header
@@ -2590,63 +2341,6 @@ fn handle_front_proxy_request(
         return;
     }
 
-    if request_path == "/hydra/vision-describe" {
-        handle_hydra_vision_describe(request, &body, async_runtime, client, correlation_id);
-        return;
-    }
-
-    // DeepSeek V4 is text-only. Before the normal provider rewrite replaces
-    // images with a safety placeholder, give the ordered OAuth vision lane a
-    // bounded chance to describe them. This happens only while DeepSeek is the
-    // selected primary route; other providers receive their native images.
-    if surface == Some(ClientSurface::Claude) {
-        let vision_result = (|| -> Result<(), String> {
-            let (provider, accounts) = {
-                let _mutation = mutation_lock()?;
-                let state = load_state()?;
-                let provider =
-                    active_provider_from_auth_for(&auth_dir()?, &state, ClientSurface::Claude);
-                let accounts = list_accounts_inner(&state)?;
-                (provider, accounts)
-            };
-            if provider.as_deref() != Some("deepseek") {
-                return Ok(());
-            }
-            let mut json: Value = serde_json::from_slice(&body)
-                .map_err(|_| "Claude request body is invalid JSON".to_string())?;
-            if vision_content_from_request(&json).is_none() {
-                return Ok(());
-            }
-            let mut descriptions = resolve_deepseek_vision_per_image(
-                async_runtime,
-                client,
-                &accounts,
-                &json,
-                correlation_id,
-            )?;
-            // The sidecar works newest-first so the bounded eight-image budget
-            // keeps the latest context. Restore conversation order for the
-            // replacement walk, which also marks older omitted images.
-            descriptions.reverse();
-            replace_images_with_descriptions(&mut json, &descriptions);
-            append_vision_presentation_guidance(&mut json)?;
-            body = serde_json::to_vec(&json).map_err(|error| {
-                format!("The vision-enriched request could not be serialized: {error}")
-            })?;
-            Ok(())
-        })();
-        if vision_result.is_err() {
-            respond_proxy_error(
-                request,
-                ErrorCode::VisionUnavailable,
-                502,
-                "Basiliskos could not obtain an image description from any configured OAuth vision provider.",
-                correlation_id,
-            );
-            return;
-        }
-    }
-
     let mut provider_for_event = None;
     let mut active_account_for_event = None;
     let mut context_budget = None;
@@ -2654,9 +2348,8 @@ fn handle_front_proxy_request(
         let rewrite_result = (|| -> Result<(), String> {
             let _mutation = mutation_lock()?;
             let mut state = load_state()?;
-            let provider =
-                active_provider_from_auth_for(&auth_dir()?, &state, ClientSurface::Claude)
-                    .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
+            let provider = active_provider_from_auth_for(&state, ClientSurface::Claude)
+                .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
             provider_for_event = Some(provider.clone());
             active_account_for_event =
                 active_account_for(&state, ClientSurface::Claude).map(str::to_owned);
@@ -2744,9 +2437,8 @@ fn handle_front_proxy_request(
         let rewrite_result = (|| -> Result<(), String> {
             let _mutation = mutation_lock()?;
             let state = load_state()?;
-            let provider =
-                active_provider_from_auth_for(&auth_dir()?, &state, ClientSurface::Codex)
-                    .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
+            let provider = active_provider_from_auth_for(&state, ClientSurface::Codex)
+                .ok_or_else(|| "Choose an active Basiliskos account first".to_string())?;
             provider_for_event = Some(provider.clone());
             active_account_for_event =
                 active_account_for(&state, ClientSurface::Codex).map(str::to_owned);
@@ -2997,35 +2689,14 @@ fn handle_front_proxy_request(
         }
     }
     let response_body: Box<dyn Read + Send> = {
-        let mut tracked = TrackedUpstream {
+        let tracked = TrackedUpstream {
             receiver: upstream.body,
             current: None,
             offset: 0,
             correlation_id: correlation_id.to_owned(),
             provider: provider_for_event.clone(),
         };
-        if upstream_status >= 400 && provider_is_text_only(provider_for_event.as_deref()) {
-            // Error bodies are small and non-streaming. Buffer the rejection so
-            // a text-only route's image error can be rephrased; every other
-            // body passes through byte-for-byte.
-            let mut bytes = Vec::new();
-            let read_ok = tracked
-                .by_ref()
-                .take((MAX_RELAY_ERROR_BODY_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .is_ok();
-            if read_ok && bytes.len() <= MAX_RELAY_ERROR_BODY_BYTES {
-                if let Some(rephrased) = rephrase_text_only_image_error(&bytes) {
-                    Box::new(std::io::Cursor::new(rephrased))
-                } else {
-                    Box::new(std::io::Cursor::new(bytes))
-                }
-            } else {
-                Box::new(tracked)
-            }
-        } else {
-            Box::new(tracked)
-        }
+        Box::new(tracked)
     };
     let response = Response::new(status, headers, response_body, None, None);
     if request.respond(response).is_err() {
@@ -3040,48 +2711,7 @@ fn handle_front_proxy_request(
     }
 }
 
-/// The DeepSeek backend schema is text-only for message content. When a routed
 /// client sends an image, the upstream rejects the whole request with a serde
-/// error that names neither the provider nor the cause. The isolated Codex
-/// window encrypts request bodies, so the relay cannot strip the image before
-/// the upstream sees it; rephrase that exact rejection into an actionable
-/// message instead of leaking the raw deserialization error.
-const TEXT_ONLY_IMAGE_REJECTION_MARKER: &str = "unknown variant `image_url`";
-const MAX_RELAY_ERROR_BODY_BYTES: usize = 1024 * 1024;
-
-/// True for providers whose upstream message schema cannot carry images at
-/// all (DeepSeek today). The /v1/messages path protects these routes with the
-/// vision lane and the placeholder fixup; the encrypted Codex dial cannot be
-/// protected pre-flight, so its rejection is rephrased instead.
-fn provider_is_text_only(provider: Option<&str>) -> bool {
-    matches!(provider, Some("deepseek"))
-}
-
-/// Rewrites the exact DeepSeek text-only image rejection into a Basiliskos
-/// message that tells the user what happened and how to send images. Returns
-/// None (pass-through) for every other body, including streamed or otherwise
-/// framed responses.
-fn rephrase_text_only_image_error(body: &[u8]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(body).ok()?;
-    if !text.contains(TEXT_ONLY_IMAGE_REJECTION_MARKER) {
-        return None;
-    }
-    if !text.trim_start().starts_with('{') {
-        return None;
-    }
-    Some(
-        serde_json::json!({
-            "error": {
-                "message": "The active Basiliskos route (DeepSeek) is text-only and cannot read images. The isolated Codex window sends images in an encrypted form the relay cannot inspect, so the upstream rejected this request. Switch the active route to a vision-capable provider (Codex, Grok, Kimi, or Claude) to send images.",
-                "type": "invalid_request_error",
-                "code": "bas_text_only_image"
-            }
-        })
-        .to_string()
-        .into_bytes(),
-    )
-}
-
 fn start_front_proxy(app: AppHandle, api_key: String) -> Result<FrontProxy, String> {
     let server = Server::http(("127.0.0.1", GATEWAY_PORT))
         .map_err(|error| format!("Could not start Basiliskos compatibility proxy: {error}"))?;
@@ -3502,104 +3132,6 @@ fn supervise_backend(app: &AppHandle) {
     }
 }
 
-fn restart_backend_for_provider_config(
-    app: &AppHandle,
-    state: &ControllerState,
-) -> Result<(), String> {
-    let (child, job) = {
-        let mut runtime = runtime_lock()?;
-        if runtime.front_proxy.is_none()
-            || !matches!(
-                runtime.phase,
-                GatewayPhase::Starting | GatewayPhase::Running | GatewayPhase::Degraded
-            )
-        {
-            return Ok(());
-        }
-        runtime.phase = GatewayPhase::Starting;
-        runtime.backend_exit_reason =
-            Some("Backend restart is applying provider configuration".into());
-        runtime.backend_restart_attempts = 0;
-        runtime.backend_next_restart = None;
-        let child = runtime.gateway_child.take();
-        #[cfg(target_os = "windows")]
-        let job = runtime.gateway_job.take();
-        #[cfg(not(target_os = "windows"))]
-        let job = None;
-        (child, job)
-    };
-
-    if let Some(mut child) = child {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    close_gateway_job(job);
-
-    let (child, job) = match spawn_backend_process(app, true) {
-        Ok(process) => process,
-        Err(error) => {
-            if let Ok(mut runtime) = runtime_lock() {
-                runtime.phase = GatewayPhase::Degraded;
-                runtime.backend_restart_attempts = 1;
-                runtime.backend_next_restart = Some(Instant::now() + Duration::from_secs(2));
-                runtime.backend_exit_reason =
-                    Some("Backend restart failed while applying provider configuration".into());
-            }
-            diagnostics::record(
-                ErrorCode::BackendRestartFailed,
-                "error",
-                "The managed backend could not apply a changed provider configuration.",
-                None,
-                None,
-                None,
-            );
-            return Err(error);
-        }
-    };
-    {
-        let mut runtime = runtime_lock()?;
-        runtime.gateway_child = Some(child);
-        #[cfg(target_os = "windows")]
-        {
-            runtime.gateway_job = job;
-        }
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if backend_health_check(&state.api_key) {
-            let mut runtime = runtime_lock()?;
-            runtime.phase = GatewayPhase::Running;
-            runtime.backend_exit_reason = None;
-            runtime.backend_restart_attempts = 0;
-            runtime.backend_next_restart = None;
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(150));
-    }
-
-    let (child, job) = {
-        let mut runtime = runtime_lock()?;
-        let child = runtime.gateway_child.take();
-        #[cfg(target_os = "windows")]
-        let job = runtime.gateway_job.take();
-        #[cfg(not(target_os = "windows"))]
-        let job = None;
-        runtime.phase = GatewayPhase::Degraded;
-        runtime.backend_restart_attempts = 1;
-        runtime.backend_next_restart = Some(Instant::now() + Duration::from_secs(2));
-        runtime.backend_exit_reason =
-            Some("Backend did not become ready after applying provider configuration".into());
-        (child, job)
-    };
-    if let Some(mut child) = child {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    close_gateway_job(job);
-    Err("Basiliskos could not apply the selected provider configuration.".into())
-}
-
 fn stop_hydra_claude_runtime() {
     let (child, job, pid, executable, profile) = match runtime_lock() {
         Ok(mut runtime) => {
@@ -4002,16 +3534,18 @@ fn nested_string(value: &Value, keys: &[&str]) -> Option<String> {
 }
 
 pub(crate) fn account_provider(value: &Value, file_name: &str) -> Option<String> {
-    let explicit =
-        nested_string(value, &["type", "provider"]).map(|provider| provider.to_ascii_lowercase());
+    let explicit = nested_string(value, &["type", "provider"])
+        .or_else(|| nested_string(value, &["provider"]))
+        .map(|provider| provider.to_ascii_lowercase());
     let provider = explicit.or_else(|| {
         let lower = file_name.to_ascii_lowercase();
-        SUPPORTED_PROVIDERS
+        let providers = all_providers();
+        providers
             .iter()
             .find(|provider| lower.starts_with(**provider))
             .map(|provider| provider.to_string())
     })?;
-    SUPPORTED_PROVIDERS
+    all_providers()
         .contains(&provider.as_str())
         .then_some(provider)
 }
@@ -4052,12 +3586,6 @@ fn credential_status(
     if relogin_required {
         return "relogin_required".into();
     }
-    // A DeepSeek API key carries no expiry, so the generic `expiry.is_none()`
-    // path ("unknown") would understate a credential that is simply always
-    // valid until the user revokes it upstream.
-    if provider == "deepseek" {
-        return "active".into();
-    }
     let renewal_window = match provider {
         "xai" => XAI_REFRESH_SKEW_SECS,
         "kimi" => KIMI_REFRESH_SKEW_SECS,
@@ -4074,10 +3602,59 @@ fn credential_status(
     }
 }
 
+fn auth_str(kind: ProviderAuth) -> &'static str {
+    match kind {
+        ProviderAuth::Oauth => "oauth",
+        ProviderAuth::ApiKey => "api_key",
+    }
+}
+
+fn key_credential_status(disabled: bool) -> String {
+    if disabled {
+        "disabled".into()
+    } else {
+        // An API-key account has no OAuth freshness; it is validated live by
+        // the endpoint health probe when the user opens the route panel.
+        "configured".into()
+    }
+}
+
+fn default_account_label(provider: &str) -> String {
+    match provider {
+        "xai" => "Grok Build".into(),
+        "codex" => "Codex account".into(),
+        "kimi" => "Kimi Code".into(),
+        "antigravity" => "Antigravity account".into(),
+        "claude" => "Claude account".into(),
+        "deepseek" => "DeepSeek API".into(),
+        "opencode" => "OpenCode API".into(),
+        "openrouter" => "OpenRouter API".into(),
+        "litellm" => "LiteLLM API".into(),
+        "custom" => "Custom endpoint".into(),
+        _ => "Account".into(),
+    }
+}
+
+/// A distinct default label for API-key accounts so "Grok Build" (OAuth) and
+/// "Grok API" (key) never read the same. Kept separate from the OAuth default.
+fn api_key_default_label(provider: &str) -> String {
+    match provider {
+        _ if provider == "xai" => "Grok API".into(),
+        "codex" => "Codex API".into(),
+        "claude" => "Claude API".into(),
+        "antigravity" => "Gemini API".into(),
+        "kimi" => "Moonshot API".into(),
+        "deepseek" => "DeepSeek API".into(),
+        "opencode" => "OpenCode API".into(),
+        "openrouter" => "OpenRouter API".into(),
+        "litellm" => "LiteLLM API".into(),
+        "custom" => "Custom endpoint".into(),
+        _ => "API key account".into(),
+    }
+}
+
 fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, String> {
-    let directory = auth_dir()?;
     let labels = load_account_labels()?;
-    secure_create_dir_all(&directory)?;
     let cooldowns = {
         let mut runtime = runtime_lock()?;
         let now = Utc::now();
@@ -4086,190 +3663,88 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
     };
     let now = Utc::now();
     let mut accounts = Vec::new();
-    for entry in fs::read_dir(&directory)
-        .map_err(|error| format!("Could not read {}: {error}", directory.display()))?
-    {
-        let entry = entry.map_err(|error| format!("Could not read account file: {error}"))?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
+    for (directory, kind) in [
+        (auth_dir()?, ProviderAuth::Oauth),
+        (keys_dir()?, ProviderAuth::ApiKey),
+    ] {
+        secure_create_dir_all(&directory)?;
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("Could not read {}: {error}", directory.display()))?
+        {
+            let entry = entry.map_err(|error| format!("Could not read account file: {error}"))?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let kind = if account_auth_kind(&value) == ProviderAuth::ApiKey {
+                ProviderAuth::ApiKey
+            } else {
+                kind
+            };
+            let Some(provider) = account_provider(&value, &file_name) else {
+                continue;
+            };
+            let email = nested_string(&value, &["email", "preferred_username"]);
+            let disabled = value
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let label = labels.get(&file_name).cloned().unwrap_or_else(|| {
+                email.clone().unwrap_or_else(|| {
+                    if kind == ProviderAuth::ApiKey {
+                        api_key_default_label(&provider)
+                    } else {
+                        default_account_label(&provider)
+                    }
+                })
+            });
+            let cooldown_until_ms = cooldowns
+                .get(&file_name)
+                .map(|until| until.timestamp_millis());
+            let base_url = nested_string(&value, &["base_url"]);
+            let credential_status = match kind {
+                ProviderAuth::ApiKey => key_credential_status(disabled),
+                ProviderAuth::Oauth => {
+                    let expiry = credential_expiry(&value);
+                    credential_status(&provider, &file_name, expiry, now)
+                }
+            };
+            let expires_at_ms = if kind == ProviderAuth::Oauth {
+                credential_expiry(&value).map(|value| value.timestamp_millis())
+            } else {
+                None
+            };
+            accounts.push(GatewayAccount {
+                active: state.active_account.as_deref() == Some(file_name.as_str()) && !disabled,
+                active_for_codex: state.active_codex_account.as_deref() == Some(file_name.as_str())
+                    && !disabled,
+                file_name,
+                provider,
+                email,
+                label,
+                disabled,
+                cooldown_until_ms,
+                expires_at_ms,
+                credential_status,
+                auth: auth_str(kind).to_string(),
+                base_url,
+            });
         }
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        let Some(provider) = account_provider(&value, &file_name) else {
-            continue;
-        };
-        let email = nested_string(&value, &["email", "preferred_username"]);
-        let disabled = value
-            .get("disabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let label = labels.get(&file_name).cloned().unwrap_or_else(|| {
-            email.clone().unwrap_or_else(|| match provider.as_str() {
-                "xai" => "Grok account".into(),
-                "codex" => "Codex account".into(),
-                "kimi" => "Kimi account".into(),
-                "deepseek" => "DeepSeek account".into(),
-                "antigravity" => "Antigravity account".into(),
-                _ => "Claude account".into(),
-            })
-        });
-        let cooldown_until_ms = cooldowns
-            .get(&file_name)
-            .map(|until| until.timestamp_millis());
-        let expiry = credential_expiry(&value);
-        let credential_status = credential_status(&provider, &file_name, expiry, now);
-        accounts.push(GatewayAccount {
-            active: state.active_account.as_deref() == Some(file_name.as_str()) && !disabled,
-            active_for_codex: state.active_codex_account.as_deref() == Some(file_name.as_str())
-                && !disabled,
-            file_name,
-            provider,
-            email,
-            label,
-            disabled,
-            cooldown_until_ms,
-            expires_at_ms: expiry.map(|value| value.timestamp_millis()),
-            credential_status,
-        });
     }
     accounts.sort_by(|left, right| {
         left.provider
             .cmp(&right.provider)
+            .then(left.auth.cmp(&right.auth))
             .then(left.label.cmp(&right.label))
     });
     Ok(accounts)
-}
-
-#[derive(Clone, Copy)]
-struct DeepseekVisionTemplate {
-    provider: &'static str,
-    model: &'static str,
-    thinking: &'static str,
-}
-
-/// Ordered, cost-aware vision candidates for DeepSeek image requests.
-///
-/// The first two entries deliberately stay on Codex OAuth: Luna at xhigh is
-/// the requested primary, followed by Terra as the cheaper general Codex
-/// fallback. Kimi and Claude remain explicit provider slots even when their
-/// OAuth files are not present on this machine. Grok is the final known
-/// image-capable OAuth provider rather than being silently dropped.
-fn deepseek_vision_templates() -> &'static [DeepseekVisionTemplate] {
-    &[
-        DeepseekVisionTemplate {
-            provider: "codex",
-            model: "gpt-5.6-luna",
-            thinking: "xhigh",
-        },
-        DeepseekVisionTemplate {
-            provider: "codex",
-            model: "gpt-5.6-terra",
-            thinking: "high",
-        },
-        DeepseekVisionTemplate {
-            provider: "kimi",
-            model: "kimi-k3",
-            thinking: "max",
-        },
-        DeepseekVisionTemplate {
-            provider: "claude",
-            model: "claude-haiku-4-5-20251001",
-            thinking: "high",
-        },
-        DeepseekVisionTemplate {
-            provider: "xai",
-            model: "grok-4.5",
-            thinking: "high",
-        },
-    ]
-}
-
-fn vision_model_supported(provider: &str, model: &str) -> bool {
-    match provider {
-        // Confirmed by the pinned CLIProxyAPI Codex model catalog.
-        "codex" => matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"),
-        // K3 is the currently verified Kimi OAuth multimodal route.
-        "kimi" => model == "kimi-k3",
-        // Claude's supported model catalog is multimodal; the credential is
-        // still optional and is discovered at runtime.
-        "claude" => CLAUDE_MODELS.iter().any(|spec| spec.id == model),
-        // Grok 4.5/4.6 are the known image-capable xAI OAuth routes in this catalog.
-        "xai" => matches!(model, "grok-4.5" | "grok-4.6"),
-        _ => false,
-    }
-}
-
-fn vision_credential_available(account: &GatewayAccount) -> bool {
-    // `disabled` marks the account as not the last-selected one of its
-    // provider. It must not hide a saved OAuth credential from the
-    // independent vision lane.
-    !matches!(
-        account.credential_status.as_str(),
-        "expired" | "relogin_required"
-    )
-}
-
-pub(crate) fn deepseek_vision_plan(accounts: &[GatewayAccount]) -> DeepseekVisionPlan {
-    let mut candidates = Vec::new();
-    for template in deepseek_vision_templates() {
-        debug_assert!(vision_model_supported(template.provider, template.model));
-        let provider_accounts = accounts
-            .iter()
-            .filter(|account| account.provider == template.provider)
-            .collect::<Vec<_>>();
-        if provider_accounts.is_empty() {
-            candidates.push(DeepseekVisionCandidate {
-                provider: template.provider.into(),
-                model: template.model.into(),
-                thinking: template.thinking.into(),
-                account_file_name: None,
-                account_label: None,
-                credential_status: "missing".into(),
-                credential_available: false,
-                detail: format!(
-                    "No saved {} OAuth credential; this slot remains scaffolded.",
-                    template.provider
-                ),
-            });
-            continue;
-        }
-        for account in provider_accounts {
-            let available = vision_credential_available(account);
-            let detail = if available && account.disabled {
-                "OAuth credential is present; it is simply not the last-selected account of its provider.".into()
-            } else if available {
-                "OAuth credential is present and eligible for the vision lane.".into()
-            } else {
-                format!(
-                    "OAuth credential is not eligible until its {} state is repaired.",
-                    account.credential_status
-                )
-            };
-            candidates.push(DeepseekVisionCandidate {
-                provider: template.provider.into(),
-                model: template.model.into(),
-                thinking: template.thinking.into(),
-                account_file_name: Some(account.file_name.clone()),
-                account_label: Some(account.label.clone()),
-                credential_status: account.credential_status.clone(),
-                credential_available: available,
-                detail,
-            });
-        }
-    }
-    DeepseekVisionPlan {
-        enabled: candidates
-            .iter()
-            .any(|candidate| candidate.credential_available),
-        transport: "isolated-sidecar".into(),
-        candidates,
-    }
 }
 
 fn shared_claude_library_dir() -> Result<PathBuf, String> {
@@ -4322,7 +3797,7 @@ fn release_installer_name(tag: &str) -> Result<String, String> {
     if version.is_empty() {
         return Err("The update service returned an invalid release tag.".to_owned());
     }
-    Ok(format!("Basiliskos_{version}_x64-setup.exe"))
+    Ok(format!("BasiliskOS_{version}_x64-setup.exe"))
 }
 
 fn release_download_url(tag: &str, asset_name: &str) -> Result<String, String> {
@@ -4338,23 +3813,26 @@ fn release_download_url(tag: &str, asset_name: &str) -> Result<String, String> {
     ))
 }
 
-fn checksum_from_manifest(manifest: &str, asset_name: &str) -> Option<String> {
+/// Resolves `asset_name` inside a SHA-256SUMS manifest case-insensitively and
+/// returns `(checksum, exact_asset_name)`. The product renamed its installer
+/// from `Basiliskos_` to `BasiliskOS_`, so releases can carry either casing;
+/// downloading by the manifest's exact name keeps every client compatible.
+fn checksum_from_manifest(manifest: &str, asset_name: &str) -> Option<(String, String)> {
     manifest.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
         let checksum = parts.next()?;
         let name = parts.next()?.trim_start_matches('*');
         (parts.next().is_none()
-            && name == asset_name
+            && name.eq_ignore_ascii_case(asset_name)
             && checksum.len() == 64
             && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| checksum.to_ascii_lowercase())
+        .then(|| (checksum.to_ascii_lowercase(), name.to_owned()))
     })
 }
 
 async fn download_verified_release_installer(tag: &str) -> Result<(PathBuf, String), String> {
-    let installer_name = release_installer_name(tag)?;
+    let expected_installer_name = release_installer_name(tag)?;
     let manifest_url = release_download_url(tag, "SHA256SUMS.txt")?;
-    let installer_url = release_download_url(tag, &installer_name)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .user_agent("Basiliskos/1.1")
@@ -4381,8 +3859,11 @@ async fn download_verified_release_installer(tag: &str) -> Result<(PathBuf, Stri
     if manifest.len() > MAX_RELEASE_MANIFEST_BYTES {
         return Err("The release checksum manifest is unexpectedly large.".to_owned());
     }
-    let expected_checksum = checksum_from_manifest(&manifest, &installer_name)
-        .ok_or_else(|| "The release checksum does not include the Windows installer.".to_owned())?;
+    let (expected_checksum, installer_name) =
+        checksum_from_manifest(&manifest, &expected_installer_name).ok_or_else(|| {
+            "The release checksum does not include the Windows installer.".to_owned()
+        })?;
+    let installer_url = release_download_url(tag, &installer_name)?;
 
     let installer_response = client
         .get(installer_url)
@@ -4543,7 +4024,7 @@ pub fn install_basiliskos_update(app: AppHandle, token: String) -> Result<(), St
     }
     // perMachine NSIS installs to Program Files, so the installer needs elevation.
     // Elevate only the installer (ShellExecute "runas"), never the Basiliskos
-    // process itself — the controller stays unelevated for OAuth / tray / profile work.
+    // process itself Ã¢â‚¬â€ the controller stays unelevated for OAuth / tray / profile work.
     launch_installer(&installer_path)?;
     app.exit(0);
     Ok(())
@@ -4567,7 +4048,7 @@ fn launch_installer(installer_path: &Path) -> Result<(), String> {
         let operation: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
         // ShellExecuteW returns an HINSTANCE cast as isize. Values > 32 mean the
         // request was accepted (UAC prompt shown / installer started). Values
-        // ≤ 32 are SE_ERR_* codes — most often SE_ERR_ACCESSDENIED when the user
+        // Ã¢â€°Â¤ 32 are SE_ERR_* codes Ã¢â‚¬â€ most often SE_ERR_ACCESSDENIED when the user
         // cancels the UAC dialog.
         let result = unsafe {
             ShellExecuteW(
@@ -4608,7 +4089,7 @@ pub fn gateway_snapshot() -> Result<GatewaySnapshot, String> {
 }
 
 /// The email of whichever relay account is currently active, if any. Used
-/// only for the cross-service "currently active for" indicator — never a
+/// only for the cross-service "currently active for" indicator Ã¢â‚¬â€ never a
 /// hard dependency, so callers should treat `None` as "unknown," not "none."
 pub fn active_relay_email() -> Option<String> {
     let state = load_state().ok()?;
@@ -4640,7 +4121,6 @@ fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
     let mut state = load_state()?;
     restore_legacy_shared_config_if_needed(&mut state)?;
     let accounts = list_accounts_inner(&state)?;
-    let deepseek_vision = deepseek_vision_plan(&accounts);
     let routes = SUPPORTED_PROVIDERS
         .iter()
         .map(|provider| provider_route(&state, provider))
@@ -4698,7 +4178,6 @@ fn gateway_snapshot_locked() -> Result<GatewaySnapshot, String> {
         routes,
         active_codex_account: state.active_codex_account,
         codex_routes,
-        deepseek_vision,
         auto_failover,
         controller: ComponentStatus {
             state: phase_name.into(),
@@ -4791,7 +4270,7 @@ fn usage_http_error_message(provider: &str, status: reqwest::StatusCode) -> Stri
     match (provider, status.as_u16()) {
         ("kimi", 402 | 403) => "No active Kimi Code subscription".into(),
         (_, 401 | 403) => {
-            "Usage check unavailable — saved login is active. Auto-retry in 5 min or use Refresh usage."
+            "Usage check unavailable Ã¢â‚¬â€ saved login is active. Auto-retry in 5 min or use Refresh usage."
                 .into()
         }
         (_, code) => format!(
@@ -4881,12 +4360,6 @@ fn load_usage_credential(
         .into_iter()
         .find(|account| account.file_name == file_name)
         .ok_or("Account not found")?;
-    if account.provider == "deepseek" {
-        return Err(
-            "DeepSeek bills a prepaid balance, not a usage quota. Check your balance at platform.deepseek.com."
-                .into(),
-        );
-    }
     if account.provider == "antigravity" {
         return Err(
             "Antigravity quota usage is managed in the Google Cloud / Gemini developer console."
@@ -4953,7 +4426,7 @@ pub async fn get_gateway_account_usage(file_name: String) -> Result<GatewayAccou
 #[tauri::command]
 pub fn rename_gateway_account(file_name: String, name: String) -> Result<GatewaySnapshot, String> {
     let _mutation = mutation_lock()?;
-    let path = exact_auth_path(&file_name)?;
+    let path = exact_account_path(&file_name)?;
     if !path.is_file() {
         return Err("Account not found".into());
     }
@@ -4980,6 +4453,31 @@ pub(crate) fn exact_auth_path(file_name: &str) -> Result<PathBuf, String> {
         return Err("Invalid account filename".into());
     }
     Ok(auth_dir()?.join(file_name))
+}
+
+/// Resolve an account file name to its on-disk path, searching the OAuth auth
+/// dir first and then the API-key dir. Used wherever an account may be either
+/// auth flavor.
+pub(crate) fn exact_account_path(file_name: &str) -> Result<PathBuf, String> {
+    exact_auth_path(file_name)?; // validates the filename shape
+    let auth_path = auth_dir()?.join(file_name);
+    if auth_path.is_file() {
+        return Ok(auth_path);
+    }
+    let keys_path = keys_dir()?.join(file_name);
+    if keys_path.is_file() {
+        return Ok(keys_path);
+    }
+    Ok(auth_path)
+}
+
+/// The directory for a given auth flavor (used by removal transactions).
+fn account_directory_for(auth: &str) -> Result<PathBuf, String> {
+    if auth == "api_key" {
+        keys_dir()
+    } else {
+        auth_dir()
+    }
 }
 
 fn account_bytes_with_disabled(path: &Path, disabled: bool) -> Result<Vec<u8>, String> {
@@ -5745,7 +5243,7 @@ fn newest_claude_session_choice() -> Option<(String, String)> {
 }
 
 /// Maps a Claude effort level to a thinking level the routed model supports.
-/// Grok 4.5 keeps the desktop-effort remap (medium→low, high/xhigh/max→high).
+/// Grok 4.5 keeps the desktop-effort remap (mediumÃ¢â€ â€™low, high/xhigh/maxÃ¢â€ â€™high).
 fn effort_to_thinking(provider: &str, model: &str, effort: &str) -> String {
     if effort == "auto" || effort == "none" {
         return "auto".to_string();
@@ -5801,7 +5299,7 @@ fn sync_route_from_claude_session() {
         .unwrap_or(default_model);
     let Some((upstream, entry_thinking)) = alias_to_picker_entry(&provider, &model, selected)
     else {
-        return; // generic routing alias or unknown — leave the route alone
+        return; // generic routing alias or unknown Ã¢â‚¬â€ leave the route alone
     };
     // A variant picker entry carries its thinking; the session effort field
     // (when present) overrides it.
@@ -5975,35 +5473,43 @@ fn validate_account_invariant(directory: &Path, state_path: &Path) -> Result<(),
     .map_err(|error| format!("Controller state failed transaction validation: {error}"))?;
     let mut enabled = Vec::new();
     let mut supported = Vec::new();
-    for entry in fs::read_dir(directory)
-        .map_err(|error| format!("Could not validate {}: {error}", directory.display()))?
-    {
-        let entry = entry.map_err(|error| format!("Could not validate an account: {error}"))?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
+    let mut directories = vec![directory.to_path_buf()];
+    if let Ok(keys) = keys_dir() {
+        if !directories.contains(&keys) {
+            directories.push(keys);
         }
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let value: Value = serde_json::from_slice(
-            &fs::read(&path)
-                .map_err(|error| format!("Could not validate {}: {error}", path.display()))?,
-        )
-        .map_err(|error| {
-            format!(
-                "Account {} failed transaction validation: {error}",
-                path.display()
+    }
+    for directory in &directories {
+        for entry in fs::read_dir(directory)
+            .map_err(|error| format!("Could not validate {}: {error}", directory.display()))?
+        {
+            let entry = entry.map_err(|error| format!("Could not validate an account: {error}"))?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let value: Value = serde_json::from_slice(
+                &fs::read(&path)
+                    .map_err(|error| format!("Could not validate {}: {error}", path.display()))?,
             )
-        })?;
-        if account_provider(&value, &file_name).is_none() {
-            continue;
-        }
-        let disabled = value
-            .get("disabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        supported.push(file_name.clone());
-        if !disabled {
-            enabled.push(file_name);
+            .map_err(|error| {
+                format!(
+                    "Account {} failed transaction validation: {error}",
+                    path.display()
+                )
+            })?;
+            if account_provider(&value, &file_name).is_none() {
+                continue;
+            }
+            let disabled = value
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            supported.push(file_name.clone());
+            if !disabled {
+                enabled.push(file_name);
+            }
         }
     }
     if let Some(active) = state.active_account.as_deref() {
@@ -6102,12 +5608,14 @@ fn selection_transaction(
         } else {
             account.disabled
         };
+        let account_path = if account.auth == "api_key" {
+            keys_dir()?.join(&account.file_name)
+        } else {
+            directory.join(&account.file_name)
+        };
         mutations.push(FileMutation {
-            path: directory.join(&account.file_name),
-            after: Some(account_bytes_with_disabled(
-                &directory.join(&account.file_name),
-                disabled,
-            )?),
+            path: account_path.clone(),
+            after: Some(account_bytes_with_disabled(&account_path, disabled)?),
         });
     }
     let mut after_state = state.clone();
@@ -6126,24 +5634,6 @@ fn selection_transaction(
             .map_err(|_| format!("Refusing to transact outside {}", root.display()))?;
     }
     Ok((mutations, after_state))
-}
-
-fn selection_requires_backend_restart(
-    accounts: &[GatewayAccount],
-    previous_file_name: Option<&str>,
-    next_file_name: &str,
-) -> bool {
-    if previous_file_name == Some(next_file_name) {
-        return false;
-    }
-    let provider_for = |file_name: &str| {
-        accounts
-            .iter()
-            .find(|account| account.file_name == file_name)
-            .map(|account| account.provider.as_str())
-    };
-    previous_file_name.and_then(provider_for) == Some("deepseek")
-        || provider_for(next_file_name) == Some("deepseek")
 }
 
 #[derive(Clone, Copy)]
@@ -6232,7 +5722,7 @@ fn pick_failover_candidate<'a>(
 // down and switch to it automatically. This reuses exactly the manual
 // select_gateway_account transaction/invariant, it just picks the candidate
 // itself instead of waiting for a click. Never touches the isolated Claude
-// window/process — config only varies by provider, not by account, so the
+// window/process Ã¢â‚¬â€ config only varies by provider, not by account, so the
 // running Claude window is left alone and its next request simply lands on
 // the new credential. Silently does nothing if any step fails or no eligible
 // candidate exists; the caller (the relay's 429 path) still returns the
@@ -6316,7 +5806,7 @@ fn attempt_same_provider_failover(
 
 #[tauri::command]
 pub async fn select_gateway_account(
-    app: AppHandle,
+    _app: AppHandle,
     file_name: String,
     client: Option<String>,
 ) -> Result<AccountSelectionResult, String> {
@@ -6328,7 +5818,7 @@ pub async fn select_gateway_account(
     }
     let _mutation = mutation_lock()?;
     let client = ClientSurface::parse(client.as_deref().unwrap_or("claude"))?;
-    let selected = exact_auth_path(&file_name)?;
+    let selected = exact_account_path(&file_name)?;
     if !selected.is_file() {
         return Err("Account not found".into());
     }
@@ -6343,11 +5833,6 @@ pub async fn select_gateway_account(
     let root = root_dir()?;
     let directory = auth_dir()?;
     let state_path = controller_path()?;
-    let restart_backend = selection_requires_backend_restart(
-        &accounts,
-        active_account_for(&state, client),
-        &file_name,
-    );
     let (mutations, state) = selection_transaction(
         &root,
         &directory,
@@ -6358,13 +5843,10 @@ pub async fn select_gateway_account(
         &file_name,
     )?;
     run_transaction(&root, &mutations, || {
-        validate_account_invariant(&directory, &state_path)
+        validate_account_invariant(&auth_dir()?, &state_path)
     })?;
     runtime_lock()?.last_known_good_models.clear();
     prepare_config()?;
-    if restart_backend {
-        restart_backend_for_provider_config(&app, &state)?;
-    }
     let claude_config_changed = match client {
         ClientSurface::Claude => {
             write_isolated_claude_config(&isolated_claude_profile_dir()?, &state)?
@@ -6396,18 +5878,30 @@ pub fn set_gateway_route(
 ) -> Result<RouteUpdateResult, String> {
     let _mutation = mutation_lock()?;
     let client = ClientSurface::parse(client.as_deref().unwrap_or("claude"))?;
-    if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return Err("Provider must be claude, codex, xai, kimi, deepseek, or antigravity".into());
+    if !all_providers().contains(&provider.as_str()) {
+        return Err(format!("Unknown provider: {provider}"));
     }
-    let Some(spec) = model_specs(&provider).iter().find(|spec| spec.id == model) else {
-        return Err(format!("{model} is not an available {provider} model"));
-    };
-    if thinking != "auto" && !spec.thinking_levels.contains(&thinking.as_str()) {
-        return Err(format!(
-            "{} does not support the {thinking} thinking setting",
-            spec.label
-        ));
+    let specs = model_specs(&provider);
+    let spec = specs.iter().find(|spec| spec.id == model);
+    let mut thinking = thinking;
+    if specs.is_empty() {
+        // Live-catalog provider (router/custom): no pinned thinking levels, so
+        // force auto; the backend validates the model id against its live list.
+        thinking = "auto".into();
+    } else {
+        let Some(spec) = spec else {
+            return Err(format!("{model} is not an available {provider} model"));
+        };
+        if thinking != "auto" && !spec.thinking_levels.contains(&thinking.as_str()) {
+            return Err(format!(
+                "{} does not support the {thinking} thinking setting",
+                spec.label
+            ));
+        }
     }
+    let model_label = spec
+        .map(|spec| spec.label.to_string())
+        .unwrap_or_else(|| model.clone());
     let mut state = load_state()?;
     let account_is_active = list_accounts_inner(&state)?.iter().any(|account| {
         let selected = match client {
@@ -6429,7 +5923,7 @@ pub fn set_gateway_route(
             {
                 return Err(format!(
                     "{} is not available for the selected {} credential. Choose a model advertised by the backend.",
-                    spec.label,
+                    model_label,
                     provider_label(&provider)
                 ));
             }
@@ -6493,8 +5987,8 @@ pub fn set_open_claude_on_launch(open: bool) -> Result<GatewaySnapshot, String> 
 #[tauri::command]
 pub fn get_model_catalog(provider: String) -> Result<Vec<ModelCatalogEntry>, String> {
     let _mutation = mutation_lock()?;
-    if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return Err("Provider must be claude, codex, xai, kimi, deepseek, or antigravity".into());
+    if !all_providers().contains(&provider.as_str()) {
+        return Err(format!("Unknown provider: {provider}"));
     }
     let hidden = load_hidden_models()?;
     let live_catalog = runtime_lock()
@@ -6538,20 +6032,16 @@ pub fn set_model_hidden(model_id: String, hidden: bool) -> Result<GatewaySnapsho
 #[tauri::command]
 pub fn remove_gateway_account(file_name: String) -> Result<GatewaySnapshot, String> {
     let _mutation = mutation_lock()?;
-    let path = exact_auth_path(&file_name)?;
     let state = load_state()?;
     let accounts = list_accounts_inner(&state)?;
-    if !accounts
+    let account = accounts
         .iter()
-        .any(|account| account.file_name == file_name)
-    {
-        return Err("Account not found".into());
-    }
+        .find(|account| account.file_name == file_name)
+        .ok_or_else(|| "Account not found".to_string())?;
     let root = root_dir()?;
-    let directory = auth_dir()?;
+    let directory = account_directory_for(&account.auth)?;
     let state_path = controller_path()?;
     let labels_path = account_labels_path()?;
-    debug_assert_eq!(path, directory.join(&file_name));
     let labels = load_account_labels()?;
     let (mutations, next_state) = removal_transaction(
         AccountPaths {
@@ -6566,7 +6056,7 @@ pub fn remove_gateway_account(file_name: String) -> Result<GatewaySnapshot, Stri
         &file_name,
     )?;
     run_transaction(&root, &mutations, || {
-        validate_account_invariant(&directory, &state_path)
+        validate_account_invariant(&auth_dir()?, &state_path)
     })?;
     prepare_config()?;
     if state.active_account.as_deref() == Some(file_name.as_str()) {
@@ -6584,177 +6074,113 @@ pub fn remove_gateway_account(file_name: String) -> Result<GatewaySnapshot, Stri
     gateway_snapshot_locked()
 }
 
-/// Stable per-key account filename, so re-adding the same DeepSeek key updates
-/// the existing account instead of accumulating duplicates. Only a short digest
-/// of the key is used — the key itself must never appear in a filename.
-fn deepseek_credential_file_name(api_key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(api_key.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    format!("deepseek-{}.json", &digest[..16])
-}
-
-/// Builds the stored DeepSeek credential.
-///
-/// A brand-new account is created **disabled**, exactly like `merge_staged_login`
-/// does for a completed OAuth login. `validate_account_invariant` requires that
-/// precisely one account be enabled — the active one — so writing a new account
-/// as enabled makes the whole transaction roll back and the add silently fails.
-/// Re-adding a key that already exists preserves whatever state it had.
-fn deepseek_credential_value(api_key: &str, existing: Option<&Value>) -> Value {
-    let disabled = existing
-        .and_then(|value| value.get("disabled").and_then(Value::as_bool))
-        .unwrap_or(true);
-    serde_json::json!({
-        "type": "deepseek",
-        "api_key": api_key,
-        "disabled": disabled,
-    })
-}
-
-/// Verifies a DeepSeek API key against the account balance endpoint.
-///
-/// This is an authorization probe, not a usage reading: it exists so a typo'd or
-/// revoked key is rejected at add time rather than surfacing later as a failed
-/// relay request with no obvious cause.
-async fn verify_deepseek_api_key(api_key: &str) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .user_agent("Basiliskos/1.1")
-        .build()
-        .map_err(|error| format!("Could not prepare the DeepSeek check: {error}"))?;
-    let response = client
-        .get(DEEPSEEK_BALANCE_URL)
-        .bearer_auth(api_key)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|_| "Could not reach DeepSeek to verify the API key.".to_string())?;
-    match response.status().as_u16() {
-        200 => Ok(()),
-        401 | 403 => Err("DeepSeek rejected that API key.".into()),
-        code => Err(format!("DeepSeek returned {code} while verifying the key.")),
+/// Build a unique, filesystem-safe account file name for an API-key account,
+/// seeded from the provider and a slug of the label.
+fn unique_key_account_file_name(provider: &str, label: &str) -> Result<String, String> {
+    let slug: String = label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = slug.trim_matches('-').to_string();
+    let stem = if trimmed.is_empty() {
+        "account".to_string()
+    } else {
+        trimmed
+    };
+    let directory = keys_dir()?;
+    let mut candidate = format!("{provider}-{stem}.json");
+    let mut suffix = 1;
+    // The provider prefix is injected into the route; keep the file name unique
+    // so two DeepSeek labels do not collide.
+    while directory.join(&candidate).exists() {
+        candidate = format!("{provider}-{stem}-{suffix}.json");
+        suffix += 1;
     }
+    Ok(candidate)
 }
 
-/// Adds (or updates) a DeepSeek account from an API key.
-///
-/// DeepSeek is the only supported provider without an OAuth flow, so it has its
-/// own entry point rather than going through `launch_provider_login`. The stored
-/// credential is a normal auth-dir JSON file, which keeps rename / disable /
-/// remove / activate working unchanged.
-///
-/// The account is stored disabled (one enabled account per provider), so the
-/// returned `fileName` lets the caller activate it right away through
-/// `select_gateway_account`.
+/// Persist a custom API-key account. This is the "API keys" half of the
+/// Provider × Auth model: any provider that accepts a key can be added without
+/// the browser OAuth flow.
 #[tauri::command]
-pub async fn add_deepseek_account(
+pub fn add_api_key_account(
+    provider: String,
+    label: String,
     api_key: String,
-    replace_file_name: Option<String>,
-) -> Result<DeepseekAccountAdded, String> {
-    let api_key = api_key.trim().to_string();
-    if !is_valid_deepseek_api_key(&api_key) {
-        return Err("Enter a valid DeepSeek API key (letters, digits, '-' and '_' only).".into());
-    }
-    verify_deepseek_api_key(&api_key).await?;
-
+    base_url: Option<String>,
+    model: Option<String>,
+) -> Result<GatewaySnapshot, String> {
     let _mutation = mutation_lock()?;
-    let directory = auth_dir()?;
+    let provider = provider.to_ascii_lowercase();
+    if !auth_kinds_for(&provider).contains(&ProviderAuth::ApiKey) {
+        return Err(format!("{provider} does not accept an API key"));
+    }
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("An API key is required.".into());
+    }
+    let base_url = base_url
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .or_else(|| default_api_base_url(&provider).map(str::to_string));
+    let model = model
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty());
+    let label = normalized_account_label(&label)?;
+    let file_name = unique_key_account_file_name(&provider, &label)?;
+    let directory = keys_dir()?;
     secure_create_dir_all(&directory)?;
-    let file_name = deepseek_credential_file_name(&api_key);
-    let path = exact_auth_path(&file_name)?;
-    let existing = fs::read(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
-    let replacement = replace_file_name.as_deref();
-    if let Some(old_file) = replacement {
-        let _ = exact_auth_path(old_file)?;
+    let mut object = serde_json::Map::new();
+    object.insert("kind".into(), Value::String("api_key".into()));
+    object.insert("provider".into(), Value::String(provider));
+    object.insert("api_key".into(), Value::String(api_key));
+    if let Some(base_url) = &base_url {
+        object.insert("base_url".into(), Value::String(base_url.clone()));
     }
-    let replacement_value = replacement
-        .and_then(|file_name| fs::read(directory.join(file_name)).ok())
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
-    if replacement.is_some()
-        && replacement != Some(file_name.as_str())
-        && replacement_value
-            .as_ref()
-            .and_then(|value| account_provider(value, replacement.unwrap_or_default()))
-            .as_deref()
-            != Some("deepseek")
-    {
-        return Err("The DeepSeek account to replace was not found.".into());
+    if let Some(model) = &model {
+        object.insert("model".into(), Value::String(model.clone()));
     }
-    let credential =
-        deepseek_credential_value(&api_key, existing.as_ref().or(replacement_value.as_ref()));
-    let after = serde_json::to_vec_pretty(&credential)
-        .map_err(|_| "The DeepSeek credential could not be serialized")?;
-    let root = root_dir()?;
-    let state_path = controller_path()?;
-    let state = load_state()?;
-    let labels_path = account_labels_path()?;
+    object.insert("label".into(), Value::String(label.clone()));
+    object.insert("disabled".into(), Value::Bool(false));
+    let bytes = serde_json::to_vec_pretty(&Value::Object(object))
+        .map_err(|error| format!("Could not serialize API key account: {error}"))?;
+    durable_write(&directory.join(&file_name), &bytes)?;
     let mut labels = load_account_labels()?;
-    let mut after_state = state.clone();
-    let mut mutations = vec![FileMutation {
-        path: path.clone(),
-        after: Some(after),
-    }];
-    if let Some(old_file) = replacement.filter(|old| *old != file_name) {
-        mutations.push(FileMutation {
-            path: directory.join(old_file),
-            after: None,
-        });
-        if let Some(label) = labels.remove(old_file) {
-            labels.insert(file_name.clone(), label);
-            mutations.push(FileMutation {
-                path: labels_path.clone(),
-                after: Some(
-                    serde_json::to_vec_pretty(&labels)
-                        .map_err(|error| format!("Could not serialize profile names: {error}"))?,
-                ),
-            });
-        }
-        if after_state.active_account.as_deref() == Some(old_file) {
-            after_state.active_account = Some(file_name.clone());
-        }
-        if after_state.active_codex_account.as_deref() == Some(old_file) {
-            after_state.active_codex_account = Some(file_name.clone());
-        }
-        if after_state.active_account != state.active_account
-            || after_state.active_codex_account != state.active_codex_account
-        {
-            mutations.push(FileMutation {
-                path: state_path.clone(),
-                after: Some(
-                    serde_json::to_vec_pretty(&after_state).map_err(|error| {
-                        format!("Could not serialize controller state: {error}")
-                    })?,
-                ),
-            });
-        }
-    }
-    run_transaction(&root, &mutations, || {
-        validate_account_invariant(&directory, &state_path)
-    })
-    .inspect_err(|_| {
-        diagnostics::record(
-            ErrorCode::ConfigTransactionFailed,
-            "error",
-            "The DeepSeek credential could not be committed transactionally.",
-            None,
-            None,
-            Some("deepseek"),
-        );
-    })?;
+    labels.insert(file_name, label);
+    save_account_labels(&labels)?;
     prepare_config()?;
-    if after_state.active_account.is_some() {
-        let _ = write_isolated_claude_config(&isolated_claude_profile_dir()?, &after_state);
+    gateway_snapshot_locked()
+}
+
+/// The model ids an API-key account can route: its provider's pinned models
+/// plus any live catalog already fetched for that provider.
+#[tauri::command]
+pub fn get_api_key_account_models(file_name: String) -> Result<Vec<String>, String> {
+    let path = exact_account_path(&file_name)?;
+    let raw = fs::read_to_string(&path).map_err(|error| format!("Account not found: {error}"))?;
+    let value: Value =
+        serde_json::from_str(&raw).map_err(|error| format!("Account file is invalid: {error}"))?;
+    let provider = account_provider(&value, &file_name).ok_or("Unknown provider")?;
+    let mut models: Vec<String> = model_specs(&provider)
+        .iter()
+        .map(|spec| spec.id.to_string())
+        .collect();
+    if let Ok(runtime) = runtime_lock() {
+        if let Some(live) = runtime.last_known_model_catalog.get(&provider) {
+            for model in live {
+                if !models.contains(model) {
+                    models.push(model.clone());
+                }
+            }
+        }
     }
-    if after_state.active_codex_account.is_some() {
-        let _ = write_isolated_codex_config(&isolated_codex_home()?, &after_state);
-    }
-    Ok(DeepseekAccountAdded {
-        snapshot: gateway_snapshot_locked()?,
-        file_name,
-    })
+    Ok(models)
 }
 
 enum LoginOutput {
@@ -7146,12 +6572,6 @@ fn provider_login_flag(provider: &str) -> Result<&'static str, String> {
         "xai" => Ok("-xai-login"),
         "kimi" => Ok("-kimi-login"),
         "antigravity" => Ok("-antigravity-login"),
-        // DeepSeek has no OAuth/device flow — it is added with an API key via
-        // `add_deepseek_account`, so routing it here would be a bug, not a
-        // user error.
-        "deepseek" => {
-            Err("DeepSeek accounts are added with an API key, not a browser login.".into())
-        }
         _ => Err("Provider must be claude, codex, xai, kimi, or antigravity".into()),
     }
 }
@@ -7547,7 +6967,7 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
         .map(|account| account.provider.as_str());
     let model_label = route_label(state, active_provider);
     // Advertise the active provider's picker entries in Claude's own picker:
-    // the selected model plus its thinking-level variants ("Model · High"),
+    // the selected model plus its thinking-level variants ("Model Ã‚Â· High"),
     // then the other visible models. `name` is a real Anthropic catalog alias
     // (Claude validates it); the front proxy maps the alias back to the
     // upstream model + thinking (`client_picker_choice`).
@@ -7762,32 +7182,40 @@ fn merge_codex_config(existing: Option<&str>, generated: &str) -> String {
 /// dropped so the picker never shows a model that cannot route.
 fn enabled_providers(auth: &Path) -> std::collections::HashSet<String> {
     let mut providers = std::collections::HashSet::new();
-    let Ok(entries) = fs::read_dir(auth) else {
-        return providers;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
+    let mut directories = vec![auth.to_path_buf()];
+    if let Ok(keys) = keys_dir() {
+        if !directories.contains(&keys) {
+            directories.push(keys);
         }
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let Ok(raw) = fs::read_to_string(&path) else {
+    }
+    for directory in directories {
+        let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        let Some(provider) = account_provider(&value, &file_name) else {
-            continue;
-        };
-        if value
-            .get("disabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let Some(provider) = account_provider(&value, &file_name) else {
+                continue;
+            };
+            if value
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            providers.insert(provider);
         }
-        providers.insert(provider);
     }
     providers
 }
@@ -7892,7 +7320,7 @@ fn write_isolated_codex_config(home: &Path, state: &ControllerState) -> Result<(
     let existing_config = fs::read_to_string(home.join("config.toml")).ok();
     let merged_config = merge_codex_config(existing_config.as_deref(), &generated_config);
     durable_write(&home.join("config.toml"), merged_config.as_bytes())?;
-    // Seed auth.json only if missing — the provider authenticates to the
+    // Seed auth.json only if missing Ã¢â‚¬â€ the provider authenticates to the
     // Basiliskos relay via env_key; the app's own login state is anchored
     // separately (anchored-account milestone).
     let auth_path = home.join("auth.json");
@@ -8044,6 +7472,23 @@ fn maybe_apply_claude_icons(app: &AppHandle, pid: u32, state: &ControllerState) 
 #[cfg(not(target_os = "windows"))]
 fn maybe_apply_claude_icons(_app: &AppHandle, _pid: u32, _state: &ControllerState) {}
 
+/// For an active API-key account, Claude's `/model` picker can't list its live
+/// (non-Anthropic) models, so surface the single active routing model through
+/// Claude's `ANTHROPIC_CUSTOM_MODEL_OPTION` escape hatch. OAuth accounts return
+/// None — they use the aliased in-app picker.
+fn claude_custom_model_hook(
+    state: &ControllerState,
+    accounts: &[GatewayAccount],
+) -> Option<String> {
+    let file = state.active_account.as_deref()?;
+    let account = accounts.iter().find(|account| account.file_name == file)?;
+    if account.auth != "api_key" {
+        return None;
+    }
+    let model = normalized_route(state, &account.provider).model;
+    (!model.is_empty()).then_some(model)
+}
+
 #[tauri::command]
 pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
     let _mutation = mutation_lock()?;
@@ -8085,6 +7530,11 @@ pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        // Drill the active API-key routing model into Claude's /model picker so
+        // the user sees the one model Basiliskos is actually routing.
+        if let Some(model) = claude_custom_model_hook(&state, &accounts) {
+            command.env("ANTHROPIC_CUSTOM_MODEL_OPTION", model);
+        }
         hidden(&mut command);
         let mut child = command.spawn().map_err(|error| {
             format!("Could not open the isolated Basiliskos Claude window: {error}")
@@ -8194,7 +7644,7 @@ pub fn launch_hydra_codex_app(app: AppHandle) -> Result<GatewaySnapshot, String>
         let home = isolated_codex_home()?;
         write_isolated_codex_config(&home, &state)?;
         // Anchor the isolated window's login: real ChatGPT credential from the
-        // relay vault (one-refresher rule — the anchor is excluded from the
+        // relay vault (one-refresher rule Ã¢â‚¬â€ the anchor is excluded from the
         // relay's auto-refresh, so the isolated app owns it).
         match seed_isolated_codex_auth(&home) {
             Ok(true) => codex_log_icon_line(&format!(
@@ -8292,27 +7742,36 @@ fn append_codex_dial_log(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::base_alias;
     use crate::usage::{unrecorded_usage_window, usage_window};
-    use crate::vision::{replace_images_with_descriptions, text_from_vision_response};
 
     #[test]
     fn direct_update_requires_the_canonical_installer_and_checksum_entry() {
         assert_eq!(
             release_installer_name("v1.1.18").unwrap(),
-            "Basiliskos_1.1.18_x64-setup.exe"
+            "BasiliskOS_1.1.18_x64-setup.exe"
         );
         assert!(release_installer_name("../v1.1.18").is_err());
-        let installer = "Basiliskos_1.1.18_x64-setup.exe";
         let checksum = "a".repeat(64);
-        let manifest = format!("{checksum}  {installer}\n{}  other.exe", "b".repeat(64));
-        assert_eq!(checksum_from_manifest(&manifest, installer), Some(checksum));
+        // The manifest's casing wins: a client expecting either the historical
+        // `Basiliskos_` prefix or the current `BasiliskOS_` prefix must resolve
+        // the same asset and download it under its published name.
+        let new_cased = "BasiliskOS_1.1.18_x64-setup.exe";
+        let old_cased = "Basiliskos_1.1.18_x64-setup.exe";
+        let manifest = format!("{checksum}  {new_cased}\n{}  other.exe", "b".repeat(64));
         assert_eq!(
-            checksum_from_manifest(&manifest, "other.exe"),
-            Some("b".repeat(64))
+            checksum_from_manifest(&manifest, new_cased),
+            Some((checksum.clone(), new_cased.to_owned()))
         );
         assert_eq!(
-            checksum_from_manifest("bad  Basiliskos_1.1.18_x64-setup.exe", installer),
+            checksum_from_manifest(&manifest, old_cased),
+            Some((checksum.clone(), new_cased.to_owned()))
+        );
+        assert_eq!(
+            checksum_from_manifest(&manifest, "other.exe"),
+            Some(("b".repeat(64), "other.exe".to_owned()))
+        );
+        assert_eq!(
+            checksum_from_manifest("bad  Basiliskos_1.1.18_x64-setup.exe", old_cased),
             None
         );
     }
@@ -8329,203 +7788,6 @@ mod tests {
             serde_json::json!({"type": provider}).to_string(),
         )
         .unwrap();
-    }
-
-    fn vision_account(
-        file_name: &str,
-        provider: &str,
-        label: &str,
-        disabled: bool,
-        credential_status: &str,
-    ) -> GatewayAccount {
-        GatewayAccount {
-            file_name: file_name.into(),
-            provider: provider.into(),
-            email: None,
-            label: label.into(),
-            disabled,
-            active: !disabled,
-            active_for_codex: false,
-            cooldown_until_ms: None,
-            expires_at_ms: None,
-            credential_status: credential_status.into(),
-        }
-    }
-
-    #[test]
-    fn deepseek_vision_plan_keeps_claude_scaffolded_when_oauth_is_missing() {
-        let accounts = vec![vision_account(
-            "codex-charles.json",
-            "codex",
-            "Charles Codex",
-            true,
-            "active",
-        )];
-        let plan = deepseek_vision_plan(&accounts);
-
-        assert_eq!(plan.transport, "isolated-sidecar");
-        assert!(plan.enabled);
-        assert_eq!(plan.candidates[0].provider, "codex");
-        assert_eq!(plan.candidates[0].model, "gpt-5.6-luna");
-        assert_eq!(plan.candidates[0].thinking, "xhigh");
-        assert!(plan.candidates[0].credential_available);
-        assert_eq!(plan.candidates[2].provider, "kimi");
-        assert_eq!(plan.candidates[2].credential_status, "missing");
-        assert!(!plan.candidates[2].credential_available);
-        assert_eq!(plan.candidates[3].provider, "claude");
-        assert_eq!(plan.candidates[3].model, "claude-haiku-4-5-20251001");
-        assert_eq!(plan.candidates[3].credential_status, "missing");
-        assert!(!plan.candidates[3].credential_available);
-    }
-
-    #[test]
-    fn deepseek_vision_plan_treats_disabled_oauth_as_available_for_sidecar() {
-        let accounts = vec![vision_account(
-            "claude-charles.json",
-            "claude",
-            "Charles Claude",
-            true,
-            "active",
-        )];
-        let plan = deepseek_vision_plan(&accounts);
-        let claude = plan
-            .candidates
-            .iter()
-            .find(|candidate| candidate.provider == "claude")
-            .unwrap();
-
-        assert!(claude.credential_available);
-        assert_eq!(claude.credential_status, "active");
-        assert!(claude
-            .detail
-            .contains("simply not the last-selected account of its provider"));
-    }
-
-    #[test]
-    fn vision_model_catalog_rejects_text_only_deepseek() {
-        assert!(vision_model_supported("codex", "gpt-5.6-luna"));
-        assert!(vision_model_supported(
-            "claude",
-            "claude-haiku-4-5-20251001"
-        ));
-        assert!(vision_model_supported("kimi", "kimi-k3"));
-        assert!(vision_model_supported("xai", "grok-4.5"));
-        assert!(!vision_model_supported("deepseek", "deepseek-v4-flash"));
-    }
-
-    #[test]
-    fn vision_translation_extracts_images_and_replaces_them_with_text() {
-        let mut request = serde_json::json!({
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Read this screenshot."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
-                    {"type": "tool_result", "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}}
-                    ]}
-                ]
-            }]
-        });
-        let content = vision_content_from_request(&request).unwrap();
-        assert_eq!(
-            content
-                .iter()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
-                .count(),
-            2
-        );
-        replace_images_with_descriptions(
-            &mut request,
-            &["newest details".into(), "older details".into()],
-        );
-        append_vision_presentation_guidance(&mut request).unwrap();
-        let serialized = serde_json::to_string(&request).unwrap();
-        assert!(!serialized.contains("base64"));
-        assert_eq!(serialized.matches("Image details:").count(), 2);
-        assert!(serialized.contains("newest details"));
-        assert!(serialized.contains("older details"));
-        assert!(!serialized.contains("Vision sidecar"));
-        assert!(serialized.contains("Do not mention image processing"));
-    }
-
-    #[test]
-    fn responses_images_become_sidecar_anthropic_blocks() {
-        use crate::vision::{vision_content_from_responses, vision_sidecar_request_from_any};
-        let request = serde_json::json!({
-            "model": "deepseek-v4-flash",
-            "input": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "What is in this screenshot?"},
-                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
-                    ]
-                }
-            ]
-        });
-        let content = vision_content_from_responses(&request).unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[1]["type"], "image");
-        assert_eq!(content[1]["source"]["media_type"], "image/png");
-        assert_eq!(content[1]["source"]["data"], "AAAA");
-        let sidecar = vision_sidecar_request_from_any(&request).unwrap();
-        assert!(sidecar.get("messages").is_some());
-        assert!(vision_sidecar_request_from_any(&serde_json::json!({
-            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"no image"}]}]
-        }))
-        .is_none());
-    }
-
-    #[test]
-    fn vision_response_parser_accepts_anthropic_and_openai_shapes() {
-        assert_eq!(
-            text_from_vision_response(&serde_json::json!({
-                "content": [{"type": "text", "text": "Anthropic text"}]
-            })),
-            Some("Anthropic text".into())
-        );
-        assert_eq!(
-            text_from_vision_response(&serde_json::json!({
-                "choices": [{"message": {"content": "OpenAI text"}}]
-            })),
-            Some("OpenAI text".into())
-        );
-    }
-
-    fn begin_mock_request(
-        runtime: &tokio::runtime::Handle,
-        scenario: crate::test_support::FaultScenario,
-        first_response_timeout: Duration,
-        stream_idle_timeout: Duration,
-    ) -> (
-        crate::test_support::MockBackend,
-        Result<UpstreamMeta, FirstResponseFailure>,
-    ) {
-        // Some Windows endpoint filters intermittently abort a brand-new
-        // loopback GET before response headers. Retrying only the disposable
-        // test fixture keeps the fault harness deterministic; production
-        // requests use begin_upstream_request directly and are never replayed.
-        for _ in 0..3 {
-            let backend = crate::test_support::MockBackend::spawn(scenario).unwrap();
-            let result = begin_upstream_request_with_timeouts(
-                runtime,
-                reqwest::Client::builder().no_proxy().build().unwrap(),
-                reqwest::Method::GET,
-                format!("http://{}/fault", backend.address()),
-                Vec::new(),
-                Vec::new(),
-                first_response_timeout,
-                stream_idle_timeout,
-            );
-            if matches!(result, Err(FirstResponseFailure::Connect)) {
-                continue;
-            }
-            return (backend, result);
-        }
-        panic!("the loopback fault fixture was aborted three consecutive times")
     }
 
     #[test]
@@ -8618,7 +7880,7 @@ mod tests {
         );
 
         // A real billing config (proven by `currentPeriod`) with no usage
-        // fields means "hasn't used anything yet this period", not "broken" —
+        // fields means "hasn't used anything yet this period", not "broken" Ã¢â‚¬â€
         // a fresh/idle account, distinct from a genuine 0%-used reading.
         let xai_idle = parse_xai_usage(&serde_json::json!({
             "config": {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY"}}
@@ -8727,45 +7989,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn deepseek_auth_file(auth: &Path, file_name: &str, api_key: &str, disabled: bool) {
-        fs::write(
-            auth.join(file_name),
-            serde_json::json!({"type": "deepseek", "api_key": api_key, "disabled": disabled})
-                .to_string(),
-        )
-        .unwrap();
-    }
-
-    fn state_with_active(auth_file_name: &str) -> ControllerState {
-        ControllerState {
-            api_key: "test-secret".into(),
-            claude_config_id: "id".into(),
-            previous_claude_applied_id: None,
-            active_account: Some(auth_file_name.into()),
-            active_codex_account: None,
-            codex_routes: default_routes(),
-            routes: default_routes(),
-            claude_window_icon: default_claude_window_icon(),
-            skip_model_switch_confirmation: false,
-            open_claude_on_launch: true,
-        }
-    }
-
-    #[test]
-    fn deepseek_api_keys_are_rejected_unless_they_are_safe_yaml_scalars() {
-        assert!(is_valid_deepseek_api_key("sk-abc123_XYZ-456"));
-        assert!(!is_valid_deepseek_api_key(""));
-        // A quote or backslash would either escape the rendered YAML scalar or
-        // be silently rewritten by `yaml_quote`, producing a wrong key.
-        assert!(!is_valid_deepseek_api_key("sk-abc\"def"));
-        assert!(!is_valid_deepseek_api_key("sk-abc\\def"));
-        assert!(!is_valid_deepseek_api_key("sk-abc def"));
-        assert!(!is_valid_deepseek_api_key("sk-abc\ndef"));
-        assert!(!is_valid_deepseek_api_key(
-            &"a".repeat(MAX_DEEPSEEK_API_KEY_LEN + 1)
-        ));
-    }
-
     #[test]
     fn codex_config_toml_points_only_at_the_local_relay_over_responses_wire() {
         let config = codex_config_toml(
@@ -8826,7 +8049,6 @@ mod tests {
         assert!(ids.contains(&"gemini-3.7-flash"));
         assert!(ids.contains(&"grok-4.5"));
         assert!(ids.contains(&"kimi-k3"));
-        assert!(ids.contains(&"deepseek-v4-flash"));
         // Every entry carries the required ModelInfo fields + a vendored prompt.
         for model in &models {
             assert!(model.get("slug").is_some());
@@ -8852,11 +8074,9 @@ mod tests {
     fn codex_catalog_offers_only_authenticated_providers() {
         let auth = temp_dir("codex-catalog-auth");
         auth_file(&auth, "xai-test.json", "xai");
-        deepseek_auth_file(&auth, "deepseek-aaa.json", "sk-key", false);
 
         let enabled = enabled_providers(&auth);
         assert!(enabled.contains("xai"));
-        assert!(enabled.contains("deepseek"));
         assert!(!enabled.contains("claude"));
         assert!(!enabled.contains("codex"));
         assert!(!enabled.contains("kimi"));
@@ -8869,7 +8089,6 @@ mod tests {
             .collect::<Vec<_>>();
         // Authenticated providers are offered.
         assert!(ids.contains(&"grok-4.5"));
-        assert!(ids.contains(&"deepseek-v4-flash"));
         // Un-authed providers are dropped, so the picker never shows a model
         // that cannot route.
         assert!(!ids.contains(&"gpt-5.6-terra"));
@@ -9006,353 +8225,6 @@ mod tests {
         assert!(write_isolated_codex_config(&home, &state).is_err());
         assert!(!home.join("config.toml").exists());
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn deepseek_credential_file_name_is_stable_per_key_and_hides_the_key() {
-        let name = deepseek_credential_file_name("sk-secret-key-value");
-        assert_eq!(name, deepseek_credential_file_name("sk-secret-key-value"));
-        assert_ne!(name, deepseek_credential_file_name("sk-a-different-key"));
-        assert!(name.starts_with("deepseek-"));
-        assert!(name.ends_with(".json"));
-        assert!(!name.contains("secret"));
-    }
-
-    #[test]
-    fn deepseek_compat_block_uses_the_enabled_account_regardless_of_active() {
-        let auth = temp_dir("deepseek-config");
-        deepseek_auth_file(&auth, "deepseek-aaa.json", "sk-active-key", false);
-        deepseek_auth_file(&auth, "deepseek-bbb.json", "sk-other-key", true); // disabled
-        auth_file(&auth, "xai-test.json", "xai");
-
-        let config = render_config(&auth, &state_with_active("deepseek-aaa.json"));
-        // `api-keys` parses but loads zero clients on the pinned runtime; the
-        // key must be under `api-key-entries`.
-        assert!(config.contains("openai-compatibility:"));
-        assert!(config.contains("deepseek_responses_url: \"https://api.deepseek.com/responses\""));
-        assert!(config.contains("vision_url: \"http://127.0.0.1:8317/hydra/vision-describe\""));
-        assert!(config.contains("api-key-entries:"));
-        assert!(config.contains("- api-key: \"sk-active-key\""));
-        assert!(config.contains("- name: \"basiliskos-deepseek\""));
-        assert!(config.contains("base-url: \"https://api.deepseek.com/v1\""));
-        assert!(config.contains("- name: \"deepseek-v4-flash\""));
-        assert!(
-            config.contains("- name: \"deepseek-v4-flash\"\n        alias: \"deepseek-v4-flash\"")
-        );
-        // Only DeepSeek ids are aliased. Other providers' models (grok-4.5,
-        // claude-*, gpt-5.6-*) must NOT be captured, or the isolated Codex
-        // window's model switcher would keep routing them to DeepSeek instead
-        // of their real providers.
-        assert!(config.contains("alias: \"deepseek-v4-pro\""));
-        assert!(!config.contains("alias: \"grok-4.5\""));
-        assert!(!config.contains("alias: \"grok-4.6\""));
-        assert!(!config.contains("alias: \"claude-sonnet-4-5-20250929\""));
-        assert!(!config.contains("alias: \"gpt-5.6-terra\""));
-        assert!(!config.contains("alias: \"kimi-k3\""));
-        // A disabled account's key is never rendered.
-        assert!(!config.contains("sk-other-key"));
-
-        // A non-DeepSeek active account still routes DeepSeek picks for real:
-        // the enabled DeepSeek account's key stays in the compat block.
-        let other = render_config(&auth, &state_with_active("xai-test.json"));
-        assert!(other.contains("openai-compatibility:"));
-        assert!(other.contains("- api-key: \"sk-active-key\""));
-        assert!(!other.contains("sk-other-key"));
-
-        // With every DeepSeek account disabled, the block is omitted.
-        deepseek_auth_file(&auth, "deepseek-aaa.json", "sk-active-key", true);
-        let disabled = render_config(&auth, &state_with_active("deepseek-aaa.json"));
-        assert!(!disabled.contains("openai-compatibility:"));
-        assert!(!disabled.contains("sk-active-key"));
-
-        let _ = fs::remove_dir_all(auth);
-    }
-
-    #[test]
-    fn adding_a_deepseek_account_does_not_break_the_one_enabled_per_provider_invariant() {
-        // Regression: a new DeepSeek account was written enabled, so the auth
-        // dir briefly had two enabled accounts, `validate_account_invariant`
-        // rejected it, and `run_transaction` rolled the write back — the add
-        // failed with "Account transaction invariant failed" every time.
-        let root = temp_dir("deepseek-invariant");
-        let directory = root.join("auth");
-        fs::create_dir_all(&directory).unwrap();
-        let state_path = root.join("controller.json");
-
-        // An active, enabled Codex account — the normal starting state.
-        fs::write(
-            directory.join("codex-active.json"),
-            serde_json::json!({"type": "codex", "disabled": false}).to_string(),
-        )
-        .unwrap();
-        fs::write(
-            &state_path,
-            serde_json::to_vec(&state_with_active("codex-active.json")).unwrap(),
-        )
-        .unwrap();
-        validate_account_invariant(&directory, &state_path)
-            .expect("baseline state should satisfy the invariant");
-
-        // Adding DeepSeek must leave the invariant intact.
-        let credential = deepseek_credential_value("sk-new-key", None);
-        assert_eq!(credential.get("disabled"), Some(&Value::Bool(true)));
-        fs::write(
-            directory.join("deepseek-new.json"),
-            serde_json::to_vec(&credential).unwrap(),
-        )
-        .unwrap();
-        validate_account_invariant(&directory, &state_path)
-            .expect("adding a DeepSeek account must not break the invariant");
-
-        // The auto-switch depends on the add result naming a file that actually
-        // exists in the auth dir and is recognised as a DeepSeek account —
-        // otherwise the UI silently falls back to "select it yourself".
-        let added_name = deepseek_credential_file_name("sk-new-key");
-        let stored: Value =
-            serde_json::from_slice(&fs::read(directory.join("deepseek-new.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            account_provider(&stored, &added_name).as_deref(),
-            Some("deepseek")
-        );
-
-        // Re-adding the same key preserves state instead of re-enabling it.
-        let reused = deepseek_credential_value("sk-new-key", Some(&credential));
-        assert_eq!(reused.get("disabled"), Some(&Value::Bool(true)));
-        let enabled = serde_json::json!({"type": "deepseek", "disabled": false});
-        assert_eq!(
-            deepseek_credential_value("sk-new-key", Some(&enabled)).get("disabled"),
-            Some(&Value::Bool(false)),
-            "an already-active DeepSeek account must not be disabled by re-adding its key"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn deepseek_credentials_report_active_rather_than_unknown_expiry() {
-        let now = Utc::now();
-        // API keys carry no expiry; the generic path would call that "unknown".
-        assert_eq!(
-            credential_status("deepseek", "deepseek-aaa.json", None, now),
-            "active"
-        );
-        assert_eq!(
-            credential_status("claude", "claude-aaa.json", None, now),
-            "unknown"
-        );
-    }
-
-    #[test]
-    fn deepseek_is_routable_but_has_no_browser_login() {
-        assert!(SUPPORTED_PROVIDERS.contains(&"deepseek"));
-        assert_eq!(default_model("deepseek"), "deepseek-v4-flash");
-        assert_eq!(provider_label("deepseek"), "DeepSeek");
-        assert!(default_routes().contains_key("deepseek"));
-        // Every DeepSeek model must be advertised in the rendered config block,
-        // or the route would be selectable in the UI but unknown to the backend.
-        assert_eq!(model_specs("deepseek").len(), DEEPSEEK_MODELS.len());
-        assert!(provider_login_flag("deepseek").is_err());
-
-        // The retired 2026-07-24 model IDs must never come back, and every
-        // advertised level must either disable thinking or be expressible
-        // through adaptive thinking.
-        for spec in DEEPSEEK_MODELS {
-            assert!(spec.id != "deepseek-chat" && spec.id != "deepseek-reasoner");
-            for level in spec.thinking_levels {
-                assert!(
-                    matches!(*level, "none" | "low" | "high" | "max"),
-                    "{} advertises an unsupported thinking level: {level}",
-                    spec.id
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn deepseek_requests_carry_no_image_blocks() {
-        // Regression: a tool result containing a screenshot became an `image_url`
-        // part upstream and DeepSeek 400'd the entire request with
-        // "unknown variant `image_url`, expected `text`" (observed at
-        // messages[93] of a real session), which killed the conversation.
-        let mut state = state_with_active("deepseek-aaa.json");
-        state.routes.insert(
-            "deepseek".into(),
-            RouteSelection {
-                model: "deepseek-v4-flash".into(),
-                thinking: "auto".into(),
-            },
-        );
-        let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-5-20250929",
-            "max_tokens": 1024,
-            "messages": [
-                {"role": "user", "content": [
-                    {"type": "text", "text": "look"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}},
-                        {"type": "text", "text": "kept"}
-                    ]}
-                ]}
-            ]
-        });
-        rewrite_claude_request(&mut body, &state, "deepseek", false).unwrap();
-
-        let serialized = serde_json::to_string(&body).unwrap();
-        assert!(
-            !serialized.contains("\"image\""),
-            "no image block may survive: {serialized}"
-        );
-        assert!(!serialized.contains("base64"));
-        // Text alongside the image, and inside the tool_result, is preserved.
-        assert!(serialized.contains("look"));
-        assert!(serialized.contains("kept"));
-        // The model is told an image was dropped rather than silently losing it,
-        // and the tool_result keeps non-empty content.
-        assert!(serialized.contains("image omitted"));
-        let tool_result = &body["messages"][1]["content"][0];
-        assert_eq!(tool_result["type"], Value::String("tool_result".into()));
-        assert_eq!(
-            tool_result["content"][0]["type"],
-            Value::String("text".into())
-        );
-
-        // The fixup is DeepSeek-only — other providers keep images intact.
-        let mut untouched = serde_json::json!({
-            "model": "x", "max_tokens": 16,
-            "messages": [{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "CCCC"}}
-            ]}]
-        });
-        rewrite_claude_request(&mut untouched, &state, "claude", false).unwrap();
-        assert!(serde_json::to_string(&untouched)
-            .unwrap()
-            .contains("base64"));
-    }
-
-    #[test]
-    fn text_only_image_rejection_is_rephrased_for_the_codex_dial() {
-        // The isolated Codex window encrypts request bodies, so the relay
-        // cannot strip an image before the upstream sees it. The DeepSeek 400
-        // ("unknown variant `image_url`, expected `text`") must become an
-        // actionable message instead of leaking the raw deserialization error.
-        let raw = serde_json::json!({
-            "error": {
-                "message": "Failed to deserialize the JSON body into the target type: messages[43]: unknown variant `image_url`, expected `text` at line 1 column 459913",
-                "type": "invalid_request_error",
-                "param": null,
-                "code": "invalid_request_error"
-            }
-        })
-        .to_string();
-        let rephrased =
-            rephrase_text_only_image_error(raw.as_bytes()).expect("the rejection is rephrased");
-        let value: Value =
-            serde_json::from_slice(&rephrased).expect("the rephrased body is valid JSON");
-        let message = value["error"]["message"]
-            .as_str()
-            .expect("the rephrased body keeps an error message");
-        assert!(message.contains("text-only"));
-        assert!(message.contains("vision-capable"));
-        assert_eq!(
-            value["error"]["code"],
-            Value::String("bas_text_only_image".into())
-        );
-        assert!(!rephrased
-            .windows(raw.len())
-            .any(|window| window == raw.as_bytes()));
-
-        // Non-image upstream errors pass through untouched.
-        let other =
-            serde_json::json!({"error": {"message": "rate limited", "type": "error"}}).to_string();
-        assert!(rephrase_text_only_image_error(other.as_bytes()).is_none());
-
-        // Streamed or otherwise non-JSON bodies pass through untouched.
-        let sse = b"data: {\"error\":{\"message\":\"unknown variant `image_url`\"}}\n\n";
-        assert!(rephrase_text_only_image_error(sse).is_none());
-    }
-
-    #[test]
-    fn provider_is_text_only_marks_deepseek_only() {
-        assert!(provider_is_text_only(Some("deepseek")));
-        for provider in ["codex", "claude", "xai", "kimi", "antigravity"] {
-            assert!(!provider_is_text_only(Some(provider)));
-        }
-        assert!(!provider_is_text_only(None));
-    }
-
-    #[test]
-    fn deepseek_effort_uses_adaptive_thinking_and_strips_ineffective_sampling() {
-        fn rewrite(thinking: &str, max_tokens: u64) -> serde_json::Map<String, Value> {
-            let mut state = state_with_active("deepseek-aaa.json");
-            state.routes.insert(
-                "deepseek".into(),
-                RouteSelection {
-                    model: "deepseek-v4-flash".into(),
-                    thinking: thinking.into(),
-                },
-            );
-            let mut body = serde_json::json!({
-                "model": "claude-sonnet-4-5-20250929",
-                "max_tokens": max_tokens,
-                "temperature": 0.2,
-                "top_p": 0.8,
-                "presence_penalty": 0.4,
-                "frequency_penalty": 0.6,
-                "messages": [{"role": "user", "content": "hi"}],
-            });
-            rewrite_claude_request(&mut body, &state, "deepseek", false).unwrap();
-            body.as_object().unwrap().clone()
-        }
-
-        // The plain model id must survive — a `model(effort)` suffix breaks
-        // credential selection on the openai-compatibility path.
-        for level in ["low", "high", "max"] {
-            let request = rewrite(level, 4_096);
-            assert_eq!(request["model"], Value::String("deepseek-v4-flash".into()));
-            assert_eq!(
-                request["thinking"]["type"],
-                Value::String("adaptive".into())
-            );
-            assert_eq!(
-                request["output_config"]["effort"],
-                Value::String(level.into())
-            );
-            assert_eq!(request["max_tokens"], Value::from(4_096u64));
-            for parameter in [
-                "temperature",
-                "top_p",
-                "presence_penalty",
-                "frequency_penalty",
-            ] {
-                assert!(
-                    !request.contains_key(parameter),
-                    "{parameter} must be removed while DeepSeek thinking is enabled"
-                );
-            }
-        }
-
-        // Off has to override Claude Desktop's thinking metadata so DeepSeek
-        // actually runs a non-thinking request and honours sampling controls.
-        let disabled = rewrite("none", 4_096);
-        assert_eq!(
-            disabled["thinking"]["type"],
-            Value::String("disabled".into())
-        );
-        assert!(!disabled.contains_key("output_config"));
-        assert_eq!(disabled["temperature"], Value::from(0.2));
-        assert_eq!(disabled["top_p"], Value::from(0.8));
-        assert_eq!(disabled["presence_penalty"], Value::from(0.4));
-        assert_eq!(disabled["frequency_penalty"], Value::from(0.6));
-
-        // "auto" leaves the client's own thinking and sampling configuration alone.
-        let automatic = rewrite("auto", 200_000);
-        assert!(!automatic.contains_key("thinking"));
-        assert_eq!(automatic["temperature"], Value::from(0.2));
-        assert_eq!(automatic["top_p"], Value::from(0.8));
     }
 
     #[test]
@@ -9849,6 +8721,8 @@ mod tests {
             cooldown_until_ms: None,
             expires_at_ms: None,
             credential_status: "unknown".into(),
+            auth: "oauth".into(),
+            base_url: None,
         };
         let accounts = vec![
             account("codex-a.json", "codex", false),
@@ -9901,54 +8775,6 @@ mod tests {
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert_eq!(selected.active_account.as_deref(), Some("xai-b.json"));
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn deepseek_account_switch_requires_backend_config_reload() {
-        let account = |file_name: &str, provider: &str| GatewayAccount {
-            file_name: file_name.into(),
-            provider: provider.into(),
-            email: None,
-            label: provider.into(),
-            disabled: true,
-            active: false,
-            active_for_codex: false,
-            cooldown_until_ms: None,
-            expires_at_ms: None,
-            credential_status: "unknown".into(),
-        };
-        let accounts = vec![
-            account("xai-a.json", "xai"),
-            account("codex-b.json", "codex"),
-            account("deepseek-c.json", "deepseek"),
-            account("deepseek-d.json", "deepseek"),
-        ];
-
-        assert!(selection_requires_backend_restart(
-            &accounts,
-            Some("xai-a.json"),
-            "deepseek-c.json"
-        ));
-        assert!(selection_requires_backend_restart(
-            &accounts,
-            Some("deepseek-c.json"),
-            "xai-a.json"
-        ));
-        assert!(selection_requires_backend_restart(
-            &accounts,
-            Some("deepseek-c.json"),
-            "deepseek-d.json"
-        ));
-        assert!(!selection_requires_backend_restart(
-            &accounts,
-            Some("xai-a.json"),
-            "codex-b.json"
-        ));
-        assert!(!selection_requires_backend_restart(
-            &accounts,
-            Some("deepseek-c.json"),
-            "deepseek-c.json"
-        ));
     }
 
     #[test]
@@ -10007,6 +8833,8 @@ mod tests {
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: "unknown".into(),
+                auth: "oauth".into(),
+                base_url: None,
             },
             GatewayAccount {
                 file_name: "xai-b.json".into(),
@@ -10019,6 +8847,8 @@ mod tests {
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: "unknown".into(),
+                auth: "oauth".into(),
+                base_url: None,
             },
         ];
         let state = ControllerState {
@@ -10068,6 +8898,8 @@ mod tests {
             cooldown_until_ms: None,
             expires_at_ms: None,
             credential_status: "unknown".into(),
+            auth: "oauth".into(),
+            base_url: None,
         };
         let accounts = vec![account("xai-a.json"), account("xai-b.json")];
         let state = ControllerState {
@@ -10135,6 +8967,8 @@ mod tests {
                     cooldown_until_ms: None,
                     expires_at_ms: None,
                     credential_status: "unknown".into(),
+                    auth: "oauth".into(),
+                    base_url: None,
                 },
                 GatewayAccount {
                     file_name: "xai-b.json".into(),
@@ -10147,6 +8981,8 @@ mod tests {
                     cooldown_until_ms: None,
                     expires_at_ms: None,
                     credential_status: "unknown".into(),
+                    auth: "oauth".into(),
+                    base_url: None,
                 },
             ];
             let (mutations, _) = selection_transaction(
@@ -10228,6 +9064,8 @@ mod tests {
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: "unknown".into(),
+                auth: "oauth".into(),
+                base_url: None,
             },
             GatewayAccount {
                 file_name: "xai-b.json".into(),
@@ -10240,6 +9078,8 @@ mod tests {
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: "unknown".into(),
+                auth: "oauth".into(),
+                base_url: None,
             },
         ];
         (auth, state_path, labels_path, accounts, state, labels)
@@ -10248,7 +9088,7 @@ mod tests {
     #[test]
     fn active_account_removal_leaves_other_providers_credentials_untouched() {
         // Removing the active account clears the selection but must not disable
-        // other providers' credentials — the isolated Codex window still routes
+        // other providers' credentials Ã¢â‚¬â€ the isolated Codex window still routes
         // picked models to them.
         let root = temp_dir("active-removal");
         let (auth, state_path, labels_path, accounts, state, labels) =
@@ -10323,7 +9163,7 @@ mod tests {
                 "codex-a.json",
             )
             .unwrap();
-            // The removed file, the state, and the labels — the remaining
+            // The removed file, the state, and the labels Ã¢â‚¬â€ the remaining
             // credential is untouched by design.
             assert_eq!(mutations.len(), 3);
             assert!(crate::persistence::run_transaction_with_fault(
@@ -10959,6 +9799,8 @@ mod tests {
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: "unknown".into(),
+                auth: "oauth".into(),
+                base_url: None,
             }
         }
         let accounts = vec![
@@ -11063,6 +9905,39 @@ mod tests {
         assert!(!ids.contains(&"gemini-3.7-flash-lite"));
     }
 
+    fn begin_mock_request(
+        runtime: &tokio::runtime::Handle,
+        scenario: crate::test_support::FaultScenario,
+        first_response_timeout: Duration,
+        stream_idle_timeout: Duration,
+    ) -> (
+        crate::test_support::MockBackend,
+        Result<UpstreamMeta, FirstResponseFailure>,
+    ) {
+        // Some Windows endpoint filters intermittently abort a brand-new
+        // loopback GET before response headers. Retrying only the disposable
+        // test fixture keeps the fault harness deterministic; production
+        // requests use begin_upstream_request directly and are never replayed.
+        for _ in 0..3 {
+            let backend = crate::test_support::MockBackend::spawn(scenario).unwrap();
+            let result = begin_upstream_request_with_timeouts(
+                runtime,
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                reqwest::Method::GET,
+                format!("http://{}/fault", backend.address()),
+                Vec::new(),
+                Vec::new(),
+                first_response_timeout,
+                stream_idle_timeout,
+            );
+            if matches!(result, Err(FirstResponseFailure::Connect)) {
+                continue;
+            }
+            return (backend, result);
+        }
+        panic!("the loopback fault fixture was aborted three consecutive times")
+    }
+
     #[test]
     fn relay_long_sse_stream_survives_while_each_chunk_meets_idle_budget() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -11161,11 +10036,11 @@ mod tests {
         );
         assert_eq!(
             usage_http_error_message("kimi", reqwest::StatusCode::UNAUTHORIZED),
-            "Usage check unavailable — saved login is active. Auto-retry in 5 min or use Refresh usage."
+            "Usage check unavailable Ã¢â‚¬â€ saved login is active. Auto-retry in 5 min or use Refresh usage."
         );
         assert_eq!(
             usage_http_error_message("codex", reqwest::StatusCode::FORBIDDEN),
-            "Usage check unavailable — saved login is active. Auto-retry in 5 min or use Refresh usage."
+            "Usage check unavailable Ã¢â‚¬â€ saved login is active. Auto-retry in 5 min or use Refresh usage."
         );
         assert_eq!(
             usage_http_error_message("xai", reqwest::StatusCode::from_u16(500).unwrap()),
@@ -11343,32 +10218,6 @@ mod tests {
     }
 
     #[test]
-    fn vision_slots_bound_concurrency_and_release_blocked_acquires() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let slots = Arc::new(VisionSlots::new());
-        let first = slots.acquire();
-        let second = slots.acquire();
-        let started = Arc::new(AtomicBool::new(false));
-        let started_clone = started.clone();
-        let slots_clone = slots.clone();
-        let handle = std::thread::spawn(move || {
-            started_clone.store(true, Ordering::SeqCst);
-            let _third = slots_clone.acquire();
-        });
-        // The third acquire blocks while both slots are taken.
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(started.load(Ordering::SeqCst));
-        assert!(!handle.is_finished());
-        // Releasing one slot unblocks it.
-        drop(first);
-        handle.join().unwrap();
-        drop(second);
-        // After everything releases, all slots are available again.
-        let _again = slots.acquire();
-        let _again_too = slots.acquire();
-    }
-
-    #[test]
     fn client_picker_choice_honors_visible_catalog_models_only() {
         let hidden = BTreeSet::new();
         // Claude sends the Anthropic routing alias; the proxy maps it back to
@@ -11417,35 +10266,10 @@ mod tests {
                 }
             }
         }
-        // DeepSeek base aliases map to Claude catalog ids, not DeepSeek ids.
-        assert_eq!(
-            base_alias("deepseek", "deepseek-v4-flash"),
-            Some("claude-sonnet-4-5")
-        );
-        // A thinking variant of the selected deepseek model resolves with its
-        // level (flash levels: none/low/high/max → index 2 = high).
-        assert_eq!(
-            alias_to_picker_entry("deepseek", "claude-opus-4-6", "deepseek-v4-flash"),
-            Some(("deepseek-v4-flash".to_string(), "high".to_string()))
-        );
     }
 
     #[test]
     fn effort_to_thinking_validates_against_model_levels() {
-        // Flash supports none/low/high/max.
-        assert_eq!(
-            effort_to_thinking("deepseek", "deepseek-v4-flash", "max"),
-            "max"
-        );
-        assert_eq!(
-            effort_to_thinking("deepseek", "deepseek-v4-flash", "high"),
-            "high"
-        );
-        // medium is not a flash level → falls back to auto.
-        assert_eq!(
-            effort_to_thinking("deepseek", "deepseek-v4-flash", "medium"),
-            "auto"
-        );
         // Grok 4.5 remaps desktop effort to its low/high pair.
         assert_eq!(effort_to_thinking("xai", "grok-4.5", "max"), "high");
         assert_eq!(effort_to_thinking("xai", "grok-4.5", "medium"), "low");
@@ -11469,10 +10293,10 @@ openai_base_url = "http://127.0.0.1:8317/v1"
         // The `model_catalog_json` / `model_reasoning_*` lines must not be
         // mistaken for the model itself, and a missing effort defaults to auto.
         let bare = parse_codex_config_toml(
-            "model = \"deepseek-v4-flash\"\nmodel_reasoning_summary = \"detailed\"\n",
+            "model = \"kimi-k2.7-code\"\nmodel_reasoning_summary = \"detailed\"\n",
         )
         .expect("bare choice parses");
-        assert_eq!(bare, ("deepseek-v4-flash".to_string(), "auto".to_string()));
+        assert_eq!(bare, ("kimi-k2.7-code".to_string(), "auto".to_string()));
         assert!(parse_codex_config_toml("openai_base_url = \"x\"\n").is_none());
     }
 
@@ -11480,7 +10304,6 @@ openai_base_url = "http://127.0.0.1:8317/v1"
     fn model_to_provider_maps_catalog_ids_only() {
         assert_eq!(model_to_provider("grok-4.6"), Some("xai"));
         assert_eq!(model_to_provider("gpt-5.6-terra"), Some("codex"));
-        assert_eq!(model_to_provider("deepseek-v4-flash"), Some("deepseek"));
         assert_eq!(model_to_provider("kimi-k3"), Some("kimi"));
         assert_eq!(
             model_to_provider("claude-sonnet-4-5-20250929"),
@@ -11504,6 +10327,8 @@ openai_base_url = "http://127.0.0.1:8317/v1"
                 cooldown_until_ms: None,
                 expires_at_ms: None,
                 credential_status: status.into(),
+                auth: "oauth".into(),
+                base_url: None,
             };
         let accounts = vec![
             account("xai-a.json", "xai", true, "expired"),
@@ -11523,7 +10348,7 @@ openai_base_url = "http://127.0.0.1:8317/v1"
             pick_codex_sync_account(&no_pin, "xai").map(|a| a.file_name.as_str()),
             Some("xai-c.json")
         );
-        // Unknown provider → nothing.
+        // Unknown provider Ã¢â€ â€™ nothing.
         assert!(pick_codex_sync_account(&accounts, "kimi").is_none());
     }
 
@@ -11572,7 +10397,7 @@ openai_base_url = "http://127.0.0.1:8317/v1"
             apply_route_model("kimi-k3", None, &mut request, &state, "kimi"),
             "kimi-k3"
         );
-        // A client-chosen kimi-k2.7-code supports high → suffix applied.
+        // A client-chosen kimi-k2.7-code supports high Ã¢â€ â€™ suffix applied.
         state.routes.insert(
             "kimi".into(),
             RouteSelection {
@@ -11583,11 +10408,6 @@ openai_base_url = "http://127.0.0.1:8317/v1"
         assert_eq!(
             apply_route_model("kimi-k2.7-code", None, &mut request, &state, "kimi"),
             "kimi-k2.7-code(high)"
-        );
-        // DeepSeek never gets a suffix.
-        assert_eq!(
-            apply_route_model("deepseek-v4-flash", None, &mut request, &state, "deepseek"),
-            "deepseek-v4-flash"
         );
     }
 
@@ -11604,11 +10424,6 @@ openai_base_url = "http://127.0.0.1:8317/v1"
             routes: Vec::new(),
             active_codex_account: None,
             codex_routes: Vec::new(),
-            deepseek_vision: DeepseekVisionPlan {
-                enabled: false,
-                transport: "none".into(),
-                candidates: Vec::new(),
-            },
             auto_failover: None,
             controller: ComponentStatus {
                 state: "healthy".into(),
@@ -11688,5 +10503,98 @@ openai_base_url = "http://127.0.0.1:8317/v1"
         });
         extract_bearer_tokens_from_value(&relay_format, &mut relay_tokens);
         assert!(relay_tokens.contains(&"token-top-access".to_string()));
+    }
+
+    #[test]
+    fn api_key_account_shape_is_detected() {
+        let value = serde_json::json!({
+            "kind": "api_key",
+            "provider": "deepseek",
+            "api_key": "sk-test",
+            "base_url": "https://api.deepseek.com",
+            "label": "DeepSeek",
+            "disabled": false
+        });
+        assert_eq!(account_auth_kind(&value), ProviderAuth::ApiKey);
+        assert_eq!(
+            account_provider(&value, "deepseek-acct.json").as_deref(),
+            Some("deepseek")
+        );
+    }
+
+    #[test]
+    fn oauth_account_shape_is_detected() {
+        let value = serde_json::json!({
+            "type": { "provider": "codex" },
+            "access_token": "token"
+        });
+        assert_eq!(account_auth_kind(&value), ProviderAuth::Oauth);
+        assert_eq!(
+            account_provider(&value, "codex-charles.json").as_deref(),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn render_config_keeps_the_cliproxy_contract() {
+        // Guards the CLIProxyAPI config surface Basiliskos depends on. If an
+        // upstream version bump forces a field rename and someone edits
+        // `render_config` wrong, this catches it instead of silently breaking
+        // the relay at runtime.
+        let state = ControllerState {
+            api_key: "secret".into(),
+            claude_config_id: "id".into(),
+            previous_claude_applied_id: None,
+            active_account: None,
+            active_codex_account: None,
+            codex_routes: default_routes(),
+            routes: default_routes(),
+            claude_window_icon: default_claude_window_icon(),
+            skip_model_switch_confirmation: false,
+            open_claude_on_launch: true,
+        };
+        let config = render_config(Path::new("unused-auth"), &state);
+        for key in [
+            "auth-dir:",
+            "api-keys:",
+            "oauth-model-alias:",
+            "force-mapping: true",
+            "inject-x-search: false",
+            "optimize-multi-agent-v2: true",
+            "plugins:",
+            "configs:",
+            "basiliskos-codex-compaction:",
+            "disable-control-panel: true",
+            "request-retry: 0",
+            "bootstrap-retries: 0",
+        ] {
+            assert!(
+                config.contains(key),
+                "CLIProxyAPI config lost a required key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_compat_provider_block_matches_the_cliproxy_schema() {
+        // Guards the api-key provider emission against the pinned CLIProxyAPI
+        // config.example.yaml shape (openai-compatibility list, api-key-entries
+        // as an object list, explicit models). The wrong shape registers zero
+        // providers and silently disables API-key routing.
+        let yaml = openai_compat_provider_yaml(
+            "deepseek",
+            "https://api.deepseek.com",
+            "sk-test",
+            &["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+        );
+        assert!(yaml.contains("  - name: \"deepseek\""));
+        assert!(yaml.contains("    base-url: \"https://api.deepseek.com\""));
+        assert!(yaml.contains("    api-key-entries:"));
+        assert!(yaml.contains("      - api-key: \"sk-test\""));
+        assert!(yaml.contains("    models:"));
+        assert!(yaml.contains("      - name: \"deepseek-chat\""));
+        assert!(yaml.contains("      - name: \"deepseek-reasoner\""));
+        // The old, non-registering shape must never come back.
+        assert!(!yaml.contains("\ndeepseek:\n"));
     }
 }

@@ -18,6 +18,7 @@ import {
   Download,
   ExternalLink,
   FolderOpen,
+  KeyRound,
   ListFilter,
   LoaderCircle,
   LogIn,
@@ -35,15 +36,26 @@ import {
 import brandArt from "./assets/basiliskos-mark.png";
 import "./App.css";
 
-type Provider = "claude" | "codex" | "xai" | "kimi" | "deepseek" | "antigravity";
+type Provider =
+  | "claude"
+  | "codex"
+  | "xai"
+  | "kimi"
+  | "antigravity"
+  | "deepseek"
+  | "opencode"
+  | "openrouter"
+  | "litellm"
+  | "custom";
 
-/**
- * DeepSeek is the one provider with no OAuth/device flow — it is authorized with
- * an API key, so the "Add account" button opens a key field instead of starting
- * a browser login.
- */
-export function usesApiKeyAuth(provider: Provider): boolean {
-  return provider === "deepseek";
+const API_KEY_PROVIDERS: Provider[] = ["deepseek", "opencode", "openrouter", "litellm", "custom"];
+
+function isApiKeyProvider(provider: Provider): boolean {
+  return API_KEY_PROVIDERS.includes(provider);
+}
+
+function providerAuthKind(provider: Provider): "oauth" | "api_key" {
+  return isApiKeyProvider(provider) ? "api_key" : "oauth";
 }
 
 type Account = {
@@ -56,7 +68,9 @@ type Account = {
   activeForCodex: boolean;
   cooldownUntilMs?: number;
   expiresAtMs?: number;
-  credentialStatus: "active" | "renewal_due" | "relogin_required" | "expired" | "unknown";
+  auth?: "oauth" | "api_key";
+  baseUrl?: string;
+  credentialStatus: "active" | "renewal_due" | "relogin_required" | "expired" | "unknown" | "configured" | "disabled";
 };
 
 type UsageWindow = {
@@ -109,7 +123,6 @@ type Snapshot = {
 
 type AccountSelectionResult = Snapshot & { claudeConfigChanged: boolean };
 type RouteUpdateResult = Snapshot & { routeVerified: boolean };
-type DeepseekAccountAdded = Snapshot & { fileName: string };
 
 export type ComponentStatus = {
   state: string;
@@ -232,15 +245,19 @@ type PreparedBasiliskosUpdate = {
 type AppView = "console" | "changes";
 type ProviderFilter = "all" | Provider;
 
-export const APP_VERSION = "2.6.1";
+export const APP_VERSION = "3.0.0";
 
-const PROVIDERS: Array<{ id: Provider; label: string; detail: string }> = [
-  { id: "claude", label: "Claude", detail: "Claude OAuth" },
-  { id: "codex", label: "Codex", detail: "ChatGPT / Codex OAuth" },
-  { id: "xai", label: "Grok", detail: "Grok Build OAuth" },
-  { id: "kimi", label: "Kimi", detail: "Kimi Code OAuth" },
-  { id: "deepseek", label: "DeepSeek", detail: "DeepSeek API key" },
-  { id: "antigravity", label: "Antigravity", detail: "Google Antigravity OAuth" },
+const PROVIDERS: Array<{ id: Provider; label: string; detail: string; group: "oauth" | "api-key" }> = [
+  { id: "claude", label: "Claude", detail: "Claude OAuth", group: "oauth" },
+  { id: "codex", label: "Codex", detail: "ChatGPT / Codex OAuth", group: "oauth" },
+  { id: "xai", label: "Grok", detail: "Grok Build OAuth", group: "oauth" },
+  { id: "kimi", label: "Kimi", detail: "Kimi Code OAuth / Moonshot key", group: "oauth" },
+  { id: "antigravity", label: "Antigravity", detail: "Google Antigravity OAuth", group: "oauth" },
+  { id: "deepseek", label: "DeepSeek", detail: "DeepSeek API key", group: "api-key" },
+  { id: "opencode", label: "OpenCode Go", detail: "OpenCode API key", group: "api-key" },
+  { id: "openrouter", label: "OpenRouter", detail: "OpenRouter API key", group: "api-key" },
+  { id: "litellm", label: "LiteLLM", detail: "Self-hosted proxy", group: "api-key" },
+  { id: "custom", label: "Custom", detail: "Any OpenAI-compatible endpoint", group: "api-key" },
 ];
 
 const PROVIDER_NAMES: Record<Provider, string> = {
@@ -248,8 +265,12 @@ const PROVIDER_NAMES: Record<Provider, string> = {
   codex: "Codex",
   xai: "Grok",
   kimi: "Kimi",
-  deepseek: "DeepSeek",
   antigravity: "Antigravity",
+  deepseek: "DeepSeek",
+  opencode: "OpenCode Go",
+  openrouter: "OpenRouter",
+  litellm: "LiteLLM",
+  custom: "Custom",
 };
 
 const THINKING_LEVELS = ["auto", "none", "low", "medium", "high", "xhigh", "max", "ultra"];
@@ -350,9 +371,10 @@ export function accountNeedsRelogin(
   return account.credentialStatus === "relogin_required" || usageError?.includes("Re-login once") === true;
 }
 
-export function usageAccountFiles(accounts: Array<Pick<Account, "fileName" | "provider">>): string[] {
+export function usageAccountFiles(accounts: Array<Pick<Account, "fileName" | "provider" | "auth">>): string[] {
   return accounts
-    .filter((account) => account.provider !== "deepseek" && account.provider !== "antigravity")
+    .filter((account) => account.provider !== "antigravity")
+    .filter((account) => account.auth !== "api_key")
     .map((account) => account.fileName);
 }
 
@@ -395,8 +417,9 @@ export default function App() {
   const [now, setNow] = useState(() => Date.now());
   const [provider, setProvider] = useState<Provider>("codex");
   const [providerFilter, setProviderFilter] = useState<ProviderFilter>("all");
+  const [apiKeyForm, setApiKeyForm] = useState<null | { key: string; baseUrl: string; model: string; label: string }>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [message, setMessage] = useState("Starting Basiliskos…");
+  const [message, setMessage] = useState("Starting BasiliskOS…");
   const [isError, setIsError] = useState(false);
   const [usageByAccount, setUsageByAccount] = useState<Record<string, UsageLoadState>>({});
   const [editingAccount, setEditingAccount] = useState<string | null>(null);
@@ -415,10 +438,6 @@ export default function App() {
   const lastFailoverAtMs = useRef<number | null>(null);
   const [pendingAuth, setPendingAuth] = useState<PendingAuthLaunch | null>(null);
   const [authCopyFeedback, setAuthCopyFeedback] = useState<string | null>(null);
-  // DeepSeek API-key entry. Held only until the key is handed to the backend.
-  const [apiKeyPrompt, setApiKeyPrompt] = useState(false);
-  const [apiKeyDraft, setApiKeyDraft] = useState("");
-  const [apiKeyReplacementFile, setApiKeyReplacementFile] = useState<string | null>(null);
   const [accountSwitchConfirm, setAccountSwitchConfirm] = useState<{
     open: boolean;
     account: Account | null;
@@ -464,7 +483,7 @@ export default function App() {
       const release = await invoke<LatestPublishedRelease>("latest_basiliskos_release");
       const next: Release[] = [{
         tagName: release.tagName,
-        name: release.name || `Basiliskos ${release.tagName}`,
+        name: release.name || `BasiliskOS ${release.tagName}`,
         publishedAt: release.publishedAt,
         body: release.body || "Release details are available on GitHub.",
         releaseUrl: release.releaseUrl,
@@ -477,7 +496,7 @@ export default function App() {
         setMessage(`${latest.name} is ready to download.`);
         setIsError(false);
       } else if (!quiet) {
-        setMessage("Basiliskos is up to date.");
+        setMessage("BasiliskOS is up to date.");
         setIsError(false);
       }
     } catch (error) {
@@ -500,12 +519,12 @@ export default function App() {
         if (next.activeAccount && next.openClaudeOnLaunch !== false) {
           const launched = await invoke<Snapshot>("launch_hydra_claude");
           setSnapshot(launched);
-          setMessage("Relay ready. Opened the separate Basiliskos Claude window.");
+          setMessage("Relay ready. Opened the separate BasiliskOS Claude window.");
         } else {
           setSnapshot(next);
           setMessage(
             next.activeAccount
-              ? "Relay ready. Choose Open Basiliskos Claude when you want the window."
+              ? "Relay ready. Choose Open BasiliskOS Claude when you want the window."
               : "Relay ready. Add or choose an account.",
           );
         }
@@ -534,7 +553,7 @@ export default function App() {
     if (lastFailoverAtMs.current === failover.atMs) return;
     lastFailoverAtMs.current = failover.atMs;
     setMessage(
-      `${failover.fromLabel} was rate-limited; Basiliskos switched to ${failover.toLabel}.`,
+      `${failover.fromLabel} was rate-limited; BasiliskOS switched to ${failover.toLabel}.`,
     );
     setIsError(false);
   }, [snapshot?.autoFailover]);
@@ -576,7 +595,7 @@ export default function App() {
           // switch with "Use account".
           setProvider(login.provider);
           setMessage(
-            "Account authorized. Choose Use account to route the Basiliskos window to it.",
+            "Account authorized. Choose Use account to route the BasiliskOS window to it.",
           );
           setIsError(false);
         } else {
@@ -590,7 +609,7 @@ export default function App() {
             : await invoke<Snapshot>("launch_hydra_claude");
           setSnapshot(next);
           setProvider(login.provider);
-          setMessage("Account authorized and selected. The isolated Basiliskos Claude window is ready.");
+          setMessage("Account authorized and selected. The isolated BasiliskOS Claude window is ready.");
           setIsError(false);
         }
       } catch (error) {
@@ -611,7 +630,7 @@ export default function App() {
   const totalAccountCount = snapshot?.accounts.length ?? 0;
   const allUsageFiles = usageAccountFiles(snapshot?.accounts ?? []);
   const allUsageKey = snapshot?.accounts
-    .filter((account) => account.provider !== "deepseek" && account.provider !== "antigravity")
+    .filter((account) => account.provider !== "antigravity")
     .map((account) => `${account.fileName}|${account.expiresAtMs ?? ""}|${account.credentialStatus}`)
     .join("\u0000") ?? "";
   const allUsageLoading = allUsageFiles.some((fileName) => usageByAccount[fileName]?.loading === true);
@@ -715,7 +734,7 @@ export default function App() {
         next = await invoke<Snapshot>("launch_hydra_claude");
       }
       setSnapshot(next);
-      setMessage(`${account.label} is now serving the separate Basiliskos Claude window`);
+      setMessage(`${account.label} is now serving the separate BasiliskOS Claude window`);
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -725,7 +744,7 @@ export default function App() {
     }
   }
 
-  /// "Use for Basiliskos Codex": select the account AND ensure the isolated
+  /// "Use for BasiliskOS Codex": select the account AND ensure the isolated
   /// Codex window runs on it (relaunch if already open so the new route
   /// applies). Mirrors `selectAccount` for the Codex surface.
   async function useAccountForCodex(account: Account) {
@@ -744,7 +763,7 @@ export default function App() {
         next = await invoke<Snapshot>("launch_hydra_codex_app");
       }
       setSnapshot(next);
-      setMessage(`${account.label} is now serving the separate Basiliskos Codex window`);
+      setMessage(`${account.label} is now serving the separate BasiliskOS Codex window`);
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -755,7 +774,7 @@ export default function App() {
   }
 
   async function removeAccount(account: Account) {
-    if (!(await confirmDialog(`Remove ${account.label} from Basiliskos?`))) return;
+    if (!(await confirmDialog(`Remove ${account.label} from BasiliskOS?`))) return;
     setBusy(account.fileName);
     try {
       setSnapshot(
@@ -811,7 +830,7 @@ export default function App() {
   async function updateRoute(model: string, thinking: string) {
     if (!active) return;
     setBusy("route");
-    setMessage("Updating the Basiliskos route…");
+    setMessage("Updating the BasiliskOS route…");
     setIsError(false);
     try {
       const next = await invoke<RouteUpdateResult>("set_gateway_route", {
@@ -825,8 +844,8 @@ export default function App() {
       setMessage(
         next.routeVerified
           ? (route
-              ? `Basiliskos now routes to ${route.selectedModelLabel} · ${thinkingLabel(route.thinking)}. Applies to the next request.`
-              : "Basiliskos route updated")
+              ? `BasiliskOS now routes to ${route.selectedModelLabel} · ${thinkingLabel(route.thinking)}. Applies to the next request.`
+              : "BasiliskOS route updated")
           : "Route saved, but the backend was unreachable so it could not be verified. It will be checked on the next request.",
       );
       setIsError(false);
@@ -1062,12 +1081,8 @@ export default function App() {
 
   async function addAccount() {
     // API-key providers have no browser login to launch — collect the key first.
-    if (usesApiKeyAuth(provider)) {
-      setApiKeyDraft("");
-      setApiKeyReplacementFile(null);
-      setApiKeyPrompt(true);
-      setMessage("Paste a DeepSeek API key from platform.deepseek.com to authorize it.");
-      setIsError(false);
+    if (providerAuthKind(provider) === "api_key") {
+      setApiKeyForm({ key: "", baseUrl: "", model: "", label: "" });
       return;
     }
     setBusy("login");
@@ -1084,38 +1099,19 @@ export default function App() {
     }
   }
 
-  async function submitApiKey() {
-    const key = apiKeyDraft.trim();
-    if (!key) {
-      setMessage("Enter a DeepSeek API key first.");
-      setIsError(true);
-      return;
-    }
-    setBusy("api-key");
+  async function submitApiKeyAccount() {
+    if (!apiKeyForm) return;
+    setBusy("login");
     try {
-      // The backend verifies the key against DeepSeek before saving it, so a
-      // bad key fails here rather than during a later relay request.
-      const added = await invoke<DeepseekAccountAdded>("add_deepseek_account", {
-        apiKey: key,
-        replaceFileName: apiKeyReplacementFile,
+      await invoke<Snapshot>("add_api_key_account", {
+        provider,
+        label: apiKeyForm.label || `${PROVIDER_NAMES[provider]} account`,
+        apiKey: apiKeyForm.key,
+        baseUrl: apiKeyForm.baseUrl || null,
+        model: apiKeyForm.model || null,
       });
-      setSnapshot(added);
-      setApiKeyPrompt(false);
-      setApiKeyDraft("");
-      setApiKeyReplacementFile(null);
-      setIsError(false);
-      // A newly added account is stored disabled, so adding alone never
-      // changes what Claude is talking to. Only the first account on this
-      // machine is activated automatically; later accounts wait for an
-      // explicit "Use account" so adding a key never disturbs an active route.
-      const account = added.accounts.find((item) => item.fileName === added.fileName);
-      const activeAccount = added.accounts.find((item) => item.active);
-      if (account && !activeAccount) {
-        await selectAccount(account);
-      } else {
-        setMessage("DeepSeek API key saved. Select the account to route through it.");
-        await refresh(true);
-      }
+      setApiKeyForm(null);
+      await refresh(true);
     } catch (error) {
       setMessage(messageFrom(error));
       setIsError(true);
@@ -1124,24 +1120,24 @@ export default function App() {
     }
   }
 
-  function cancelApiKeyPrompt() {
-    setApiKeyPrompt(false);
-    setApiKeyDraft("");
-    setApiKeyReplacementFile(null);
+  function cancelApiKeyForm() {
+    setApiKeyForm(null);
+  }
+
+  async function showApiKeyModels(account: Account) {
+    try {
+      const models = await invoke<string[]>("get_api_key_account_models", { fileName: account.fileName });
+      setMessage(models.length
+        ? `${account.label} models: ${models.join(", ")}`
+        : `${account.label}: no models detected yet. Select the account to fetch its live catalog.`);
+      setIsError(false);
+    } catch (error) {
+      setMessage(messageFrom(error));
+      setIsError(true);
+    }
   }
 
   async function relogin(account: Account) {
-    // Re-authorizing an API-key account means replacing the key, not re-running
-    // a login the provider does not have.
-    if (usesApiKeyAuth(account.provider)) {
-      setProvider(account.provider);
-      setApiKeyDraft("");
-      setApiKeyReplacementFile(account.fileName);
-      setApiKeyPrompt(true);
-      setMessage(`Paste a new DeepSeek API key to replace the one on "${account.label}".`);
-      setIsError(false);
-      return;
-    }
     setBusy(`relogin-${account.fileName}`);
     try {
       const login = await invoke<ProviderLoginLaunch>("launch_provider_login", { provider: account.provider });
@@ -1212,7 +1208,7 @@ export default function App() {
     if (!snapshot) return;
     const zones = ["controller", "relay", "backend", "credentials", "route", "oauth", "claude"] as const;
     const lines = [
-      `Basiliskos ${APP_VERSION} · ${new Date().toISOString()}`,
+      `BasiliskOS ${APP_VERSION} · ${new Date().toISOString()}`,
       "",
       ...zones.map((zone) => {
         const status = snapshot[zone];
@@ -1243,7 +1239,7 @@ export default function App() {
     setBusy("settings");
     try {
       setSnapshot(await invoke<Snapshot>("set_open_claude_on_launch", { open }));
-      setMessage(open ? "Basiliskos will reopen the Claude window at launch" : "Basiliskos will not auto-open the Claude window at launch");
+      setMessage(open ? "BasiliskOS will reopen the Claude window at launch" : "BasiliskOS will not auto-open the Claude window at launch");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -1257,7 +1253,7 @@ export default function App() {
     setBusy("open-claude");
     try {
       setSnapshot(await invoke<Snapshot>("launch_hydra_claude"));
-      setMessage("Opened the separate Basiliskos Claude window. Your normal Claude app is untouched.");
+      setMessage("Opened the separate BasiliskOS Claude window. Your normal Claude app is untouched.");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -1271,7 +1267,7 @@ export default function App() {
     setBusy("close-claude");
     try {
       setSnapshot(await invoke<Snapshot>("stop_hydra_claude"));
-      setMessage("Closed only the Basiliskos Claude window");
+      setMessage("Closed only the BasiliskOS Claude window");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -1285,7 +1281,7 @@ export default function App() {
     setBusy("open-codex");
     try {
       setSnapshot(await invoke<Snapshot>("launch_hydra_codex_app"));
-      setMessage("Opened the separate Basiliskos Codex window. Your normal Codex app is untouched.");
+      setMessage("Opened the separate BasiliskOS Codex window. Your normal Codex app is untouched.");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -1299,7 +1295,7 @@ export default function App() {
     setBusy("close-codex");
     try {
       setSnapshot(await invoke<Snapshot>("stop_hydra_codex_app"));
-      setMessage("Closed only the Basiliskos Codex window");
+      setMessage("Closed only the BasiliskOS Codex window");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -1355,7 +1351,7 @@ export default function App() {
       <div className="app-chrome">
         <header className="topbar" data-tauri-drag-region>
           <div className="brand">
-            <img src={brandArt} alt="Basiliskos crowned serpent emblem" />
+            <img src={brandArt} alt="BasiliskOS crowned serpent emblem" />
             <div>
               <h1>BasiliskOS</h1>
               <p>Local model relay for Claude Code</p>
@@ -1367,19 +1363,19 @@ export default function App() {
                 <BellDot size={15} /> Update {availableUpdate.tagName.replace(/^v/i, "")} available
               </button>
             )}
-            <div className="health-indicators" aria-label="Basiliskos health">
+            <div className="health-indicators" aria-label="BasiliskOS health">
               <StatusBadge label="Local server" status={snapshot?.relay} />
               <StatusBadge label="Provider link" status={snapshot?.backend} />
             </div>
             <div className="window-controls" aria-label="Window controls">
-              <button type="button" aria-label="Minimize Basiliskos" title="Minimize" onClick={() => void minimizeWindow()}><Minus size={15} /></button>
-              <button type="button" aria-label="Maximize Basiliskos" title="Maximize" onClick={() => void toggleWindowMaximize()}><Maximize2 size={14} /></button>
-              <button type="button" className="close-control" aria-label="Hide Basiliskos to tray" title="Hide to tray" onClick={() => void hideWindow()}><X size={15} /></button>
+              <button type="button" aria-label="Minimize BasiliskOS" title="Minimize" onClick={() => void minimizeWindow()}><Minus size={15} /></button>
+              <button type="button" aria-label="Maximize BasiliskOS" title="Maximize" onClick={() => void toggleWindowMaximize()}><Maximize2 size={14} /></button>
+              <button type="button" className="close-control" aria-label="Hide BasiliskOS to tray" title="Hide to tray" onClick={() => void hideWindow()}><X size={15} /></button>
             </div>
           </div>
         </header>
 
-        <nav className="app-tabs" aria-label="Basiliskos sections">
+        <nav className="app-tabs" aria-label="BasiliskOS sections">
           <button className={view === "console" ? "selected" : ""} aria-current={view === "console" ? "page" : undefined} onClick={() => setView("console")}>Console</button>
           <button className={view === "changes" ? "selected" : ""} aria-current={view === "changes" ? "page" : undefined} onClick={() => setView("changes")}>Changes{availableUpdate && <i aria-label="Update available" />}</button>
         </nav>
@@ -1533,7 +1529,7 @@ export default function App() {
                       className="add-button"
                       onClick={() => void refreshUsage(allUsageFiles)}
                       disabled={allUsageFiles.length === 0 || allUsageLoading}
-                      title="Refresh usage for every account now. Basiliskos also refreshes automatically every five minutes."
+                      title="Refresh usage for every account now. BasiliskOS also refreshes automatically every five minutes."
                     >
                       <RefreshCw className={allUsageLoading ? "spin" : undefined} size={15} /> Refresh usage
                     </button>
@@ -1551,17 +1547,68 @@ export default function App() {
                           : undefined}
                       >
                         {busy === "login" ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />}{" "}
-                        {usesApiKeyAuth(provider) ? "Add API key" : "Add account"}
+                        "Add account"
                       </button>
                     )}
                   </div>
                 </div>
+                {apiKeyForm && (
+                  <div className="api-key-form" role="group" aria-label={`Add ${PROVIDER_NAMES[provider]} API key`}>
+                    <span className="zone-label">API KEY</span>
+                    <label className="field-label" htmlFor="api-key-label">Label</label>
+                    <input
+                      id="api-key-label"
+                      className="text-field"
+                      value={apiKeyForm.label}
+                      onChange={(event) => setApiKeyForm({ ...apiKeyForm, label: event.target.value })}
+                      placeholder={`${PROVIDER_NAMES[provider]} account`}
+                      maxLength={64}
+                    />
+                    <label className="field-label" htmlFor="api-key-value">API key</label>
+                    <input
+                      id="api-key-value"
+                      className="text-field"
+                      type="password"
+                      value={apiKeyForm.key}
+                      onChange={(event) => setApiKeyForm({ ...apiKeyForm, key: event.target.value })}
+                      placeholder="sk-…"
+                    />
+                    <label className="field-label" htmlFor="api-key-base-url">Base URL (optional)</label>
+                    <input
+                      id="api-key-base-url"
+                      className="text-field"
+                      value={apiKeyForm.baseUrl}
+                      onChange={(event) => setApiKeyForm({ ...apiKeyForm, baseUrl: event.target.value })}
+                      placeholder="https://…"
+                    />
+                    <label className="field-label" htmlFor="api-key-model">Model (optional)</label>
+                    <input
+                      id="api-key-model"
+                      className="text-field"
+                      value={apiKeyForm.model}
+                      onChange={(event) => setApiKeyForm({ ...apiKeyForm, model: event.target.value })}
+                      placeholder="deepseek-chat"
+                    />
+                    <div className="api-key-form-actions">
+                      <button className="add-button cancel-login" onClick={cancelApiKeyForm} disabled={busy !== null}>
+                        <X size={15} /> Cancel
+                      </button>
+                      <button
+                        className="add-button"
+                        onClick={() => void submitApiKeyAccount()}
+                        disabled={busy !== null || !apiKeyForm.key.trim()}
+                      >
+                        {busy === "login" ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />} Save API key
+                      </button>
+                    </div>
+                  </div>
+                )}
                 <div className="provider-tabs" role="tablist" aria-label="Account provider">
                   <button
                     role="tab"
                     aria-selected={providerFilter === "all"}
                     className={providerFilter === "all" ? "selected" : ""}
-                    onClick={() => { setProviderFilter("all"); cancelApiKeyPrompt(); }}
+                    onClick={() => setProviderFilter("all")}
                   >
                     All ({totalAccountCount})
                   </button>
@@ -1576,7 +1623,6 @@ export default function App() {
                         onClick={() => {
                           setProviderFilter(item.id);
                           setProvider(item.id);
-                          cancelApiKeyPrompt();
                         }}
                       >
                         {item.label} ({count})
@@ -1584,39 +1630,6 @@ export default function App() {
                     );
                   })}
                 </div>
-                {apiKeyPrompt && (
-                  <div className="auth-wait-card" role="group" aria-label="DeepSeek API key">
-                    <div className="auth-wait-head">
-                      <span className="zone-label">API KEY</span>
-                      <strong>DeepSeek</strong>
-                      <p>
-                        DeepSeek authorizes with an API key instead of a browser login. Create one at
-                        platform.deepseek.com, then paste it here. It is stored locally and verified with
-                        DeepSeek before it is saved.
-                      </p>
-                    </div>
-                    <div className="auth-wait-url-row">
-                      <input
-                        className="auth-wait-url"
-                        type="password"
-                        autoComplete="off"
-                        spellCheck={false}
-                        aria-label="DeepSeek API key"
-                        placeholder="sk-…"
-                        value={apiKeyDraft}
-                        onChange={(event) => setApiKeyDraft(event.target.value)}
-                        onKeyDown={(event) => { if (event.key === "Enter") void submitApiKey(); }}
-                        disabled={busy !== null}
-                      />
-                      <button type="button" className="auth-wait-action" onClick={() => void submitApiKey()} disabled={busy !== null || !apiKeyDraft.trim()}>
-                        {busy === "api-key" ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} aria-hidden="true" />} Verify and save
-                      </button>
-                      <button type="button" className="auth-wait-action" onClick={cancelApiKeyPrompt} disabled={busy !== null}>
-                        <X size={14} aria-hidden="true" /> Cancel
-                      </button>
-                    </div>
-                  </div>
-                )}
                 {pendingAuth && (
                   <div className="auth-wait-card" role="status" aria-live="polite">
                     <div className="auth-wait-head">
@@ -1706,7 +1719,16 @@ export default function App() {
                               )}
                             </div>
                           )}
-                          <p>{account.email ?? "Authorized subscription"}</p>
+                          <p>
+                            {account.auth === "api_key"
+                              ? account.baseUrl ?? "Custom API key"
+                              : account.email ?? "Authorized subscription"}
+                          </p>
+                          {account.auth === "api_key" && (
+                            <div className="credential-expiry key">
+                              <KeyRound size={11} aria-hidden="true" /> API key
+                            </div>
+                          )}
                           {credentialWarning && (
                             <div className={`credential-expiry ${credentialWarning.tone}`}>
                               <Timer size={11} aria-hidden="true" /> {credentialWarning.label}
@@ -1728,13 +1750,13 @@ export default function App() {
                               </div>
                             )) : usage?.loading ? (
                               <span className="usage-state"><LoaderCircle className="spin" size={11} /> Checking usage…</span>
+                            ) : account.auth === "api_key" ? (
+                              <span className="usage-state unrecorded" title="Key-based account; usage is billed by the provider.">
+                                Key-based · provider-managed
+                              </span>
                             ) : account.provider === "antigravity" ? (
                               <span className="usage-state unrecorded" title="Google Cloud / Gemini quota is managed in the Google Cloud or AI Studio console.">
                                 Managed in Google Cloud
-                              </span>
-                            ) : account.provider === "deepseek" ? (
-                              <span className="usage-state unrecorded" title="DeepSeek bills a prepaid API balance at platform.deepseek.com.">
-                                Prepaid API balance
                               </span>
                             ) : (
                               <span className="usage-state unavailable" title={usage?.error}>
@@ -1772,7 +1794,7 @@ export default function App() {
                           </button>
                           <button
                             className={`icon-button serve-toggle codex ${account.activeForCodex ? "active" : ""}`}
-                            aria-label={account.activeForCodex ? `${account.label} is serving Basiliskos Codex` : `Serve Basiliskos Codex with ${account.label}`}
+                            aria-label={account.activeForCodex ? `${account.label} is serving BasiliskOS Codex` : `Serve BasiliskOS Codex with ${account.label}`}
                             onClick={() => requestCodexAccountSelection(account)}
                             disabled={busy !== null || cooling > 0 || account.activeForCodex}
                           >
@@ -1781,7 +1803,7 @@ export default function App() {
                                 {busy === `codex-${account.fileName}` ? <LoaderCircle className="spin" size={15} /> : <CodexMark className="codex-mark-icon" />}
                               </span>
                               <span className="serve-toggle-label">
-                                {account.activeForCodex ? "Serving Basiliskos Codex" : cooling > 0 ? `Cooling down ${cooldownLabel(cooling)}` : "Use for Basiliskos Codex"}
+                                {account.activeForCodex ? "Serving BasiliskOS Codex" : cooling > 0 ? `Cooling down ${cooldownLabel(cooling)}` : "Use for BasiliskOS Codex"}
                               </span>
                             </span>
                           </button>
@@ -1817,6 +1839,11 @@ export default function App() {
                                   {account.email === activeIdentities?.grokCliEmail ? "Serving Grok CLI" : "Use for Grok CLI"}
                                 </span>
                               </span>
+                            </button>
+                          )}
+                          {account.auth === "api_key" && (
+                            <button className="icon-button" aria-label={`List models for ${account.label}`} title="List models from this API key" onClick={() => void showApiKeyModels(account)} disabled={busy !== null}>
+                              <Terminal size={15} />
                             </button>
                           )}
                           {!isEditing && <button className="icon-button" aria-label={`Rename ${account.label}`} title={`Rename ${account.label}`} onClick={() => beginRename(account)} disabled={busy !== null}><Pencil size={15} /></button>}
@@ -1989,7 +2016,7 @@ export default function App() {
           </div>
 
           {showDiagnostics && (
-            <section className="diagnostics-panel" aria-label="Basiliskos diagnostics">
+            <section className="diagnostics-panel" aria-label="BasiliskOS diagnostics">
               <div className="diagnostics-head">
                 <div><span className="zone-label">DIAGNOSTICS</span><h2>Redacted controller activity</h2></div>
                 <div className="diagnostics-actions">
@@ -2011,9 +2038,9 @@ export default function App() {
           )}
         </>
       ) : (
-        <section className="changes-panel" aria-label="Basiliskos updates and changes">
+        <section className="changes-panel" aria-label="BasiliskOS updates and changes">
           <div className="changes-head">
-            <div><span className="zone-label">UPDATES</span><h2>{availableUpdate ? `${availableUpdate.name} is available` : "Basiliskos is up to date"}</h2><p>Current version {APP_VERSION}</p></div>
+            <div><span className="zone-label">UPDATES</span><h2>{availableUpdate ? `${availableUpdate.name} is available` : "BasiliskOS is up to date"}</h2><p>Current version {APP_VERSION}</p></div>
             <div className="changes-actions">
               <button onClick={() => void checkForUpdates()} disabled={checkingUpdates || busy !== null}>{checkingUpdates ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />} Check now</button>
               {availableUpdate && <button className="primary" onClick={() => void downloadUpdate(availableUpdate)} disabled={busy !== null}><Download size={15} /> Install update</button>}
@@ -2038,8 +2065,8 @@ export default function App() {
           <div className="modal" role="alertdialog" aria-modal="true" aria-labelledby="account-switch-title" onClick={(event) => event.stopPropagation()}>
             <h3 id="account-switch-title">Switch account?</h3>
             <p>{accountSwitchConfirm.surface === "codex"
-              ? "This will close and reopen the Basiliskos Codex window. Any in-progress request in that window will be interrupted."
-              : "This will close and reopen the Basiliskos Claude window. Any in-progress request in that window will be interrupted."}</p>
+              ? "This will close and reopen the BasiliskOS Codex window. Any in-progress request in that window will be interrupted."
+              : "This will close and reopen the BasiliskOS Claude window. Any in-progress request in that window will be interrupted."}</p>
             <label className="modal-checkbox">
               <input
                 type="checkbox"
@@ -2059,7 +2086,7 @@ export default function App() {
       {pendingConfirm && (
         <div className="modal-backdrop" role="presentation" onClick={() => resolvePendingConfirm(false)}>
           <div className="modal" role="alertdialog" aria-modal="true" aria-labelledby="pending-confirm-title" onClick={(event) => event.stopPropagation()}>
-            <h3 id="pending-confirm-title">Basiliskos</h3>
+            <h3 id="pending-confirm-title">BasiliskOS</h3>
             <p>{pendingConfirm.message}</p>
             <div className="modal-actions">
               <button onClick={() => resolvePendingConfirm(false)}>Cancel</button>
@@ -2073,7 +2100,7 @@ export default function App() {
         <div className="modal-backdrop" role="presentation" onClick={() => setPreparedUpdate(null)}>
           <div className="modal" role="alertdialog" aria-modal="true" aria-labelledby="update-install-title" onClick={(event) => event.stopPropagation()}>
             <h3 id="update-install-title">Install {preparedUpdate.tagName}?</h3>
-            <p>{preparedUpdate.installerName} was downloaded and its SHA-256 checksum matched the published release manifest. Basiliskos will close, then Windows will ask for administrator approval and open the installer. Basiliskos itself does not stay elevated.</p>
+            <p>{preparedUpdate.installerName} was downloaded and its SHA-256 checksum matched the published release manifest. BasiliskOS will close, then Windows will ask for administrator approval and open the installer. BasiliskOS itself does not stay elevated.</p>
             <div className="modal-actions">
               <button onClick={() => setPreparedUpdate(null)} disabled={busy === "install-update"}>Cancel</button>
               <button className="primary" onClick={() => void confirmUpdateInstall()} disabled={busy === "install-update"}>{busy === "install-update" ? "Launching…" : "Install and close"}</button>
@@ -2086,7 +2113,7 @@ export default function App() {
         <div className="modal-backdrop" role="presentation" onClick={closeModelCatalog}>
           <div className="modal model-catalog-modal" role="dialog" aria-modal="true" aria-labelledby="model-catalog-title" onClick={(event) => event.stopPropagation()}>
             <h3 id="model-catalog-title">Manage models</h3>
-            <p>Hide models you don't want cluttering the list. Once Basiliskos has checked the backend for this provider, models it doesn't report as available are flagged automatically.</p>
+            <p>Hide models you don't want cluttering the list. Once BasiliskOS has checked the backend for this provider, models it doesn't report as available are flagged automatically.</p>
             <div className="model-catalog-list">
               {modelCatalog.map((entry) => (
                 <label key={entry.id} className="model-catalog-row">
@@ -2116,7 +2143,7 @@ export default function App() {
             </button>
           )}
         </p>
-        <span>Basiliskos {APP_VERSION} · CLIProxyAPI {snapshot?.version ?? "…"}</span>
+        <span>BasiliskOS {APP_VERSION} · CLIProxyAPI {snapshot?.version ?? "…"}</span>
       </footer>
     </main>
   );

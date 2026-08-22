@@ -4,9 +4,12 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $projectRoot 'src-tauri\resources\gateway\cli-proxy-api.exe'
+# Derive the expected runtime version from the single pin source so the smoke
+# test cannot drift from prepare-gateway.ps1 / gateway.rs.
+$pinVersion = ([regex]::Match((Get-Content -LiteralPath (Join-Path $PSScriptRoot 'prepare-gateway.ps1') -Raw), "\`$version\s*=\s*'([^']+)'")).Groups[1].Value
 $versionLine = (& $exe -h 2>&1 | Select-Object -First 1)
-if ($versionLine -notmatch 'CLIProxyAPI Version: 7\.2\.131,') {
-    throw "Unexpected CLIProxyAPI runtime version: $versionLine"
+if ($versionLine -notmatch ("CLIProxyAPI Version: " + [regex]::Escape($pinVersion) + ',')) {
+    throw "Unexpected CLIProxyAPI runtime version: $versionLine (expected $pinVersion)"
 }
 $tempBase = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
 $tempRoot = Join-Path $tempBase ("hydra-gateway-test-" + [guid]::NewGuid().ToString('N'))

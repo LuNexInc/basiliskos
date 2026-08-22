@@ -3,6 +3,18 @@
 > What is intentionally settled + why + reverse-if. HANDOFF = history; this = standing state.
 > Newest on top. Extracted from AGENTS.md 2026-07-25 — keep in sync when a call changes.
 
+## 2026-08-22 — DeepSeek is removed as a provider
+- **Decision:** DeepSeek support is deleted end-to-end: catalog models, API-key add flow (`add_deepseek_account`), compat-block config generation, adaptive-thinking bridge, usage/expiry handling, the vision sidecar engine (DeepSeek was the only text-only provider needing image description), and the Codex plugin's DeepSeek Responses hop (`deepseek_responses.go`, rebuilt DLL). Supported providers are now Claude / Codex / Grok(xAI) / Kimi / Antigravity.
+- **Why:** Charles directed the complete removal on 2026-08-22. The sidecar machinery existed solely because DeepSeek V4 is text-only; with it gone, images route natively everywhere.
+- **Migration notes:** leftover `deepseek-*.json` auth files are inert (no generated compat block selects them); a controller state that still points at one simply shows no active account until the user picks another. `selection_requires_backend_restart` was DeepSeek-only and is gone.
+- **Reverse if:** Charles asks DeepSeek back; recover from git history before this date (provider code, `docs/DEEPSEEK-VISION.md`).
+
+## 2026-08-22 — productName renamed to BasiliskOS (installer/exe/folder)
+- **Decision:** `tauri.conf.json` `productName` is now **BasiliskOS**; the installer, exe, Start Menu entry, Program Files folder, window titles, tray tooltip, and user-visible UI strings all say BasiliskOS. The workspace folder (`hydra-gateway`), package id (`com.threereadylab.hydragateway`), publish repo slug (`LuNexInc/basiliskos`), and GitHub download URL are unchanged. Internal state names (`Basiliskos` config dir, `Basiliskos Logs`) keep historical casing on purpose — changing them would orphan existing controller state.
+- **Why:** Charles approved the rename on 2026-08-22, satisfying the reverse-if of the 2026-08-14 entry. Windows paths are case-insensitive, so upgrades reuse the old directory; a PREINSTALL recase step (GetLongPathNameW + directory bounce) makes the folder display the new casing. The updater resolves release assets through SHA256SUMS.txt case-insensitively and downloads by the manifest's exact name, so releases may carry either `Basiliskos_`/`BasiliskOS_` asset casing without breaking any installed client.
+- **Residual:** live upgrade-over-old-casing is exercised by CI installer-lifecycle at the next tagged release (dev tree cannot safely reinstall over Charles's running app). Old 2.6.x clients resolve new-cased assets only after they run an updater-fixed build — acceptable: next release requires manual install once for existing users anyway if they update before this ships.
+- **Reverse if:** Charles wants the public name back to Basiliskos (cosmetic revert; keep the recase hook pattern).
+
 ## 2026-08-14 — Public product name is BasiliskOS
 - **Decision:** The product display name is **BasiliskOS**. Keep the workspace folder `hydra-gateway`, the package id `com.threereadylab.hydragateway`, the publish repo slug `LuNexInc/basiliskos`, and the hardcoded GitHub download URL on that slug. Do not rename the GitHub repo for the next ship.
 - **Why:** Charles set the public name. The slug, folder, and updater URL already work. A GitHub rename or a `productName` change moves `C:\Program Files\3ReadyLab\<productName>\` and can leave a second install unless the NSIS hook migrates the old Basiliskos path.
@@ -61,10 +73,10 @@
 - **Known limitation:** DeepSeek bills a prepaid balance, not a quota window, so `get_gateway_account_usage` returns an explanatory error rather than a fabricated percentage.
 - **Reverse if:** CLIProxyAPI gains a first-class DeepSeek provider with its own auth (then drop the compat block), or Charles wants keys kept out of the generated config entirely.
 
-## OpenCodex is scaffold/UI only — live routing stays Claude/Codex/Grok/Kimi
-- **Decision:** ship an OpenCodex-shaped catalog + UI tab, but live request routing uses only the four real providers via the pinned CLIProxyAPI. Do NOT reinstall `@bitkyc08/opencodex` or rewrite `~/.codex/config.toml`.
-- **Why:** the catalog is a forward-looking surface; enabling live multi-provider routing / storing API keys needs explicit sign-off. *(Superseded for DeepSeek only on 2026-08-01 — see the entry above. The gate still stands for every other catalog entry.)*
-- **Reverse if:** Charles approves live catalog routing (see `docs/OPENCODEX-SCAFFOLD.md`). Note: `opencodex.rs` isn't actually in the tree yet — this decision currently describes intent, not shipped code.
+## OpenCodex dropped (3.0)
+- **Decision:** OpenCodex (the designed-but-unshipped multi-provider catalog scaffold) is dropped. API-key providers and model routers are first-class via the `Provider` × `Auth` (`oauth` | `api_key`) model behind the pinned CLIProxyAPI path.
+- **Why:** a dedicated generic OpenAI/Anthropic-compatible API-key slot supersedes a catalog-shaped scaffold; popular routers (OpenCode Go, OpenRouter, LiteLLM) are curated presets on top of it.
+- **Reverse if:** Charles reintroduces an OpenCodex-shaped catalog surface instead of the generic API-key slot.
 
 ## Standing product & legal boundaries (stable)
 - **Official OAuth / audited local bridge only** for provider auth. Never automate provider login-approval pages. Never describe Basiliskos as a quota or restriction bypass. *Reverse if:* never — this is the product's legal footing.

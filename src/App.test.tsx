@@ -9,10 +9,9 @@ import {
   StatusBadge,
   usageAccountFiles,
   usageResetLabel,
-  usesApiKeyAuth,
 } from "./App";
 
-describe("truthful Basiliskos status components", () => {
+describe("truthful BasiliskOS status components", () => {
   it("only advertises a numerically newer published version", () => {
     expect(isNewerVersion("v1.1.16", "1.1.15")).toBe(true);
     expect(isNewerVersion("v1.1.15", "1.1.15")).toBe(false);
@@ -109,23 +108,10 @@ describe("truthful Basiliskos status components", () => {
     expect(prefersManualAuthBrowser("antigravity")).toBe(false);
   });
 
-  it("routes only DeepSeek through API-key auth instead of a browser login", () => {
-    expect(usesApiKeyAuth("deepseek")).toBe(true);
-    expect(usesApiKeyAuth("claude")).toBe(false);
-    expect(usesApiKeyAuth("codex")).toBe(false);
-    expect(usesApiKeyAuth("xai")).toBe(false);
-    expect(usesApiKeyAuth("kimi")).toBe(false);
-    expect(usesApiKeyAuth("antigravity")).toBe(false);
-    // DeepSeek has no OAuth URL at all, so it must never reach the
-    // manual-browser path that exists for cookie-prone OAuth providers.
-    expect(prefersManualAuthBrowser("deepseek")).toBe(false);
-  });
-
   it("refreshes usage for every OAuth account through one global action", () => {
     expect(usageAccountFiles([
       { fileName: "codex-a.json", provider: "codex" },
       { fileName: "xai-b.json", provider: "xai" },
-      { fileName: "deepseek-c.json", provider: "deepseek" },
       { fileName: "kimi-d.json", provider: "kimi" },
       { fileName: "antigravity-e.json", provider: "antigravity" },
     ])).toEqual(["codex-a.json", "xai-b.json", "kimi-d.json"]);

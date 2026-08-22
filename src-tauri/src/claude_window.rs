@@ -297,7 +297,7 @@ pub(crate) fn apply_basiliskos_aumid(hwnd: isize, window_ico: &Path) {
 
         let ico = window_ico.to_string_lossy();
         let _ = set_string(&PKEY_AUMID, CLAUDE_BASILISKOS_AUMID);
-        let _ = set_string(&PKEY_RELAUNCH_NAME, "Basiliskos Claude");
+        let _ = set_string(&PKEY_RELAUNCH_NAME, "BasiliskOS Claude");
         let _ = set_string(&PKEY_RELAUNCH_ICON, ico.as_ref());
         let _ = commit(store);
         let _ = release(store);

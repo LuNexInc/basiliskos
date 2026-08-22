@@ -7,8 +7,9 @@ truth" section below for the dev-vs-publish-repo rules.
 
 The product goal is a small Windows controller that keeps Claude Code Desktop
 as the user's working interface while switching its local gateway between
-Claude, Codex, Grok, Kimi, and DeepSeek accounts the user owns or is authorized
-to use.
+Claude, Codex, Grok, Kimi, and Antigravity accounts (OAuth) and API-key
+providers and model routers (DeepSeek, OpenCode Go, OpenRouter, LiteLLM, and
+custom OpenAI-compatible endpoints) the user owns or is authorized to use.
 
 ## Boundaries
 
@@ -37,8 +38,14 @@ Run `pnpm test:all` before shipping any feature (especially new Tauri
 commands or provider integrations). Dev doesn't run the release gate, so
 skipping this lets drift pile up and surface only at release time. `test:all`
 = build + ui + format + clippy + rust + surface + installer + gateway +
-secrets + log-secrets. In particular, adding/removing a `gateway::` command
-means updating the `$expected` allowlist in `scripts/check-command-surface.ps1`.
+cliproxy + secrets + log-secrets. In particular, adding/removing a `gateway::`
+command means updating the `$expected` allowlist in
+`scripts/check-command-surface.ps1`. When bumping the pinned CLIProxyAPI
+version, update BOTH `scripts/prepare-gateway.ps1` and the `GATEWAY_VERSION` /
+`GATEWAY_EXE_SHA256` constants in `src-tauri/src/gateway.rs` (they must match),
+re-run `pnpm test:all`, and confirm the config contract test
+(`render_config_keeps_the_cliproxy_contract`) plus `pnpm test:cliproxy` are
+green.
 
 Follow the root workspace `AGENTS.md` and `HANDOFF.md` protocol.
 
@@ -95,13 +102,20 @@ Installers publish **Unsigned / Unknown publisher** unless
 `BASILISKOS_SIGN_CERT_BASE64` / `BASILISKOS_SIGN_CERT_PASSWORD` secrets exist
 in the `LuNexInc/basiliskos` repo (workflow already wired for them).
 
-## OpenCodex scaffold (2026-07-23)
+## Provider model (3.0)
 
-- The OpenCodex-shaped multi-provider catalog is **designed but not shipped**.
-  There is no `opencodex.rs` and no OpenCodex UI tab in the code — do not rely
-  on either until a later milestone lands them. `MAP.md` also flags this.
-- Live request routing uses only Claude / Codex / Grok / Kimi / DeepSeek via
-  the pinned CLIProxyAPI path. Do **not** reinstall `@bitkyc08/opencodex` or
-  rewrite `~/.codex/config.toml` for this product.
-- Design + next milestones: `docs/OPENCODEX-SCAFFOLD.md`. Get Charles's approval
-  before enabling live catalog routing or storing API keys.
+Every catalog provider is reached one of two ways via two orthogonal axes:
+`Provider` (target) and `Auth` (`oauth` | `api_key`).
+
+- **OAuth providers** (browser login, refreshable token): Claude, Codex, Grok
+  (`xai`), Antigravity, Kimi Code. Driven by CLIProxyAPI's `-<provider>-login`.
+- **API-key providers** (paste a key + optional endpoint, OpenAI/Anthropic-
+  compatible): DeepSeek, Kimi (Moonshot key), OpenCode Go, OpenRouter, LiteLLM,
+  and custom endpoints. Any OAuth provider can also be reached with a key.
+- The Anthropic picker requires real Anthropic model ids, so non-Claude models
+  are advertised under a stable alias and reverse-mapped by the front proxy.
+- API keys live in `~/.hydra-gateway/gateway/keys/<provider>-<label>.json` and
+  are never logged or committed.
+
+OpenCodex was dropped in 3.0. Do **not** reinstall `@bitkyc08/opencodex` or
+rewrite `~/.codex/config.toml` for this product.

@@ -1,13 +1,65 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::gateway::RouteSelection;
 
-// Supported live providers, in UI order. Adding a provider here changes the
-// account tabs, route defaults, and the config generation surface.
-pub(crate) const SUPPORTED_PROVIDERS: [&str; 6] =
-    ["claude", "codex", "xai", "kimi", "deepseek", "antigravity"];
+// Supported OAuth-capable providers, in UI order. Adding a provider here
+// changes the account tabs, route defaults, and the config generation surface.
+pub(crate) const SUPPORTED_PROVIDERS: [&str; 5] = ["claude", "codex", "xai", "kimi", "antigravity"];
+
+/// How an account authenticates. An OAuth-capable provider can also be reached
+/// with a static API key; an API-key-only provider (DeepSeek, routers, custom
+/// endpoints) can never use the browser OAuth flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderAuth {
+    Oauth,
+    ApiKey,
+}
+
+/// Providers reached only with a static API key + endpoint (never OAuth).
+/// OpenCodex was dropped in 3.0; these replace the catalog scaffold with a
+/// first-class API-key slot.
+pub(crate) const API_KEY_PROVIDERS: &[&str] =
+    &["deepseek", "opencode", "openrouter", "litellm", "custom"];
+
+/// Every provider that can name a credential, for account detection. OAuth
+/// providers come first so filename-prefix matching stays unambiguous.
+pub(crate) fn all_providers() -> Vec<&'static str> {
+    let mut providers = SUPPORTED_PROVIDERS.to_vec();
+    providers.extend_from_slice(API_KEY_PROVIDERS);
+    providers
+}
+
+/// The auth methods a provider supports. OAuth providers also accept a key, so
+/// Claude / Codex / Grok / Antigravity / Kimi can each be used with a BYO key.
+pub(crate) fn auth_kinds_for(provider: &str) -> &'static [ProviderAuth] {
+    if API_KEY_PROVIDERS.contains(&provider) {
+        &[ProviderAuth::ApiKey]
+    } else {
+        &[ProviderAuth::Oauth, ProviderAuth::ApiKey]
+    }
+}
+
+/// Default upstream base URL for API-key mode. Lane routers with no fixed
+/// endpoint (LiteLLM, custom) return None so the user supplies one.
+pub(crate) fn default_api_base_url(provider: &str) -> Option<&'static str> {
+    match provider {
+        "claude" => Some("https://api.anthropic.com"),
+        "codex" => Some("https://api.openai.com"),
+        "xai" => Some("https://api.x.ai"),
+        "antigravity" => Some("https://generativelanguage.googleapis.com"),
+        "kimi" => Some("https://api.moonshot.ai"),
+        "deepseek" => Some("https://api.deepseek.com"),
+        "opencode" => Some("https://opencode.ai"),
+        "openrouter" => Some("https://openrouter.ai/api"),
+        // Self-hosted proxy: the user supplies the base URL.
+        "litellm" | "custom" => None,
+        _ => None,
+    }
+}
 
 pub(crate) const GROK_4_5_CONTEXT_WINDOW_TOKENS: u64 = 500_000;
 
@@ -97,26 +149,6 @@ pub(crate) const KIMI_MODELS: &[ModelSpec] = &[
     },
 ];
 
-// `deepseek-chat` / `deepseek-reasoner` were fully retired on 2026-07-24 and now
-// return errors, so V4 is the only routable generation.
-//
-// Thinking is delivered through Anthropic adaptive thinking, which CLIProxyAPI
-// translates to the OpenAI-compatible upstream's `reasoning_effort`. Do not use
-// the `model(effort)` suffix used for OAuth providers: it breaks credential
-// selection on the openai-compatibility path.
-pub(crate) const DEEPSEEK_MODELS: &[ModelSpec] = &[
-    ModelSpec {
-        id: "deepseek-v4-flash",
-        label: "DeepSeek V4 Flash",
-        thinking_levels: &["none", "low", "high", "max"],
-    },
-    ModelSpec {
-        id: "deepseek-v4-pro",
-        label: "DeepSeek V4 Pro",
-        thinking_levels: &["none", "high", "max"],
-    },
-];
-
 pub(crate) const ANTIGRAVITY_MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: "gemini-3.7-flash",
@@ -135,14 +167,33 @@ pub(crate) const ANTIGRAVITY_MODELS: &[ModelSpec] = &[
     },
 ];
 
+// API-key providers have a known model set (DeepSeek) or a live catalog fetched
+// from the backend. Routers / custom endpoints return empty pinned specs here;
+// their picker options come from `refresh_model_catalog_cache`'s live list.
+pub(crate) const DEEPSEEK_MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        id: "deepseek-chat",
+        label: "DeepSeek Chat",
+        thinking_levels: &["none"],
+    },
+    ModelSpec {
+        id: "deepseek-reasoner",
+        label: "DeepSeek Reasoner",
+        thinking_levels: &["none", "high"],
+    },
+];
+
 pub(crate) fn model_specs(provider: &str) -> &'static [ModelSpec] {
     match provider {
         "claude" => CLAUDE_MODELS,
         "codex" => CODEX_MODELS,
         "xai" => XAI_MODELS,
         "kimi" => KIMI_MODELS,
-        "deepseek" => DEEPSEEK_MODELS,
         "antigravity" => ANTIGRAVITY_MODELS,
+        "deepseek" => DEEPSEEK_MODELS,
+        // Routers and custom endpoints expose a live model catalog; no pinned
+        // specs until the alias/live-catalog feature lands.
+        "opencode" | "openrouter" | "litellm" | "custom" => &[],
         _ => &[],
     }
 }
@@ -153,14 +204,20 @@ pub(crate) fn default_model(provider: &str) -> &'static str {
         "codex" => "gpt-5.6-terra",
         "xai" => "grok-4.5",
         "kimi" => "kimi-k3",
-        "deepseek" => "deepseek-v4-flash",
         "antigravity" => "gemini-3.7-flash",
+        "deepseek" => "deepseek-chat",
+        // Routers/custom: the live catalog validates and refines the actual
+        // model id; a placeholder keeps the route non-empty until fetched.
+        "opencode" => "opencode-go",
+        "openrouter" => "auto",
+        "litellm" => "auto",
+        "custom" => "auto",
         _ => "",
     }
 }
 
 pub(crate) fn default_routes() -> BTreeMap<String, RouteSelection> {
-    SUPPORTED_PROVIDERS
+    all_providers()
         .into_iter()
         .map(|provider| {
             (
@@ -259,6 +316,51 @@ pub(crate) fn thinking_level_label(level: &str) -> &'static str {
     }
 }
 
+/// The single, deterministic source of truth for a provider's picker aliases.
+/// Returns `(alias, model, thinking)` in picker order — the selected model's
+/// base alias, its thinking-variant aliases, then every other catalog base
+/// alias. Aliases are unique and Anthropic-valid, and the assignment is
+/// independent of the hidden list (which only filters display, never slot
+/// numbering), so the display (`picker_entries`) and the reverse map
+/// (`alias_to_picker_entry`) can never disagree.
+fn picker_alias_spec(provider: &str, selected: &str) -> Vec<(String, String, String)> {
+    let specs = model_specs(provider);
+    let mut out = Vec::new();
+    if let Some(selected_spec) = specs.iter().find(|spec| spec.id == selected) {
+        if let Some(alias) = base_alias(provider, selected_spec.id) {
+            out.push((
+                alias.to_string(),
+                selected_spec.id.to_string(),
+                "auto".into(),
+            ));
+            // Thinking variants use pool slots after the base models. Only one
+            // model's variants are advertised at a time (the selected one), so
+            // the slots are unambiguous: index < n_models is a base model,
+            // index >= n_models is a thinking variant of the selected model.
+            if provider != "claude" && selected_spec.thinking_levels.len() > 1 {
+                for (index, level) in selected_spec.thinking_levels.iter().enumerate() {
+                    if let Some(alias) = ANTHROPIC_ALIAS_POOL.get(specs.len() + index) {
+                        out.push((
+                            alias.to_string(),
+                            selected_spec.id.to_string(),
+                            level.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for spec in specs {
+        if spec.id == selected {
+            continue;
+        }
+        if let Some(alias) = base_alias(provider, spec.id) {
+            out.push((alias.to_string(), spec.id.to_string(), "auto".into()));
+        }
+    }
+    out
+}
+
 /// Builds the Claude picker entries for the active provider: the selected
 /// model first (its base entry, then an explicit entry per supported thinking
 /// level), then the other visible models as base entries. Returns
@@ -269,78 +371,128 @@ pub(crate) fn picker_entries(
     selected: &str,
 ) -> Vec<(String, String, String, String)> {
     let specs = model_specs(provider);
-    let visible = |spec: &ModelSpec| spec.id == selected || !hidden.contains(spec.id);
-    let mut entries = Vec::new();
-    if let Some(spec) = specs.iter().find(|spec| spec.id == selected) {
-        if visible(spec) {
-            if let Some(alias) = base_alias(provider, spec.id) {
-                entries.push((
-                    alias.to_string(),
-                    spec.label.to_string(),
-                    spec.id.to_string(),
-                    "auto".into(),
-                ));
-            }
-            // Thinking variants use pool slots after the base models. Only one
-            // model's variants are advertised at a time (the selected one), so
-            // the slots are unambiguous: index < n_models is a base model,
-            // index >= n_models is a thinking variant of the selected model.
-            if provider != "claude" && spec.thinking_levels.len() > 1 {
-                for (index, level) in spec.thinking_levels.iter().enumerate() {
-                    if let Some(alias) = ANTHROPIC_ALIAS_POOL.get(specs.len() + index) {
-                        entries.push((
-                            alias.to_string(),
-                            format!("{} · {}", spec.label, thinking_level_label(level)),
-                            spec.id.to_string(),
-                            level.to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    for spec in specs {
-        if spec.id == selected || !visible(spec) {
-            continue;
-        }
-        if let Some(alias) = base_alias(provider, spec.id) {
-            entries.push((
-                alias.to_string(),
-                spec.label.to_string(),
-                spec.id.to_string(),
-                "auto".into(),
-            ));
-        }
-    }
-    entries
+    let label_for = |model: &str| {
+        specs
+            .iter()
+            .find(|spec| spec.id == model)
+            .map(|spec| spec.label.to_string())
+            .unwrap_or_else(|| model.to_string())
+    };
+    picker_alias_spec(provider, selected)
+        .into_iter()
+        .filter(|(_, model, _)| model == selected || !hidden.contains(model))
+        .map(|(alias, model, thinking)| {
+            let label = if thinking == "auto" {
+                label_for(&model)
+            } else {
+                format!(
+                    "{} · {}",
+                    label_for(&model),
+                    thinking_level_label(&thinking)
+                )
+            };
+            (alias, label, model, thinking)
+        })
+        .collect()
 }
 
 /// Reverse lookup for a picker request: Anthropic alias → (upstream model,
-/// thinking). Base aliases resolve from the provider catalog with "auto"
-/// thinking; variant aliases (index >= model count) resolve against the
-/// selected model's thinking levels.
+/// thinking). Resolved against the same generator as `picker_entries`, so the
+/// two directions share one alias assignment.
 pub(crate) fn alias_to_picker_entry(
     provider: &str,
     alias: &str,
     selected: &str,
 ) -> Option<(String, String)> {
-    if provider == "claude" {
-        return model_specs("claude")
+    picker_alias_spec(provider, selected)
+        .into_iter()
+        .find(|(candidate, _, _)| candidate == alias)
+        .map(|(_, model, thinking)| (model, thinking))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_providers_are_key_only() {
+        for provider in API_KEY_PROVIDERS {
+            assert_eq!(auth_kinds_for(provider), &[ProviderAuth::ApiKey]);
+        }
+    }
+
+    #[test]
+    fn oauth_providers_accept_a_key_too() {
+        for provider in SUPPORTED_PROVIDERS {
+            assert!(auth_kinds_for(provider).contains(&ProviderAuth::Oauth));
+            assert!(auth_kinds_for(provider).contains(&ProviderAuth::ApiKey));
+        }
+    }
+
+    #[test]
+    fn deepseek_has_defaults_and_model_specs() {
+        assert_eq!(default_model("deepseek"), "deepseek-chat");
+        assert_eq!(
+            default_api_base_url("deepseek"),
+            Some("https://api.deepseek.com")
+        );
+        assert!(model_specs("deepseek")
             .iter()
-            .find(|spec| spec.id == alias)
-            .map(|spec| (spec.id.to_string(), "auto".into()));
+            .any(|spec| spec.id == "deepseek-chat"));
     }
-    let specs = model_specs(provider);
-    let index = ANTHROPIC_ALIAS_POOL
-        .iter()
-        .position(|candidate| *candidate == alias)?;
-    if index < specs.len() {
-        return Some((specs[index].id.to_string(), "auto".into()));
+
+    #[test]
+    fn routers_and_custom_are_live_catalog() {
+        for provider in ["opencode", "openrouter", "litellm", "custom"] {
+            assert!(model_specs(provider).is_empty());
+        }
+        assert_eq!(
+            default_api_base_url("opencode"),
+            Some("https://opencode.ai")
+        );
+        assert_eq!(
+            default_api_base_url("openrouter"),
+            Some("https://openrouter.ai/api")
+        );
+        assert_eq!(default_api_base_url("litellm"), None);
+        assert_eq!(default_api_base_url("custom"), None);
     }
-    let selected_spec = specs.iter().find(|spec| spec.id == selected)?;
-    if selected_spec.thinking_levels.len() > 1 {
-        let level = selected_spec.thinking_levels.get(index - specs.len())?;
-        return Some((selected.to_string(), (*level).to_string()));
+
+    #[test]
+    fn all_providers_covers_every_catalog_entry() {
+        let all = all_providers();
+        for provider in SUPPORTED_PROVIDERS.iter().chain(API_KEY_PROVIDERS.iter()) {
+            assert!(all.contains(provider));
+        }
     }
-    None
+
+    #[test]
+    fn picker_alias_spec_is_stable_and_reversible() {
+        for provider in SUPPORTED_PROVIDERS {
+            let selected = default_model(provider);
+            let spec = picker_alias_spec(provider, selected);
+            assert!(!spec.is_empty(), "{provider} alias spec is empty");
+            let mut seen = std::collections::BTreeSet::new();
+            for (alias, model, _thinking) in &spec {
+                assert!(
+                    seen.insert(alias.clone()),
+                    "{provider} alias {alias} duplicated"
+                );
+                // Every advertised alias reverses back to the same upstream model.
+                assert_eq!(
+                    alias_to_picker_entry(provider, alias, selected).map(|(m, _)| m),
+                    Some(model.clone()),
+                    "{provider} alias {alias} did not reverse to {model}"
+                );
+            }
+            // The hidden list filters display only — it never shifts the alias
+            // assignment, so the reverse map stays stable.
+            let hidden = std::collections::BTreeSet::from([selected.to_string()]);
+            let _ = picker_entries(provider, &hidden, selected);
+        }
+        // Live-catalog providers (routers/custom) have no pinned aliases yet.
+        for provider in ["opencode", "openrouter", "litellm", "custom"] {
+            assert!(picker_alias_spec(provider, default_model(provider)).is_empty());
+        }
+    }
 }
