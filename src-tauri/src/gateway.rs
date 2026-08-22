@@ -5480,10 +5480,13 @@ fn validate_account_invariant(directory: &Path, state_path: &Path) -> Result<(),
         }
     }
     for directory in &directories {
-        for entry in fs::read_dir(directory)
-            .map_err(|error| format!("Could not validate {}: {error}", directory.display()))?
-        {
-            let entry = entry.map_err(|error| format!("Could not validate an account: {error}"))?;
+        // The API-key directory may not exist yet (fresh machine). A missing
+        // account directory means "no accounts of that flavor" — skip it rather
+        // than failing the whole transaction.
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
