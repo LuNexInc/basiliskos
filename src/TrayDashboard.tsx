@@ -19,6 +19,7 @@ type Provider =
   | "xai"
   | "kimi"
   | "antigravity"
+  | "zai"
   | "deepseek"
   | "opencode"
   | "openrouter"
@@ -181,6 +182,48 @@ function fuelTone(percent?: number): FuelTone {
   return "full";
 }
 
+function healthLabel(
+  subject: "relay" | "link" | "claude" | "chatgpt",
+  status?: { state: string },
+): string {
+  const state = status?.state;
+  if (!state) {
+    if (subject === "relay") return "Relay …";
+    if (subject === "link") return "Link …";
+    if (subject === "claude") return "Claude …";
+    return "ChatGPT …";
+  }
+
+  const ready = ["running", "healthy", "selected", "ready", "completed"].includes(state);
+  const pending = ["starting", "waiting"].includes(state);
+  const stopped = state === "stopped";
+  const degraded = state === "degraded" || state === "failed";
+
+  switch (subject) {
+    case "relay":
+      if (ready) return "Relay running";
+      if (pending) return "Relay starting";
+      if (stopped) return "Relay stopped";
+      return `Relay ${state}`;
+    case "link":
+      if (ready) return "Link healthy";
+      if (pending) return "Link connecting";
+      if (stopped) return "Link stopped";
+      if (degraded) return "Link degraded";
+      return `Link ${state}`;
+    case "claude":
+      if (ready) return "Claude window open";
+      if (pending) return "Claude window opening";
+      if (stopped) return "Claude window closed";
+      return `Claude ${state}`;
+    case "chatgpt":
+      if (ready) return "ChatGPT window open";
+      if (pending) return "ChatGPT window opening";
+      if (stopped) return "ChatGPT window closed";
+      return `ChatGPT ${state}`;
+  }
+}
+
 function ReactorCore({
   percent,
   label,
@@ -196,7 +239,7 @@ function ReactorCore({
   const aria =
     percent === undefined
       ? `${label}: usage unrecorded`
-      : `${label}: ${Math.round(percent)} percent fuel remaining`;
+      : `${label}: ${Math.round(percent)} percent remaining`;
 
   return (
     <div className={`tray-fuel tone-${tone}`} data-tone={tone}>
@@ -211,7 +254,7 @@ function ReactorCore({
         ))}
       </div>
       <span className="tray-fuel-readout">
-        {percent === undefined ? "UNRECORDED" : `${Math.round(percent)}% FUEL`}
+        {percent === undefined ? "Unrecorded" : `${Math.round(percent)}% remaining`}
       </span>
     </div>
   );
@@ -377,13 +420,13 @@ export default function TrayDashboard() {
             }
           : current,
       );
-      setMessage("Opened BasiliskOS Claude");
+      setMessage("Claude window opened");
       return;
     }
     setBusy("claude");
     try {
       setSnapshot(await invoke<Snapshot>("launch_hydra_claude"));
-      setMessage("Opened BasiliskOS Claude");
+      setMessage("Claude window opened");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -404,13 +447,13 @@ export default function TrayDashboard() {
             }
           : current,
       );
-      setMessage("Closed BasiliskOS Claude");
+      setMessage("Claude window closed");
       return;
     }
     setBusy("claude");
     try {
       setSnapshot(await invoke<Snapshot>("stop_hydra_claude"));
-      setMessage("Closed BasiliskOS Claude");
+      setMessage("Claude window closed");
       setIsError(false);
     } catch (error) {
       setMessage(messageFrom(error));
@@ -478,7 +521,7 @@ export default function TrayDashboard() {
         <div className="tray-top-meta">
           <span className={`tray-core-badge${systemsLive ? " live" : ""}`}>
             <i aria-hidden="true" />
-            {systemsLive ? "CORE ONLINE" : "CORE STANDBY"}
+            {systemsLive ? "Online" : "Standby"}
           </span>
           <button type="button" className="tray-icon-btn" aria-label="Close dashboard" onClick={() => void dismiss()}>
             <X size={14} />
@@ -488,16 +531,16 @@ export default function TrayDashboard() {
 
       <section className="tray-health" aria-label="Health">
         <span className={statusTone(snapshot?.relay)} title={snapshot?.relay.detail}>
-          <i aria-hidden="true" /> Relay · {snapshot?.relay.state ?? "…"}
+          <i aria-hidden="true" /> {healthLabel("relay", snapshot?.relay)}
         </span>
         <span className={statusTone(snapshot?.backend)} title={snapshot?.backend.detail}>
-          <i aria-hidden="true" /> Link · {snapshot?.backend.state ?? "…"}
+          <i aria-hidden="true" /> {healthLabel("link", snapshot?.backend)}
         </span>
         <span className={statusTone(snapshot?.claude)} title={snapshot?.claude.detail}>
-          <i aria-hidden="true" /> Claude · {snapshot?.claude.state ?? "…"}
+          <i aria-hidden="true" /> {healthLabel("claude", snapshot?.claude)}
         </span>
         <span className={statusTone(snapshot?.codex)} title={snapshot?.codex?.detail}>
-          <i aria-hidden="true" /> ChatGPT · {snapshot?.codex?.state ?? "…"}
+          <i aria-hidden="true" /> {healthLabel("chatgpt", snapshot?.codex)}
         </span>
       </section>
 
@@ -505,7 +548,7 @@ export default function TrayDashboard() {
         <article className="tray-service">
           <div className="tray-service-head">
             <span className="eyebrow">Claude Code</span>
-            <span className="tray-service-tag">PRIMARY</span>
+            <span className="tray-service-tag">Primary</span>
           </div>
           <h2>{active && activeRoute ? activeRoute.selectedModelLabel : "No account"}</h2>
           <p>
@@ -523,7 +566,7 @@ export default function TrayDashboard() {
         <article className="tray-service">
           <div className="tray-service-head">
             <span className="eyebrow">ChatGPT</span>
-            <span className="tray-service-tag">{snapshot?.codexRunning ? "OPEN" : "CLOSED"}</span>
+            <span className="tray-service-tag">{snapshot?.codexRunning ? "Open" : "Closed"}</span>
           </div>
           <h2>{activeCodex && codexActiveRoute ? codexActiveRoute.selectedModelLabel : "No account"}</h2>
           <p>
@@ -537,7 +580,7 @@ export default function TrayDashboard() {
         <article className="tray-service">
           <div className="tray-service-head">
             <span className="eyebrow">Codex CLI</span>
-            <span className="tray-service-tag">WORKER</span>
+            <span className="tray-service-tag">Worker</span>
           </div>
           <h2>{codexCliAccount ? codexCliAccount.label : "Not set"}</h2>
           <p>{codexCliAccount ? codexCliAccount.email ?? "Real codex command" : "Serve from full window"}</p>
@@ -547,7 +590,7 @@ export default function TrayDashboard() {
         <article className="tray-service">
           <div className="tray-service-head">
             <span className="eyebrow">Grok CLI</span>
-            <span className="tray-service-tag">WORKER</span>
+            <span className="tray-service-tag">Worker</span>
           </div>
           <h2>{grokCliAccount ? grokCliAccount.label : "Not set"}</h2>
           <p>{grokCliAccount ? grokCliAccount.email ?? "Real grok command" : "Serve from full window"}</p>

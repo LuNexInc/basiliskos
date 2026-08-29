@@ -21,6 +21,10 @@
         { "url": "https://auth.x.ai/*" },
         { "url": "https://auth.kimi.com/*" },
         { "url": "https://www.kimi.com/*" },
+        { "url": "https://zcode.z.ai/*" },
+        { "url": "https://chat.z.ai/*" },
+        { "url": "https://z.ai/*" },
+        { "url": "https://www.z.ai/*" },
         { "url": "https://github.com/LuNexInc/basiliskos/releases/download/*" }
       ]
     }

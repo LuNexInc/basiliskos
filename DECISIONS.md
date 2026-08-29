@@ -3,6 +3,13 @@
 > What is intentionally settled + why + reverse-if. HANDOFF = history; this = standing state.
 > Newest on top. Extracted from AGENTS.md 2026-07-25 — keep in sync when a call changes.
 
+
+## 2026-08-29 — Z.AI GLM OAuth is a first-class provider
+- **Decision:** `zai` is in `SUPPORTED_PROVIDERS`. Add account runs the official ZCode CLI poll (`POST zcode.z.ai/api/v1/oauth/cli/init` → browser authorize → poll) and then mints a coding-plan API key through the Z.AI business API (`inference:mint_agent_key` equivalent). The minted key is stored as an OAuth account and routed through CLIProxyAPI `openai-compatibility` to `https://api.z.ai/api/coding/paas/v4` because pinned 7.2.139 has no native `-zai-login`.
+- **Why:** Charles asked for Z.AI/GLM OAuth. Official Z.AI Claude Code docs are API-key only; the coding-plan OAuth flow is the ZCode CLI poll plus key mint, not a pasted key. Do not automate the approval page.
+- **Known limitation:** quota is managed in the Z.AI console (no usage windows). Thinking levels are not mapped through the openai-compat hop yet, so the GLM picker thinking control is disabled. China BigModel loopback login is not shipped.
+- **Reverse if:** CLIProxyAPI merges `-zai-login` (PR #3928) and Basiliskos pins that runtime; then drop the native poll/mint and use the CPA flag like Kimi.
+
 ## 2026-08-22 — DeepSeek is removed as a provider
 - **Decision:** DeepSeek support is deleted end-to-end: catalog models, API-key add flow (`add_deepseek_account`), compat-block config generation, adaptive-thinking bridge, usage/expiry handling, the vision sidecar engine (DeepSeek was the only text-only provider needing image description), and the Codex plugin's DeepSeek Responses hop (`deepseek_responses.go`, rebuilt DLL). Supported providers are now Claude / Codex / Grok(xAI) / Kimi / Antigravity.
 - **Why:** Charles directed the complete removal on 2026-08-22. The sidecar machinery existed solely because DeepSeek V4 is text-only; with it gone, images route natively everywhere.

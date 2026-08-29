@@ -18,16 +18,16 @@ describe("tray dashboard preview render", () => {
     window.history.replaceState({}, "", window.location.pathname);
   });
 
-  it("renders the fuel-core header and health statuses", async () => {
+  it("renders the header and health statuses", async () => {
     const TrayDashboard = await loadTrayWithTrayFlag();
     render(<TrayDashboard />);
     await act(async () => {});
     expect(screen.getByText("BasiliskOS")).toBeInTheDocument();
     expect(screen.getByText("Relay")).toBeInTheDocument();
-    expect(screen.getByText("CORE ONLINE")).toBeInTheDocument();
-    expect(screen.getByText(/Relay · /)).toBeInTheDocument();
-    expect(screen.getByText(/Link · /)).toBeInTheDocument();
-    expect(screen.getByText(/Claude · /)).toBeInTheDocument();
+    expect(screen.getByText("Online")).toBeInTheDocument();
+    expect(screen.getByText("Relay running")).toBeInTheDocument();
+    expect(screen.getByText("Link healthy")).toBeInTheDocument();
+    expect(screen.getAllByText("Claude window open").length).toBeGreaterThan(0);
   });
 
   it("shows the primary service route and the quick actions", async () => {
@@ -37,7 +37,7 @@ describe("tray dashboard preview render", () => {
     expect(screen.getAllByText("Claude Code").length).toBeGreaterThan(0);
     expect(screen.getAllByText("GPT-5.4").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Codex worker").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("PRIMARY").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Primary").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Stop relay").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Close Claude").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Open full window").length).toBeGreaterThan(0);

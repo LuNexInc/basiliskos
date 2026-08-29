@@ -105,6 +105,7 @@ describe("truthful BasiliskOS status components", () => {
     expect(prefersManualAuthBrowser("kimi")).toBe(true);
     expect(prefersManualAuthBrowser("codex")).toBe(false);
     expect(prefersManualAuthBrowser("claude")).toBe(false);
+    expect(prefersManualAuthBrowser("zai")).toBe(true);
     expect(prefersManualAuthBrowser("antigravity")).toBe(false);
   });
 
@@ -114,6 +115,7 @@ describe("truthful BasiliskOS status components", () => {
       { fileName: "xai-b.json", provider: "xai" },
       { fileName: "kimi-d.json", provider: "kimi" },
       { fileName: "antigravity-e.json", provider: "antigravity" },
+      { fileName: "zai-f.json", provider: "zai" },
     ])).toEqual(["codex-a.json", "xai-b.json", "kimi-d.json"]);
   });
 });

@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock,
     },
     thread,
@@ -41,6 +41,7 @@ use crate::usage::{
     parse_claude_usage, parse_codex_usage, parse_kimi_usage, parse_xai_usage, GatewayAccountUsage,
 };
 use crate::vision::tool_compatibility_fixups;
+use crate::zai_oauth::{self, ZaiOAuth};
 
 use crate::persistence::{
     durable_write, load_json_with_recovery, recover_pending_transactions, run_transaction,
@@ -430,7 +431,8 @@ pub struct ProviderLoginStatus {
 
 struct LoginRuntime {
     status: ProviderLoginStatus,
-    child: Arc<Mutex<Child>>,
+    child: Option<Arc<Mutex<Child>>>,
+    cancel: Arc<AtomicBool>,
     staging_dir: PathBuf,
     #[cfg(target_os = "windows")]
     job: Option<usize>,
@@ -829,6 +831,7 @@ fn provider_label(provider: &str) -> &'static str {
         "xai" => "Grok Build",
         "kimi" => "Kimi Code",
         "antigravity" => "Antigravity",
+        "zai" => "Z.AI GLM",
         _ => "Unknown provider",
     }
 }
@@ -1328,14 +1331,35 @@ fn render_api_key_provider_blocks(auth: &Path) -> String {
     let Ok(directory) = keys_dir() else {
         return String::new();
     };
-    let Ok(entries) = fs::read_dir(&directory) else {
-        return String::new();
-    };
-    // Only the enabled accounts are emitted; per-account base-url falls back to
-    // the catalog default. Routers/custom declare only their pinned models (the
-    // live model list is surfaced in the route panel). Do not take the runtime
-    // lock here: render_config can be reached while it is held.
     let mut providers: Vec<(String, String, String)> = Vec::new();
+    collect_compat_accounts(&mut providers, &directory, true);
+    if let Ok(auth_directory) = auth_dir() {
+        collect_compat_accounts(&mut providers, &auth_directory, false);
+    }
+    if providers.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nopenai-compatibility:\n");
+    for (provider, base_url, key) in providers {
+        let model_ids: Vec<String> = model_specs(&provider)
+            .iter()
+            .map(|spec| spec.id.to_string())
+            .collect();
+        out.push_str(&openai_compat_provider_yaml(
+            &provider, &base_url, &key, &model_ids,
+        ));
+    }
+    out
+}
+
+fn collect_compat_accounts(
+    providers: &mut Vec<(String, String, String)>,
+    directory: &Path,
+    api_key_only: bool,
+) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -1358,10 +1382,17 @@ fn render_api_key_provider_blocks(auth: &Path) -> String {
         let Some(provider) = account_provider(&value, &file_name) else {
             continue;
         };
-        if !crate::catalog::API_KEY_PROVIDERS.contains(&provider.as_str()) {
+        let include = if api_key_only {
+            crate::catalog::API_KEY_PROVIDERS.contains(&provider.as_str()) || provider == "zai"
+        } else {
+            provider == "zai"
+        };
+        if !include {
             continue;
         }
-        let Some(key) = nested_string(&value, &["api_key"]) else {
+        let Some(key) = nested_string(&value, &["api_key"])
+            .or_else(|| nested_string(&value, &["access_token"]))
+        else {
             continue;
         };
         let base_url = nested_string(&value, &["base_url"])
@@ -1372,20 +1403,6 @@ fn render_api_key_provider_blocks(auth: &Path) -> String {
         }
         providers.push((provider, base_url, key));
     }
-    if providers.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("\nopenai-compatibility:\n");
-    for (provider, base_url, key) in providers {
-        let model_ids: Vec<String> = model_specs(&provider)
-            .iter()
-            .map(|spec| spec.id.to_string())
-            .collect();
-        out.push_str(&openai_compat_provider_yaml(
-            &provider, &base_url, &key, &model_ids,
-        ));
-    }
-    out
 }
 
 /// One `openai-compatibility` list item, matching the pinned CLIProxyAPI
@@ -3536,7 +3553,12 @@ fn nested_string(value: &Value, keys: &[&str]) -> Option<String> {
 pub(crate) fn account_provider(value: &Value, file_name: &str) -> Option<String> {
     let explicit = nested_string(value, &["type", "provider"])
         .or_else(|| nested_string(value, &["provider"]))
-        .map(|provider| provider.to_ascii_lowercase());
+        .or_else(|| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|provider| provider.to_ascii_lowercase())
+        });
     let provider = explicit.or_else(|| {
         let lower = file_name.to_ascii_lowercase();
         let providers = all_providers();
@@ -3625,6 +3647,7 @@ fn default_account_label(provider: &str) -> String {
         "codex" => "Codex account".into(),
         "kimi" => "Kimi Code".into(),
         "antigravity" => "Antigravity account".into(),
+        "zai" => "Z.AI GLM".into(),
         "claude" => "Claude account".into(),
         "deepseek" => "DeepSeek API".into(),
         "opencode" => "OpenCode API".into(),
@@ -3643,6 +3666,7 @@ fn api_key_default_label(provider: &str) -> String {
         "codex" => "Codex API".into(),
         "claude" => "Claude API".into(),
         "antigravity" => "Gemini API".into(),
+        "zai" => "Z.AI API".into(),
         "kimi" => "Moonshot API".into(),
         "deepseek" => "DeepSeek API".into(),
         "opencode" => "OpenCode API".into(),
@@ -3747,15 +3771,22 @@ fn list_accounts_inner(state: &ControllerState) -> Result<Vec<GatewayAccount>, S
     Ok(accounts)
 }
 
-fn shared_claude_library_dir() -> Result<PathBuf, String> {
+fn claude_3p_profile_dir() -> Result<PathBuf, String> {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .map(|path| path.join("Claude-3p").join("configLibrary"))
+        .map(|path| path.join("Claude-3p"))
         .ok_or_else(|| "LOCALAPPDATA is not available".to_string())
 }
 
+fn shared_claude_library_dir() -> Result<PathBuf, String> {
+    Ok(claude_3p_profile_dir()?.join("configLibrary"))
+}
+
 pub(crate) fn isolated_claude_profile_dir() -> Result<PathBuf, String> {
-    Ok(root_dir()?.join("claude-profile"))
+    // Claude 1.40609 `cl()` on Windows is `%LOCALAPPDATA%\Claude-3p` unless
+    // CLAUDE_USER_DATA_DIR is set, and that env now means "use Electron
+    // userData" (stock %APPDATA%\Claude on MSIX) instead of the env path.
+    claude_3p_profile_dir()
 }
 
 pub(crate) fn isolated_codex_home() -> Result<PathBuf, String> {
@@ -4365,6 +4396,9 @@ fn load_usage_credential(
             "Antigravity quota usage is managed in the Google Cloud / Gemini developer console."
                 .into(),
         );
+    }
+    if account.provider == "zai" {
+        return Err("GLM Coding Plan quota is managed in the Z.AI console.".into());
     }
     let raw = fs::read_to_string(&path)
         .map_err(|error| format!("Could not read account credentials: {error}"))?;
@@ -6209,6 +6243,7 @@ fn extract_login_url(provider: &str, line: &str) -> Option<String> {
                 || candidate.starts_with("https://www.kimi.com/")
         }
         "antigravity" => candidate.starts_with("https://accounts.google.com/"),
+        "zai" => zai_oauth::is_allowed_authorize_url(candidate),
         _ => false,
     };
     allowed.then(|| candidate.to_string())
@@ -6466,8 +6501,10 @@ fn finish_login_session(session_id: String) {
         runtime.login.take()
     };
     let Some(session) = session else { return };
-    let exit = session
-        .child
+    let Some(child) = session.child else {
+        return;
+    };
+    let exit = child
         .lock()
         .map_err(|_| "Provider login process state is unavailable".to_string())
         .and_then(|mut child| {
@@ -6575,7 +6612,183 @@ fn provider_login_flag(provider: &str) -> Result<&'static str, String> {
         "xai" => Ok("-xai-login"),
         "kimi" => Ok("-kimi-login"),
         "antigravity" => Ok("-antigravity-login"),
-        _ => Err("Provider must be claude, codex, xai, kimi, or antigravity".into()),
+        "zai" => Err("Z.AI login uses the official ZCode CLI flow, not CLIProxyAPI".into()),
+        _ => Err("Provider must be claude, codex, xai, kimi, antigravity, or zai".into()),
+    }
+}
+
+fn launch_zai_login_blocking() -> Result<ProviderLoginLaunch, String> {
+    let session_id = Uuid::new_v4().simple().to_string();
+    {
+        let mut runtime = runtime_lock()?;
+        if runtime.login.is_some() || runtime.login_claim.is_some() {
+            return Err("A provider login is already running. Finish or cancel it first.".into());
+        }
+        runtime.login_claim = Some(session_id.clone());
+        runtime.last_login = None;
+    }
+    let staging_dir = login_staging_root()?.join(&session_id);
+    let staged_auth = staging_dir.join("auth");
+    if let Err(error) = (|| -> Result<(), String> {
+        let _mutation = mutation_lock()?;
+        secure_create_dir_all(&staging_dir)?;
+        secure_create_dir_all(&staged_auth)?;
+        Ok(())
+    })() {
+        abort_login_start(&session_id, &staging_dir, None, None, "zai");
+        return Err(error);
+    }
+    let client = match ZaiOAuth::production() {
+        Ok(client) => client,
+        Err(error) => {
+            abort_login_start(&session_id, &staging_dir, None, None, "zai");
+            return Err(error);
+        }
+    };
+    let init = match tauri::async_runtime::block_on(client.start_cli_flow()) {
+        Ok(init) => init,
+        Err(error) => {
+            abort_login_start(&session_id, &staging_dir, None, None, "zai");
+            return Err(error);
+        }
+    };
+    let authorization_url = match extract_login_url("zai", &init.authorize_url) {
+        Some(url) => url,
+        None => {
+            abort_login_start(&session_id, &staging_dir, None, None, "zai");
+            return Err("Z.AI login did not return a trusted authorization URL".into());
+        }
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let status = ProviderLoginStatus {
+        session_id: session_id.clone(),
+        provider: "zai".into(),
+        state: "waiting".into(),
+        started_at: Utc::now().to_rfc3339(),
+        result_file_name: None,
+        detail: "Waiting for the official provider authorization to complete".into(),
+    };
+    {
+        let mut runtime = match runtime_lock() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                abort_login_start(&session_id, &staging_dir, None, None, "zai");
+                return Err(error);
+            }
+        };
+        if runtime.login_claim.as_deref() != Some(session_id.as_str()) {
+            drop(runtime);
+            abort_login_start(&session_id, &staging_dir, None, None, "zai");
+            return Err("The provider login was cancelled during startup".into());
+        }
+        runtime.login_claim = None;
+        runtime.login = Some(LoginRuntime {
+            status,
+            child: None,
+            cancel: Arc::clone(&cancel),
+            staging_dir: staging_dir.clone(),
+            #[cfg(target_os = "windows")]
+            job: None,
+        });
+    }
+    let worker_session = session_id.clone();
+    thread::spawn(move || {
+        let outcome = tauri::async_runtime::block_on(async {
+            let ready = client.wait_for_authorization(&init, &cancel).await?;
+            if cancel.load(Ordering::SeqCst) {
+                return Err("Z.AI login was cancelled".into());
+            }
+            let minted = client.mint_coding_plan_key(&ready).await?;
+            Ok((ready, minted))
+        });
+        finish_zai_login(worker_session, staging_dir, cancel, outcome);
+    });
+    Ok(ProviderLoginLaunch {
+        session_id,
+        authorization_url,
+        user_code: None,
+    })
+}
+
+fn finish_zai_login(
+    session_id: String,
+    staging_dir: PathBuf,
+    cancel: Arc<AtomicBool>,
+    outcome: Result<(zai_oauth::ZaiReady, String), String>,
+) {
+    let commit = (|| -> Result<String, String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Z.AI login was cancelled".into());
+        }
+        let (ready, api_key) = outcome?;
+        let _mutation = mutation_lock()?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Z.AI login was cancelled".into());
+        }
+        let file_name = zai_oauth::credential_file_name(&ready);
+        let staged_auth = staging_dir.join("auth");
+        secure_create_dir_all(&staged_auth)?;
+        durable_write(
+            &staged_auth.join(&file_name),
+            serde_json::to_vec_pretty(&zai_oauth::credential_json(&ready, &api_key))
+                .map_err(|_| "The Z.AI credential could not be serialized")?
+                .as_slice(),
+        )?;
+        merge_staged_login("zai", &staging_dir)
+    })();
+    let session = {
+        let Ok(mut runtime) = runtime_lock() else {
+            let _ = remove_login_staging(&staging_dir);
+            return;
+        };
+        if runtime
+            .login
+            .as_ref()
+            .map(|login| login.status.session_id.as_str())
+            != Some(session_id.as_str())
+        {
+            let _ = remove_login_staging(&staging_dir);
+            return;
+        }
+        runtime.login.take()
+    };
+    let Some(session) = session else {
+        let _ = remove_login_staging(&staging_dir);
+        return;
+    };
+    let _ = remove_login_staging(&staging_dir);
+    let status = match commit {
+        Ok(file_name) => ProviderLoginStatus {
+            state: "completed".into(),
+            result_file_name: Some(file_name),
+            detail: "Provider login completed and the validated credential was committed".into(),
+            ..session.status
+        },
+        Err(error) if error.contains("cancelled") => ProviderLoginStatus {
+            state: "cancelled".into(),
+            result_file_name: None,
+            detail: "Provider login cancelled; live credentials were not changed".into(),
+            ..session.status
+        },
+        Err(_) => {
+            diagnostics::record(
+                ErrorCode::LoginFailed,
+                "error",
+                "The provider login did not produce a validated credential.",
+                None,
+                None,
+                Some("zai"),
+            );
+            ProviderLoginStatus {
+                state: "failed".into(),
+                result_file_name: None,
+                detail: "Provider login failed without changing live credentials".into(),
+                ..session.status
+            }
+        }
+    };
+    if let Ok(mut runtime) = runtime_lock() {
+        runtime.last_login = Some(status);
     }
 }
 
@@ -6583,6 +6796,9 @@ fn launch_provider_login_blocking(
     app: AppHandle,
     provider: String,
 ) -> Result<ProviderLoginLaunch, String> {
+    if provider == "zai" {
+        return launch_zai_login_blocking();
+    }
     let flag = provider_login_flag(&provider)?;
     let session_id = Uuid::new_v4().simple().to_string();
     {
@@ -6731,7 +6947,8 @@ fn launch_provider_login_blocking(
                         runtime.login_claim = None;
                         runtime.login = Some(LoginRuntime {
                             status,
-                            child: Arc::clone(&child),
+                            child: Some(Arc::clone(&child)),
+                            cancel: Arc::new(AtomicBool::new(false)),
                             staging_dir: staging_dir.clone(),
                             #[cfg(target_os = "windows")]
                             job,
@@ -6781,9 +6998,12 @@ fn cancel_login_runtime() {
         runtime.login.take()
     });
     let Some(session) = session else { return };
-    if let Ok(mut child) = session.child.lock() {
-        let _ = child.kill();
-        let _ = child.wait();
+    session.cancel.store(true, Ordering::SeqCst);
+    if let Some(child) = session.child {
+        if let Ok(mut child) = child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
     #[cfg(target_os = "windows")]
     close_gateway_job(session.job);
@@ -6908,6 +7128,16 @@ fn validate_claude_config_set(
             .get("inferenceGatewayBaseUrl")
             .and_then(Value::as_str)
             != Some("http://127.0.0.1:8317")
+        || generated
+            .get("inference")
+            .and_then(|value| value.get("provider"))
+            .and_then(Value::as_str)
+            != Some("gateway")
+        || generated
+            .get("authentication")
+            .and_then(|value| value.get("disableClaudeAiSignIn"))
+            .and_then(Value::as_bool)
+            != Some(true)
         || deployment.get("deploymentMode").and_then(Value::as_str) != Some("3p")
     {
         return Err("The Claude config set failed its cross-file invariant".into());
@@ -7013,6 +7243,26 @@ fn write_isolated_claude_config(profile: &Path, state: &ControllerState) -> Resu
     generated.insert("inferenceProvider".into(), Value::String("gateway".into()));
     generated.insert("modelDiscoveryEnabled".into(), Value::Bool(true));
     generated.insert("unstableDisableModelVerification".into(), Value::Bool(true));
+    // Claude 1.40609 3p forcing reads nested `inference`, not the older
+    // flat keys. Keep both so 1.24012 still hydrates from legacyFlatKey.
+    generated.insert(
+        "inference".into(),
+        serde_json::json!({
+            "provider": "gateway",
+            "baseUrl": format!("http://127.0.0.1:{GATEWAY_PORT}"),
+            "credential": {
+                "kind": "static",
+                "apiKey": state.api_key,
+                "authScheme": "x-api-key"
+            }
+        }),
+    );
+    generated.insert(
+        "authentication".into(),
+        serde_json::json!({
+            "disableClaudeAiSignIn": true
+        }),
+    );
 
     deployment.insert("deploymentMode".into(), Value::String("3p".into()));
     deployment.insert("awaitingSignIn".into(), Value::Bool(false));
@@ -7528,8 +7778,10 @@ pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
         let stderr = fs::File::create(&stderr_path)
             .map_err(|error| format!("Could not create the Basiliskos Claude log: {error}"))?;
         let mut command = Command::new(&executable);
+        // Do not set CLAUDE_USER_DATA_DIR: 1.40609 then reads stock 1p
+        // userData. `--user-data-dir` must match `%LOCALAPPDATA%\Claude-3p`.
         command
-            .env("CLAUDE_USER_DATA_DIR", &profile)
+            .arg(format!("--user-data-dir={}", profile.to_string_lossy()))
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -7559,7 +7811,7 @@ pub fn launch_hydra_claude(app: AppHandle) -> Result<GatewaySnapshot, String> {
         std::thread::sleep(Duration::from_millis(900));
         if !hydra_claude_running() {
             return Err(
-                "Basiliskos Claude exited during startup. Check ~/.hydra-gateway/claude-profile/Basiliskos Logs."
+                "Basiliskos Claude exited during startup. Check %LOCALAPPDATA%\\Claude-3p\\Basiliskos Logs."
                     .into(),
             );
         }
@@ -8084,6 +8336,7 @@ mod tests {
         assert!(!enabled.contains("codex"));
         assert!(!enabled.contains("kimi"));
         assert!(!enabled.contains("antigravity"));
+        assert!(!enabled.contains("zai"));
 
         let models = codex_catalog_models(&enabled, None);
         let ids = models
@@ -8444,6 +8697,28 @@ mod tests {
                 .get("inferenceGatewayApiKey")
                 .and_then(Value::as_str),
             Some("new-secret")
+        );
+        assert_eq!(
+            generated
+                .get("inference")
+                .and_then(|value| value.get("provider"))
+                .and_then(Value::as_str),
+            Some("gateway")
+        );
+        assert_eq!(
+            generated
+                .get("inference")
+                .and_then(|value| value.get("credential"))
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str),
+            Some("static")
+        );
+        assert_eq!(
+            generated
+                .get("authentication")
+                .and_then(|value| value.get("disableClaudeAiSignIn"))
+                .and_then(Value::as_bool),
+            Some(true)
         );
 
         let deployment: Value =
@@ -9234,6 +9509,10 @@ mod tests {
             .as_deref(),
             Some("https://accounts.google.com/o/oauth2/v2/auth?client_id=test")
         );
+        assert_eq!(
+            extract_login_url("zai", "https://chat.z.ai/auth?flow=1").as_deref(),
+            Some("https://chat.z.ai/auth?flow=1")
+        );
         assert!(extract_login_url("codex", "about:blank").is_none());
         assert!(extract_login_url(
             "codex",
@@ -9248,6 +9527,7 @@ mod tests {
             "https://accounts.google.com.evil.example/auth"
         )
         .is_none());
+        assert!(extract_login_url("zai", "https://chat.z.ai.evil.example/auth").is_none());
     }
 
     #[test]

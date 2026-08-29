@@ -18,6 +18,7 @@ mod test_support;
 mod usage;
 mod vault;
 mod vision;
+mod zai_oauth;
 
 const TRAY_DASHBOARD_LABEL: &str = "tray-dashboard";
 const TRAY_DASHBOARD_WIDTH: f64 = 392.0;

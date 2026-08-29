@@ -2,7 +2,7 @@
 
 > Navigation index: where things live / what to open first. NOT behavior docs (that's AGENTS.md).
 > Size cap ~45 lines. Update in the same commit that moves/renames a module.
-> Last verified: 2026-08-16
+> Last verified: 2026-08-29
 
 ## Open first
 - `AGENTS.md` — Basiliskos contract + the **canonical-vs-publish-repo** rules. Read before ANY work here.
@@ -15,7 +15,7 @@
 
 ## Rust backend (Tauri, `src-tauri/src/`)
 - `gateway.rs` — command surface / provider routing (OAuth + API-key, `:8317` front proxy, model rewrite + identity injection, credential refresh, update). Still the biggest file.
-- `catalog.rs` — provider catalog (ModelSpec + per-provider lists), `Provider` × `Auth` kinds, route defaults, model→Anthropic alias map, live model fetch.
+- `catalog.rs` — provider catalog (ModelSpec + per-provider lists), `Provider` × `Auth` kinds, route defaults, model→Anthropic alias map, live model fetch. OAuth providers: Claude, Codex, xAI, Kimi, Antigravity, Z.AI GLM.
 - `usage.rs` — provider quota-window parsing (Claude/Codex/xAI/Kimi) + `GatewayUsageWindow`/`GatewayAccountUsage` types.
 - `vision.rs` — per-provider tool-compatibility fixups (Kimi tool_reference flattening, xAI web_search strip).
 - `claude_window.rs`, `codex_window.rs` — Win32 window icon, title, and close-watcher management.
@@ -25,7 +25,7 @@
 - API-key accounts live in `~/.hydra-gateway/gateway/keys/` (`kind: "api_key"`); OAuth accounts live in `~/.hydra-gateway/gateway/auth/`. OpenCodex was dropped in 3.0.
 
 ## Release & security scripts (`scripts/`)
-- `check-command-surface.ps1` (gateway command allowlist — update when adding/removing a `gateway::` command) · `check-cliproxy.ps1` (pinned CLIProxyAPI version/SHA consistency + upstream-release notice) · `check-installer-contract.ps1` · `check-runtime-log-secrets.ps1` · `check-sensitive-data.ps1` · `generate-release-evidence.ps1` · `sign-command.ps1` · `test-gateway.ps1` · `test-installer-lifecycle.ps1` · `tauri-build.ps1`.
+- `check-command-surface.ps1` (gateway command allowlist — update when adding/removing a `gateway::` command) · `check-cliproxy.ps1` (pinned CLIProxyAPI version/SHA consistency + upstream-release notice) · `check-installer-contract.ps1` · `check-runtime-log-secrets.ps1` · `check-sensitive-data.ps1` · `generate-release-evidence.ps1` · `prepare-gateway.ps1` · `sign-command.ps1` · `test-cliproxy-api-key.ps1` · `test-gateway.ps1` · `test-installer-lifecycle.ps1` · `tauri-build.ps1`.
 - CI: `.github/workflows/release-gate.yml` — pushing a `v<version>` tag runs build → installer-lifecycle → publish.
 
 ## Version lives in 5 spots (bump ALL on release)

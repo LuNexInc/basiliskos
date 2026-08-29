@@ -15,7 +15,7 @@ behind that seam without changing the clients.
 Every account is identified by two orthogonal axes:
 
 - **Provider** — the target catalog identity (`claude`, `codex`, `xai`, `kimi`,
-  `antigravity`, `deepseek`, `opencode`, `openrouter`, `litellm`, `custom`).
+  `antigravity`, `zai`, `deepseek`, `opencode`, `openrouter`, `litellm`, `custom`).
 - **Auth** — `oauth` (browser login, refreshable token) or `api_key` (static
   key + optional endpoint). Any OAuth provider can also be reached by key.
 

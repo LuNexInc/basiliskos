@@ -3,7 +3,7 @@
 </p>
 
 Open a separate Basiliskos-owned Claude Code Windows app and switch the
-authorized account serving it: Claude, Codex, Grok Build, Kimi Code, or Antigravity. Your normal Claude
+authorized account serving it: Claude, Codex, Grok Build, Kimi Code, Antigravity, or Z.AI GLM. Your normal Claude
 app remains untouched.
 
 Inside that isolated window, Basiliskos keeps the selected real engine visible
@@ -37,7 +37,7 @@ request.
 ## First use
 
 1. Open Basiliskos. Its local proxy starts automatically.
-2. Choose **Claude**, **Codex**, **Grok**, or **Kimi**, then select **Add account**.
+2. Choose **Claude**, **Codex**, **Grok**, **Kimi**, **Antigravity**, or **GLM**, then select **Add account**.
 3. Basiliskos opens the provider's validated HTTPS OAuth URL in your default
    browser. Kimi also shows its one-time device code. Finish the official login
 4. Basiliskos automatically opens its own isolated Claude window after an
@@ -52,7 +52,8 @@ request.
    them. If a signed-in Kimi account has no Kimi Code subscription, the
    account card shows **No active Kimi Code subscription** instead of a
    misleading re-auth error. Antigravity quota is managed externally rather than a
-   quota window, so it reports no usage percentage.
+   quota window, so it reports no usage percentage. GLM Coding Plan quota is
+   managed in the Z.AI console.
 
 Basiliskos never applies its relay to `%LOCALAPPDATA%\Claude-3p`. Version 1.0.1
 also detects and restores a shared configuration left applied by version 1.0.0.

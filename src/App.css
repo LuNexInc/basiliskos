@@ -29,8 +29,7 @@ html, body, #root { min-width: 720px; height: 100%; margin: 0; overflow: hidden;
 body {
   min-height: 100%;
   background:
-    radial-gradient(ellipse 80% 50% at 0% -10%, rgba(199, 90, 49, 0.08), transparent 46%),
-    radial-gradient(ellipse 70% 40% at 100% 0%, rgba(86, 182, 194, 0.06), transparent 42%),
+    radial-gradient(ellipse 55% 30% at 0% 0%, rgba(199, 90, 49, 0.03), transparent 58%),
     #07131b;
 }
 button, select, input { font: inherit; }
@@ -379,7 +378,7 @@ button.secondary:hover:not(:disabled) { border-color: rgba(238, 229, 207, 0.55);
 .provider-mini-badge.codex { border-color: rgba(57, 65, 255, 0.45); color: #9ab4ff; }
 .provider-mini-badge.xai { border-color: rgba(238, 229, 207, 0.35); color: #eee5cf; }
 .provider-mini-badge.kimi { border-color: rgba(86, 182, 194, 0.45); color: #7fd6e2; }
-.provider-mini-badge.antigravity { border-color: rgba(66, 133, 244, 0.45); color: #8ab4f8; }
+.provider-mini-badge.zai { border-color: rgba(16, 163, 127, 0.45); color: #5ee0b5; }
 .account-copy { min-width: 0; flex: 1; }
 .account-name-line { display: flex; align-items: center; min-width: 0; gap: 8px; }
 .account-copy strong { overflow: hidden; font-size: 12.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
@@ -568,7 +567,7 @@ footer p { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space:
 .hero-fuel.unrecorded { color: var(--muted); font-size: 10px; font-weight: 400; }
 
 
-/* Tray dashboard popup — ice-white fuel core (stealth monochrome) */
+/* Tray dashboard popup */
 html.tray-dashboard, body.tray-dashboard, body.tray-dashboard #root {
   min-width: 0;
   min-height: 0;
@@ -725,7 +724,6 @@ body.tray-dashboard {
   color: #dff8e8;
   border-color: rgba(105, 207, 138, 0.45);
   background: rgba(40, 90, 58, 0.28);
-  box-shadow: 0 0 12px rgba(105, 207, 138, 0.18);
 }
 .tray-core-badge.live i {
   background: var(--success);
@@ -768,8 +766,8 @@ body.tray-dashboard {
 .tray-health .healthy i {
   background: var(--success);
 }
-.tray-health .pending i { background: #e5b45f; box-shadow: 0 0 6px rgba(229, 180, 95, 0.45); }
-.tray-health .degraded i { background: var(--danger); box-shadow: 0 0 7px rgba(238, 107, 98, 0.5); }
+.tray-health .pending i { background: #e5b45f; }
+.tray-health .degraded i { background: var(--danger); }
 .tray-services {
   margin: 8px 12px 0;
   padding: 1px 12px 8px;
@@ -793,13 +791,13 @@ body.tray-dashboard {
 }
 .tray-shell .eyebrow {
   color: var(--accent-bright);
-  letter-spacing: 0.08em;
+  letter-spacing: 0.04em;
 }
 .tray-service-tag {
-  color: rgba(242, 245, 248, 0.38);
+  color: var(--muted);
   font-size: 8.5px;
-  font-weight: 800;
-  letter-spacing: 0.14em;
+  font-weight: 700;
+  letter-spacing: 0.06em;
 }
 .tray-service h2 {
   margin-top: 4px;
@@ -813,7 +811,7 @@ body.tray-dashboard {
 .tray-service p {
   margin-top: 2px;
   overflow: hidden;
-  color: rgba(242, 245, 248, 0.55);
+  color: var(--muted);
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -831,69 +829,47 @@ body.tray-dashboard {
   gap: 2px;
   height: 10px;
   padding: 2px;
-  border: 1px solid rgba(242, 245, 248, 0.14);
+  border: 1px solid var(--line-bright);
   border-radius: 2px;
-  background:
-    linear-gradient(180deg, rgba(0, 0, 0, 0.55), rgba(10, 16, 22, 0.85));
-  box-shadow:
-    inset 0 0 10px rgba(0, 0, 0, 0.65),
-    0 0 0 1px rgba(0, 0, 0, 0.35);
+  background: #081420;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
 }
 .tray-core span {
   flex: 1 1 0;
   min-width: 0;
   border-radius: 1px;
-  background: rgba(242, 245, 248, 0.045);
-  box-shadow: inset 0 0 0 1px rgba(242, 245, 248, 0.03);
+  background: rgba(238, 229, 207, 0.08);
 }
 .tray-core span.lit {
-  background: linear-gradient(180deg, #ffffff 0%, #d7dee6 55%, #aeb8c2 100%);
-  box-shadow:
-    0 0 5px rgba(242, 245, 248, 0.55),
-    inset 0 1px 0 rgba(255, 255, 255, 0.65);
+  background: #c5ced8;
 }
 .tray-fuel-readout {
   min-width: 78px;
   text-align: right;
-  color: rgba(242, 245, 248, 0.78);
+  color: var(--muted-strong);
   font-size: 9.5px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
+  font-weight: 650;
+  letter-spacing: 0.04em;
   font-variant-numeric: tabular-nums;
 }
 .tray-fuel.tone-mid .tray-core span.lit {
-  background: linear-gradient(180deg, #f2f5f8 0%, #c5ced8 100%);
-  box-shadow: 0 0 5px rgba(242, 245, 248, 0.4);
+  background: #aeb8c2;
 }
 .tray-fuel.tone-low .tray-core span.lit {
-  background: linear-gradient(180deg, #ffd1a8 0%, #e8793d 100%);
-  box-shadow: 0 0 6px rgba(232, 121, 61, 0.55);
+  background: var(--accent-bright);
 }
 .tray-fuel.tone-low .tray-fuel-readout { color: #f0a06f; }
 .tray-fuel.tone-critical .tray-core {
   border-color: rgba(238, 107, 98, 0.45);
-  box-shadow:
-    inset 0 0 10px rgba(0, 0, 0, 0.65),
-    0 0 10px rgba(238, 107, 98, 0.18);
 }
 .tray-fuel.tone-critical .tray-core span.lit {
-  background: linear-gradient(180deg, #ffc2bc 0%, #ee6b62 100%);
-  box-shadow: 0 0 7px rgba(238, 107, 98, 0.65);
-  animation: tray-core-pulse 1.4s ease-in-out infinite;
+  background: var(--danger);
 }
 .tray-fuel.tone-critical .tray-fuel-readout { color: #ffb0a9; }
 .tray-fuel.tone-unknown .tray-fuel-readout {
-  color: rgba(242, 245, 248, 0.38);
-  font-weight: 700;
-  letter-spacing: 0.06em;
-}
-@keyframes tray-core-breathe {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.45; }
-}
-@keyframes tray-core-pulse {
-  0%, 100% { opacity: 1; filter: brightness(1); }
-  50% { opacity: 0.55; filter: brightness(1.15); }
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.04em;
 }
 .tray-actions {
   margin: 8px 12px 0;
@@ -944,15 +920,15 @@ body.tray-dashboard {
   align-items: end;
   justify-content: space-between;
   gap: 10px;
-  border-top: 1px solid rgba(242, 245, 248, 0.08);
-  color: rgba(242, 245, 248, 0.42);
-  background: linear-gradient(0deg, rgba(0, 0, 0, 0.28), transparent);
+  border-top: 1px solid var(--line-soft);
+  color: var(--muted);
+  background: #061018;
   font-size: 9.5px;
 }
 .tray-foot p {
   margin: 0;
   max-width: 240px;
-  color: rgba(242, 245, 248, 0.68);
+  color: var(--muted-strong);
   line-height: 1.35;
 }
 .tray-foot .error-message { color: #ffb0a9; }

@@ -7,7 +7,7 @@ truth" section below for the dev-vs-publish-repo rules.
 
 The product goal is a small Windows controller that keeps Claude Code Desktop
 as the user's working interface while switching its local gateway between
-Claude, Codex, Grok, Kimi, and Antigravity accounts (OAuth) and API-key
+Claude, Codex, Grok, Kimi, Antigravity, and Z.AI GLM accounts (OAuth) and API-key
 providers and model routers (DeepSeek, OpenCode Go, OpenRouter, LiteLLM, and
 custom OpenAI-compatible endpoints) the user owns or is authorized to use.
 
@@ -108,7 +108,9 @@ Every catalog provider is reached one of two ways via two orthogonal axes:
 `Provider` (target) and `Auth` (`oauth` | `api_key`).
 
 - **OAuth providers** (browser login, refreshable token): Claude, Codex, Grok
-  (`xai`), Antigravity, Kimi Code. Driven by CLIProxyAPI's `-<provider>-login`.
+  (`xai`), Antigravity, Kimi Code, and Z.AI GLM. Claude / Codex / Grok / Kimi /
+  Antigravity use CLIProxyAPI's `-<provider>-login`. Z.AI uses the official
+  ZCode CLI poll flow because the pinned CLIProxyAPI 7.2.139 has no `-zai-login`.
 - **API-key providers** (paste a key + optional endpoint, OpenAI/Anthropic-
   compatible): DeepSeek, Kimi (Moonshot key), OpenCode Go, OpenRouter, LiteLLM,
   and custom endpoints. Any OAuth provider can also be reached with a key.

@@ -42,6 +42,7 @@ type Provider =
   | "xai"
   | "kimi"
   | "antigravity"
+  | "zai"
   | "deepseek"
   | "opencode"
   | "openrouter"
@@ -197,7 +198,7 @@ type PendingAuthLaunch = {
  * so the user can paste into a private window or dedicated profile.
  */
 export function prefersManualAuthBrowser(provider: Provider): boolean {
-  return provider === "xai" || provider === "kimi";
+  return provider === "xai" || provider === "kimi" || provider === "zai";
 }
 
 export async function copyTextToClipboard(text: string): Promise<void> {
@@ -245,7 +246,7 @@ type PreparedBasiliskosUpdate = {
 type AppView = "console" | "changes";
 type ProviderFilter = "all" | Provider;
 
-export const APP_VERSION = "3.0.0";
+export const APP_VERSION = "3.1.0";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string; group: "oauth" | "api-key" }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth", group: "oauth" },
@@ -253,6 +254,7 @@ const PROVIDERS: Array<{ id: Provider; label: string; detail: string; group: "oa
   { id: "xai", label: "Grok", detail: "Grok Build OAuth", group: "oauth" },
   { id: "kimi", label: "Kimi", detail: "Kimi Code OAuth / Moonshot key", group: "oauth" },
   { id: "antigravity", label: "Antigravity", detail: "Google Antigravity OAuth", group: "oauth" },
+  { id: "zai", label: "GLM", detail: "Z.AI GLM Coding Plan OAuth", group: "oauth" },
   { id: "deepseek", label: "DeepSeek", detail: "DeepSeek API key", group: "api-key" },
   { id: "opencode", label: "OpenCode Go", detail: "OpenCode API key", group: "api-key" },
   { id: "openrouter", label: "OpenRouter", detail: "OpenRouter API key", group: "api-key" },
@@ -266,6 +268,7 @@ const PROVIDER_NAMES: Record<Provider, string> = {
   xai: "Grok",
   kimi: "Kimi",
   antigravity: "Antigravity",
+  zai: "GLM",
   deepseek: "DeepSeek",
   opencode: "OpenCode Go",
   openrouter: "OpenRouter",
@@ -373,7 +376,7 @@ export function accountNeedsRelogin(
 
 export function usageAccountFiles(accounts: Array<Pick<Account, "fileName" | "provider" | "auth">>): string[] {
   return accounts
-    .filter((account) => account.provider !== "antigravity")
+    .filter((account) => account.provider !== "antigravity" && account.provider !== "zai")
     .filter((account) => account.auth !== "api_key")
     .map((account) => account.fileName);
 }
@@ -630,7 +633,7 @@ export default function App() {
   const totalAccountCount = snapshot?.accounts.length ?? 0;
   const allUsageFiles = usageAccountFiles(snapshot?.accounts ?? []);
   const allUsageKey = snapshot?.accounts
-    .filter((account) => account.provider !== "antigravity")
+    .filter((account) => account.provider !== "antigravity" && account.provider !== "zai")
     .map((account) => `${account.fileName}|${account.expiresAtMs ?? ""}|${account.credentialStatus}`)
     .join("\u0000") ?? "";
   const allUsageLoading = allUsageFiles.some((fileName) => usageByAccount[fileName]?.loading === true);
@@ -1757,6 +1760,10 @@ export default function App() {
                             ) : account.provider === "antigravity" ? (
                               <span className="usage-state unrecorded" title="Google Cloud / Gemini quota is managed in the Google Cloud or AI Studio console.">
                                 Managed in Google Cloud
+                              </span>
+                            ) : account.provider === "zai" ? (
+                              <span className="usage-state unrecorded" title="GLM Coding Plan quota is managed in the Z.AI console.">
+                                Managed in Z.AI
                               </span>
                             ) : (
                               <span className="usage-state unavailable" title={usage?.error}>

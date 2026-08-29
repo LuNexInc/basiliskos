@@ -7,7 +7,8 @@ use crate::gateway::RouteSelection;
 
 // Supported OAuth-capable providers, in UI order. Adding a provider here
 // changes the account tabs, route defaults, and the config generation surface.
-pub(crate) const SUPPORTED_PROVIDERS: [&str; 5] = ["claude", "codex", "xai", "kimi", "antigravity"];
+pub(crate) const SUPPORTED_PROVIDERS: [&str; 6] =
+    ["claude", "codex", "xai", "kimi", "antigravity", "zai"];
 
 /// How an account authenticates. An OAuth-capable provider can also be reached
 /// with a static API key; an API-key-only provider (DeepSeek, routers, custom
@@ -34,7 +35,7 @@ pub(crate) fn all_providers() -> Vec<&'static str> {
 }
 
 /// The auth methods a provider supports. OAuth providers also accept a key, so
-/// Claude / Codex / Grok / Antigravity / Kimi can each be used with a BYO key.
+/// Claude / Codex / Grok / Antigravity / Kimi / Z.AI can each be used with a BYO key.
 pub(crate) fn auth_kinds_for(provider: &str) -> &'static [ProviderAuth] {
     if API_KEY_PROVIDERS.contains(&provider) {
         &[ProviderAuth::ApiKey]
@@ -52,6 +53,7 @@ pub(crate) fn default_api_base_url(provider: &str) -> Option<&'static str> {
         "xai" => Some("https://api.x.ai"),
         "antigravity" => Some("https://generativelanguage.googleapis.com"),
         "kimi" => Some("https://api.moonshot.ai"),
+        "zai" => Some("https://api.z.ai/api/coding/paas/v4"),
         "deepseek" => Some("https://api.deepseek.com"),
         "opencode" => Some("https://opencode.ai"),
         "openrouter" => Some("https://openrouter.ai/api"),
@@ -167,6 +169,20 @@ pub(crate) const ANTIGRAVITY_MODELS: &[ModelSpec] = &[
     },
 ];
 
+pub(crate) const ZAI_MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        id: "glm-5.3",
+        label: "GLM-5.3",
+        // Thinking is not mapped through the openai-compatibility hop yet.
+        thinking_levels: &[],
+    },
+    ModelSpec {
+        id: "glm-5.3-flash",
+        label: "GLM-5.3 Flash",
+        thinking_levels: &[],
+    },
+];
+
 // API-key providers have a known model set (DeepSeek) or a live catalog fetched
 // from the backend. Routers / custom endpoints return empty pinned specs here;
 // their picker options come from `refresh_model_catalog_cache`'s live list.
@@ -190,6 +206,7 @@ pub(crate) fn model_specs(provider: &str) -> &'static [ModelSpec] {
         "xai" => XAI_MODELS,
         "kimi" => KIMI_MODELS,
         "antigravity" => ANTIGRAVITY_MODELS,
+        "zai" => ZAI_MODELS,
         "deepseek" => DEEPSEEK_MODELS,
         // Routers and custom endpoints expose a live model catalog; no pinned
         // specs until the alias/live-catalog feature lands.
@@ -205,6 +222,7 @@ pub(crate) fn default_model(provider: &str) -> &'static str {
         "xai" => "grok-4.5",
         "kimi" => "kimi-k3",
         "antigravity" => "gemini-3.7-flash",
+        "zai" => "glm-5.3",
         "deepseek" => "deepseek-chat",
         // Routers/custom: the live catalog validates and refines the actual
         // model id; a placeholder keeps the route non-empty until fetched.
@@ -234,6 +252,7 @@ pub(crate) fn default_routes() -> BTreeMap<String, RouteSelection> {
 pub(crate) fn context_window_for_route(provider: &str, model: &str) -> Option<u64> {
     match (provider, model) {
         ("xai", "grok-4.5" | "grok-4.6") => Some(GROK_4_5_CONTEXT_WINDOW_TOKENS),
+        ("zai", "glm-5.3" | "glm-5.3-flash") => Some(1_048_576),
         _ => None,
     }
 }
