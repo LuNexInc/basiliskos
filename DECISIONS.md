@@ -4,6 +4,18 @@
 > Newest on top. Extracted from AGENTS.md 2026-07-25 — keep in sync when a call changes.
 
 
+## 2026-09-03 — Antigravity uses public Gemini aliases in routes and pickers
+- **Decision:** BasiliskOS sends the public `gemini-3.8-flash` and `gemini-3.7-flash` aliases to CLIProxyAPI. CLIProxyAPI maps them to its internal `-high` models. The picker only shows catalog models that the live backend advertises. If a saved model disappears, the picker selects a live last-known-good model or the first visible live model and resets thinking to `Auto`.
+- **Why:** Sending an internal `-high` name through the public API returned `unknown provider`, which broke Claude routing. A picker could also keep an unavailable saved model selected after a backend catalog update.
+- **Thinking levels:** Gemini 3.8 Flash and Gemini 3.7 Flash expose `Low`, `Medium`, `High`, and `Max`. They do not expose `Off` because the backend rejects a zero thinking budget.
+- **Reverse if:** CLIProxyAPI changes its public alias contract or starts advertising a verified non-thinking mode for these models.
+
+## 2026-09-03 — CLIProxyAPI Gemini 3.8 support is pinned to an audited source commit
+- **Decision:** BasiliskOS 3.2.0 builds CLIProxyAPI commit `dacae582284283b05c54f9426c597e16a3d389c8` with Go 1.26.4, `-trimpath`, read-only modules, and fixed build metadata. The source archive and resulting Windows executable have pinned SHA-256 hashes. GitHub Actions uses the same Go version and rejects a different executable hash.
+- **Why:** Gemini 3.8 support is merged upstream but is not present in the latest official CLIProxyAPI release, 7.2.147. Two clean local builds from different paths produced the same executable hash, and an isolated live request confirmed Gemini 3.8 routing.
+- **Reverse if:** CLIProxyAPI publishes an official release that includes commit `dacae582` or later; audit that release and return `prepare-gateway.ps1` to the signed release-archive pin.
+
+
 ## 2026-08-29 — Z.AI GLM OAuth is a first-class provider
 - **Decision:** `zai` is in `SUPPORTED_PROVIDERS`. Add account runs the official ZCode CLI poll (`POST zcode.z.ai/api/v1/oauth/cli/init` → browser authorize → poll) and then mints a coding-plan API key through the Z.AI business API (`inference:mint_agent_key` equivalent). The minted key is stored as an OAuth account and routed through CLIProxyAPI `openai-compatibility` to `https://api.z.ai/api/coding/paas/v4` because pinned 7.2.139 has no native `-zai-login`.
 - **Why:** Charles asked for Z.AI/GLM OAuth. Official Z.AI Claude Code docs are API-key only; the coding-plan OAuth flow is the ZCode CLI poll plus key mint, not a pasted key. Do not automate the approval page.

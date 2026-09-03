@@ -48,16 +48,14 @@ use crate::persistence::{
     secure_create_dir_all, secure_existing_path, FileMutation,
 };
 
-// Pin CLIProxyAPI 7.2.139 (2026-08-22). Re-audited against the 7.2.139 windows
-// release: config contract (auth-dir, api-keys, api-key-entries, oauth-model-alias,
-// xai.inject-x-search, codex.optimize-multi-agent-v2, plugins) and the
-// api-key-entries shape hold; gateway smoke + log-redaction green. The
-// `-<provider>-login` flags and the model alias registry are unchanged. If a
-// future bump changes any of that, the new pin guard (`scripts/check-cliproxy.ps1`)
-// and `render_config_keeps_the_cliproxy_contract` test should be updated together.
-const GATEWAY_VERSION: &str = "7.2.139";
+// Pin CLIProxyAPI commit dacae582 (2026-09-02), built reproducibly with Go
+// 1.26.4. This audited upstream commit adds Gemini 3.8 Flash to the embedded
+// model registry. The config contract, provider login flags, gateway smoke,
+// and log-redaction checks remain valid. Update the pin guard and config
+// contract tests together when this dependency changes.
+const GATEWAY_VERSION: &str = "7.2.148-dev-dacae582";
 pub(crate) const GATEWAY_EXE_SHA256: &str =
-    "457d717382189c38a2641dd5ae3b467c86b4cdb5b1833d5c289375fb4a86cf0b";
+    "49056caa627209618f15e80e6044c77630b226ae1c59e074f63b1fd1d4d18276";
 const GATEWAY_PORT: u16 = 8317;
 const BACKEND_PORT: u16 = 8318;
 const MAX_RELAY_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -600,13 +598,32 @@ fn provider_route_for(
     client: ClientSurface,
     provider: &str,
 ) -> ProviderRoute {
-    let route = normalized_route_for(state, client, provider);
+    let mut route = normalized_route_for(state, client, provider);
     let specs = model_specs(provider);
-    let selected = specs.iter().find(|spec| spec.id == route.model);
     let hidden = load_hidden_models().unwrap_or_default();
-    let live_catalog = runtime_lock()
+    let (live_catalog, last_known_good) = runtime_lock()
         .ok()
-        .and_then(|runtime| runtime.last_known_model_catalog.get(provider).cloned());
+        .map(|runtime| {
+            (
+                runtime.last_known_model_catalog.get(provider).cloned(),
+                runtime.last_known_good_models.get(provider).cloned(),
+            )
+        })
+        .unwrap_or_default();
+    if let Some(live) = live_catalog.as_deref() {
+        if let Some(model) = advertised_model_fallback(
+            provider,
+            &route.model,
+            last_known_good.as_deref(),
+            specs,
+            &hidden,
+            live,
+        ) {
+            route.model = model;
+            route.thinking = "auto".into();
+        }
+    }
+    let selected = specs.iter().find(|spec| spec.id == route.model);
     let mut model_options: Vec<RouteModelOption> = filter_visible_models(
         provider,
         specs,
@@ -719,9 +736,11 @@ fn client_effort_choice(request: &serde_json::Map<String, Value>) -> Option<Stri
 fn backend_model_identifier<'a>(provider: &str, base_model: &'a str) -> &'a str {
     if provider == "antigravity" {
         match base_model {
-            "gemini-3.7-flash" | "gemini-3.6-flash-high" => "gemini-3.6-flash-high",
-            "gemini-3.7-pro" | "gemini-3.1-pro-low" => "gemini-3.1-pro-low",
-            "gemini-3.7-flash-lite" | "gemini-3.1-flash-lite" => "gemini-3.1-flash-lite",
+            // CLIProxyAPI's oauth-model-alias publishes these public IDs and
+            // resolves them to the provider's internal `-high` models. Keep
+            // current routes on the public IDs and migrate legacy saved IDs.
+            "gemini-3.8-flash-high" => "gemini-3.8-flash",
+            "gemini-3.7-flash-high" => "gemini-3.7-flash",
             "gemini-3-flash" => "gemini-3-flash",
             other => other,
         }
@@ -1321,7 +1340,7 @@ fn active_provider_from_auth_for(state: &ControllerState, client: ClientSurface)
 
 /// Emit the `openai-compatibility` provider list for every enabled API-key-only
 /// account (DeepSeek, routers, custom endpoints). Verified against the pinned
-/// 7.2.139 `config.example.yaml`: the block is a LIST under `openai-compatibility:`
+/// Pinned CLIProxyAPI `config.example.yaml`: the block is a LIST under `openai-compatibility:`
 /// with `name`, `base-url`, `api-key-entries` (an object list), and an explicit
 /// `models` list. OAuth providers used by key are routed through their native
 /// sections (`claude-api-key`, `xai-api-key`, `codex-api-key`, `gemini-api-key`)
@@ -1460,14 +1479,11 @@ streaming:
   bootstrap-retries: 0
 oauth-model-alias:
   antigravity:
-    - name: "gemini-3.6-flash-high"
+    - name: "gemini-3.8-flash-high"
+      alias: "gemini-3.8-flash"
+      force-mapping: true
+    - name: "gemini-3.7-flash-high"
       alias: "gemini-3.7-flash"
-      force-mapping: true
-    - name: "gemini-3.1-pro-low"
-      alias: "gemini-3.7-pro"
-      force-mapping: true
-    - name: "gemini-3.1-flash-lite"
-      alias: "gemini-3.7-flash-lite"
       force-mapping: true
 plugins:
   enabled: true
@@ -1486,7 +1502,7 @@ xai:
 codex:
   optimize-multi-agent-v2: true
 # API-key provider accounts (DeepSeek, routers, custom endpoints). Best-effort
-# and YAML-valid; verify field names against CLIProxyAPI 7.2.139 before relying
+# and YAML-valid; verify field names against the pinned CLIProxyAPI before relying
 # on live API-key routing.
 {api_key_blocks}"#,
         auth_dir = yaml_quote(&auth.to_string_lossy()),
@@ -1582,6 +1598,38 @@ fn refresh_model_catalog_cache(provider: &str, api_key: &str) {
     }
 }
 
+fn model_is_advertised(provider: &str, model: &str, live_catalog: &[String]) -> bool {
+    let backend_id = backend_model_identifier(provider, model);
+    live_catalog
+        .iter()
+        .any(|id| id == model || id == backend_id)
+}
+
+fn advertised_model_fallback(
+    provider: &str,
+    selected: &str,
+    last_known_good: Option<&str>,
+    specs: &[crate::catalog::ModelSpec],
+    hidden: &BTreeSet<String>,
+    live_catalog: &[String],
+) -> Option<String> {
+    if model_is_advertised(provider, selected, live_catalog) {
+        return None;
+    }
+    last_known_good
+        .filter(|model| model_is_advertised(provider, model, live_catalog))
+        .map(str::to_string)
+        .or_else(|| {
+            specs
+                .iter()
+                .find(|spec| {
+                    !hidden.contains(spec.id)
+                        && model_is_advertised(provider, spec.id, live_catalog)
+                })
+                .map(|spec| spec.id.to_string())
+        })
+}
+
 // Keeps a model visible if it isn't manually hidden AND (when a live catalog
 // is known for this provider) the backend actually reports it as available.
 // The currently-selected model is always kept visible regardless of either
@@ -1597,10 +1645,8 @@ fn filter_visible_models<'a>(
         .iter()
         .filter(|spec| spec.id == selected_id || !hidden.contains(spec.id))
         .filter(|spec| {
-            let backend_id = backend_model_identifier(provider, spec.id);
             spec.id == selected_id
-                || live_catalog
-                    .is_none_or(|live| live.iter().any(|id| id == spec.id || id == backend_id))
+                || live_catalog.is_none_or(|live| model_is_advertised(provider, spec.id, live))
         })
         .collect()
 }
@@ -3023,6 +3069,75 @@ fn spawn_backend_process(
         let _ = child.wait();
     })?;
     Ok((child, job))
+}
+
+/// Restart the managed CLIProxyAPI child so it re-reads `auth-dir` and picks
+/// the newly-enabled credential. CLIProxyAPI resolves per-provider OAuth
+/// credentials when it first starts and does not re-evaluate the `disabled`
+/// flag on later file changes, so switching the active account requires
+/// bouncing the backend. The in-process front proxy keeps running; only the
+/// CLIProxyAPI process (its `:8318` backend listener) restarts.
+fn reload_backend_after_credential_change(app: &AppHandle) -> Result<(), String> {
+    {
+        let runtime = runtime_lock()?;
+        if runtime.gateway_child.is_none() {
+            // The managed backend is not running; the normal start path spawns
+            // it with the current state, so there is nothing to reload.
+            return Ok(());
+        }
+    }
+    let old_child = {
+        let mut runtime = runtime_lock()?;
+        let child = runtime.gateway_child.take();
+        runtime.phase = GatewayPhase::Degraded;
+        runtime.backend_exit_reason =
+            Some("Backend reloading to apply the newly selected credential".into());
+        runtime.backend_restart_attempts = 0;
+        runtime.backend_next_restart = None;
+        child
+    };
+    #[cfg(target_os = "windows")]
+    let old_job = {
+        let mut runtime = runtime_lock()?;
+        runtime.gateway_job.take()
+    };
+    #[cfg(not(target_os = "windows"))]
+    let old_job: Option<usize> = None;
+    if let Some(mut child) = old_child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    close_gateway_job(old_job);
+    let _ = prepare_config();
+    let (child, job) = spawn_backend_process(app, true)?;
+    {
+        let mut runtime = runtime_lock()?;
+        runtime.gateway_child = Some(child);
+        #[cfg(target_os = "windows")]
+        {
+            runtime.gateway_job = job;
+        }
+        runtime.phase = GatewayPhase::Starting;
+        runtime.backend_exit_reason = None;
+        runtime.backend_next_restart = None;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(state) = load_state() {
+            if health_check(&state.api_key) {
+                if let Ok(mut runtime) = runtime_lock() {
+                    runtime.phase = GatewayPhase::Running;
+                }
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    // Not ready: leave it degraded so the supervisor retries with backoff.
+    if let Ok(mut runtime) = runtime_lock() {
+        runtime.phase = GatewayPhase::Degraded;
+    }
+    Err("Basiliskos did not become ready after reloading the selected credential.".into())
 }
 
 fn supervise_backend(app: &AppHandle) {
@@ -5732,8 +5847,10 @@ fn removal_transaction(
     Ok((mutations, after_state))
 }
 
-// Picks the first same-provider account other than the one that just got
-// rate-limited, skipping any that are themselves still cooling down.
+// rate-limited, skipping any that are themselves still cooling down. Only
+// accounts the user has actually enabled are candidates: auto-failover must
+// never silently re-enable a disabled sibling and steal the account the user
+// explicitly pinned.
 fn pick_failover_candidate<'a>(
     accounts: &'a [GatewayAccount],
     rate_limited_account: &str,
@@ -5744,6 +5861,7 @@ fn pick_failover_candidate<'a>(
     accounts.iter().find(|account| {
         account.provider == provider
             && account.file_name != rate_limited_account
+            && !account.disabled
             && !matches!(
                 account.credential_status.as_str(),
                 "expired" | "relogin_required"
@@ -5843,7 +5961,7 @@ fn attempt_same_provider_failover(
 
 #[tauri::command]
 pub async fn select_gateway_account(
-    _app: AppHandle,
+    app: AppHandle,
     file_name: String,
     client: Option<String>,
 ) -> Result<AccountSelectionResult, String> {
@@ -5867,6 +5985,7 @@ pub async fn select_gateway_account(
     {
         return Err("Unsupported account file".into());
     }
+    let previous_active = active_account_for(&state, client).map(str::to_owned);
     let root = root_dir()?;
     let directory = auth_dir()?;
     let state_path = controller_path()?;
@@ -5893,6 +6012,14 @@ pub async fn select_gateway_account(
             false
         }
     };
+    // CLIProxyAPI picks the per-provider credential when it first starts and
+    // does not re-read `auth-dir` afterward, so applying a newly-selected
+    // account requires bouncing the backend. Without this, requests keep
+    // using the previously started credential and every account switch
+    // silently fails.
+    if active_account_for(&state, client).map(str::to_owned) != previous_active {
+        reload_backend_after_credential_change(&app)?;
+    }
     if let Some(newly_active_provider) = accounts
         .iter()
         .find(|account| account.file_name == file_name)
@@ -8301,7 +8428,7 @@ mod tests {
             .filter_map(|model| model.get("slug").and_then(Value::as_str))
             .collect::<Vec<_>>();
         // Every advertised model id is a real upstream id the relay routes by.
-        assert!(ids.contains(&"gemini-3.7-flash"));
+        assert!(ids.contains(&"gemini-3.8-flash"));
         assert!(ids.contains(&"grok-4.5"));
         assert!(ids.contains(&"kimi-k3"));
         // Every entry carries the required ModelInfo fields + a vendored prompt.
@@ -8350,7 +8477,7 @@ mod tests {
         assert!(!ids.contains(&"gpt-5.6-terra"));
         assert!(!ids.contains(&"kimi-k3"));
         assert!(!ids.contains(&"claude-sonnet-4-5-20250929"));
-        assert!(!ids.contains(&"gemini-3.7-flash"));
+        assert!(!ids.contains(&"gemini-3.8-flash"));
 
         let _ = fs::remove_dir_all(auth);
     }
@@ -8509,6 +8636,9 @@ mod tests {
         assert!(config.contains("bootstrap-retries: 0"));
         assert!(config.contains("disable-claude-cloak-mode: true"));
         assert!(config.contains("oauth-model-alias:"));
+        assert!(config.contains("gemini-3.8-flash-high"));
+        assert!(config.contains("alias: \"gemini-3.8-flash\""));
+        assert!(!config.contains("gemini-3.6-flash-high"));
         assert!(config.contains("gemini-3.7-flash"));
         let _ = fs::remove_dir_all(auth);
     }
@@ -10069,14 +10199,14 @@ mod tests {
     }
 
     #[test]
-    fn failover_picks_a_same_provider_account_that_is_not_cooling_and_skips_others() {
-        fn account(file_name: &str, provider: &str) -> GatewayAccount {
+    fn failover_picks_an_enabled_same_provider_account_and_skips_disabled_or_cooling_ones() {
+        fn account(file_name: &str, provider: &str, disabled: bool) -> GatewayAccount {
             GatewayAccount {
                 file_name: file_name.into(),
                 provider: provider.into(),
                 email: None,
                 label: file_name.into(),
-                disabled: true,
+                disabled,
                 active: false,
                 active_for_codex: false,
                 cooldown_until_ms: None,
@@ -10086,30 +10216,42 @@ mod tests {
                 base_url: None,
             }
         }
-        let accounts = vec![
-            account("codex-a.json", "codex"),
-            account("codex-b.json", "codex"),
-            account("codex-c.json", "codex"),
-            account("xai-only.json", "xai"),
-        ];
         let now = Utc::now();
-
-        // No cooldowns recorded: first other same-provider account wins.
         let none_cooling = BTreeMap::new();
-        assert_eq!(
+
+        // Only enabled siblings are candidates. Every sibling starts disabled,
+        // so auto-failover must not silently re-enable a pinned-off account.
+        let accounts = vec![
+            account("codex-a.json", "codex", false),
+            account("codex-b.json", "codex", true),
+            account("codex-c.json", "codex", true),
+            account("xai-only.json", "xai", false),
+        ];
+        assert!(
             pick_failover_candidate(&accounts, "codex-a.json", "codex", &none_cooling, now)
+                .is_none()
+        );
+
+        // An enabled sibling is eligible; disabled ones are skipped.
+        let mut with_b_enabled = accounts.clone();
+        with_b_enabled[1].disabled = false;
+        assert_eq!(
+            pick_failover_candidate(&with_b_enabled, "codex-a.json", "codex", &none_cooling, now)
                 .map(|account| account.file_name.as_str()),
             Some("codex-b.json")
         );
 
-        // codex-b is cooling: falls through to codex-c.
+        // A cooling enabled sibling falls through to the next enabled one.
+        let mut two_enabled = accounts.clone();
+        two_enabled[1].disabled = false;
+        two_enabled[2].disabled = false;
         let mut cooling = BTreeMap::new();
         cooling.insert(
             "codex-b.json".to_string(),
             now + chrono::Duration::seconds(30),
         );
         assert_eq!(
-            pick_failover_candidate(&accounts, "codex-a.json", "codex", &cooling, now)
+            pick_failover_candidate(&two_enabled, "codex-a.json", "codex", &cooling, now)
                 .map(|account| account.file_name.as_str()),
             Some("codex-c.json")
         );
@@ -10121,50 +10263,30 @@ mod tests {
             now - chrono::Duration::seconds(1),
         );
         assert_eq!(
-            pick_failover_candidate(&accounts, "codex-a.json", "codex", &expired, now)
+            pick_failover_candidate(&two_enabled, "codex-a.json", "codex", &expired, now)
                 .map(|account| account.file_name.as_str()),
             Some("codex-b.json")
         );
 
-        // Never crosses providers: with no other codex account, the xai
-        // account is not picked as a substitute even though it's available.
-        let single_provider_accounts = vec![
-            account("codex-a.json", "codex"),
-            account("xai-only.json", "xai"),
-        ];
-        assert!(pick_failover_candidate(
-            &single_provider_accounts,
-            "codex-a.json",
-            "codex",
-            &none_cooling,
-            now
-        )
-        .is_none());
+        // Never crosses providers: the enabled xai account is not a substitute.
+        let solo_codex = vec![account("codex-a.json", "codex", false)];
+        assert!(
+            pick_failover_candidate(&solo_codex, "codex-a.json", "codex", &none_cooling, now)
+                .is_none()
+        );
 
-        // All same-provider candidates cooling: no failover.
-        let mut all_cooling = BTreeMap::new();
-        all_cooling.insert(
-            "codex-b.json".to_string(),
-            now + chrono::Duration::seconds(30),
+        // Expired / relogin_required candidates are skipped even when enabled.
+        let mut b_expired = with_b_enabled.clone();
+        b_expired[1].credential_status = "expired".into();
+        assert!(
+            pick_failover_candidate(&b_expired, "codex-a.json", "codex", &none_cooling, now)
+                .is_none()
         );
-        all_cooling.insert(
-            "codex-c.json".to_string(),
-            now + chrono::Duration::seconds(30),
-        );
-        // Expired or relogin_required candidates are skipped.
-        let mut expired_b = accounts.clone();
-        expired_b[1].credential_status = "expired".into();
-        assert_eq!(
-            pick_failover_candidate(&expired_b, "codex-a.json", "codex", &none_cooling, now)
-                .map(|account| account.file_name.as_str()),
-            Some("codex-c.json")
-        );
-        let mut relogin_b = accounts.clone();
-        relogin_b[1].credential_status = "relogin_required".into();
-        assert_eq!(
-            pick_failover_candidate(&relogin_b, "codex-a.json", "codex", &none_cooling, now)
-                .map(|account| account.file_name.as_str()),
-            Some("codex-c.json")
+        let mut b_relogin = with_b_enabled.clone();
+        b_relogin[1].credential_status = "relogin_required".into();
+        assert!(
+            pick_failover_candidate(&b_relogin, "codex-a.json", "codex", &none_cooling, now)
+                .is_none()
         );
     }
 
@@ -10172,20 +10294,76 @@ mod tests {
     fn antigravity_model_mapping_keeps_models_visible_against_live_backend() {
         let none_hidden = BTreeSet::new();
         let live = vec![
-            "gemini-3.6-flash-high".to_string(),
-            "gemini-3.1-pro-low".to_string(),
+            "gemini-3.8-flash".to_string(),
+            "gemini-3.7-flash".to_string(),
+            "gemini-3.7-pro".to_string(),
         ];
         let visible = filter_visible_models(
             "antigravity",
             crate::catalog::ANTIGRAVITY_MODELS,
-            "gemini-3.7-flash",
+            "gemini-3.8-flash",
             &none_hidden,
             Some(&live),
         );
         let ids: Vec<&str> = visible.iter().map(|s| s.id).collect();
+        assert!(ids.contains(&"gemini-3.8-flash"));
         assert!(ids.contains(&"gemini-3.7-flash"));
         assert!(ids.contains(&"gemini-3.7-pro"));
         assert!(!ids.contains(&"gemini-3.7-flash-lite"));
+    }
+
+    #[test]
+    fn antigravity_model_mapping_uses_current_backend_ids_and_levels() {
+        assert_eq!(
+            backend_model_identifier("antigravity", "gemini-3.8-flash"),
+            "gemini-3.8-flash"
+        );
+        assert_eq!(
+            backend_model_identifier("antigravity", "gemini-3.7-flash"),
+            "gemini-3.7-flash"
+        );
+        assert_eq!(
+            backend_model_identifier("antigravity", "gemini-3.8-flash-high"),
+            "gemini-3.8-flash"
+        );
+        assert_eq!(
+            backend_model_identifier("antigravity", "gemini-3.7-pro"),
+            "gemini-3.7-pro"
+        );
+        let flash_38 = crate::catalog::ANTIGRAVITY_MODELS
+            .iter()
+            .find(|model| model.id == "gemini-3.8-flash")
+            .expect("Gemini 3.8 Flash is cataloged");
+        assert_eq!(flash_38.thinking_levels, &["low", "medium", "high", "max"]);
+        assert!(!flash_38.thinking_levels.contains(&"none"));
+    }
+
+    #[test]
+    fn unavailable_picker_selection_falls_back_to_an_advertised_model() {
+        let hidden = BTreeSet::new();
+        let live = vec!["gemini-3.8-flash".to_string()];
+        assert_eq!(
+            advertised_model_fallback(
+                "antigravity",
+                "gemini-3.7-flash",
+                Some("gemini-3.8-flash"),
+                crate::catalog::ANTIGRAVITY_MODELS,
+                &hidden,
+                &live,
+            ),
+            Some("gemini-3.8-flash".to_string())
+        );
+        assert_eq!(
+            advertised_model_fallback(
+                "antigravity",
+                "gemini-3.8-flash",
+                None,
+                crate::catalog::ANTIGRAVITY_MODELS,
+                &hidden,
+                &live,
+            ),
+            None
+        );
     }
 
     fn begin_mock_request(
@@ -10674,13 +10852,12 @@ openai_base_url = "http://127.0.0.1:8317/v1"
             open_claude_on_launch: true,
         };
         let mut request = serde_json::json!({}).as_object().unwrap().clone();
-        // kimi-k3 only supports max thinking, so route thinking "high" must
-        // degrade to auto (plain id) for the route model.
+        // Kimi K3 supports high thinking, so the route keeps that level.
         assert_eq!(
             apply_route_model("kimi-k3", None, &mut request, &state, "kimi"),
-            "kimi-k3"
+            "kimi-k3(high)"
         );
-        // A client-chosen kimi-k2.7-code supports high Ã¢â€ â€™ suffix applied.
+        // A client-chosen kimi-k2.7-code supports high, so the suffix is applied.
         state.routes.insert(
             "kimi".into(),
             RouteSelection {

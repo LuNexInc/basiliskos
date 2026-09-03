@@ -141,8 +141,8 @@ pub(crate) const KIMI_MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: "kimi-k3",
         label: "Kimi K3",
-        // K3 always thinks; official API currently only accepts reasoning_effort=max.
-        thinking_levels: &["max"],
+        // K3 always thinks. CLIProxyAPI exposes low, high, and max.
+        thinking_levels: &["low", "high", "max"],
     },
     ModelSpec {
         id: "kimi-k2.7-code",
@@ -153,9 +153,14 @@ pub(crate) const KIMI_MODELS: &[ModelSpec] = &[
 
 pub(crate) const ANTIGRAVITY_MODELS: &[ModelSpec] = &[
     ModelSpec {
+        id: "gemini-3.8-flash",
+        label: "Gemini 3.8 Flash",
+        thinking_levels: &["low", "medium", "high", "max"],
+    },
+    ModelSpec {
         id: "gemini-3.7-flash",
         label: "Gemini 3.7 Flash",
-        thinking_levels: &["none", "low", "medium", "high", "max"],
+        thinking_levels: &["low", "medium", "high", "max"],
     },
     ModelSpec {
         id: "gemini-3.7-pro",
@@ -221,7 +226,7 @@ pub(crate) fn default_model(provider: &str) -> &'static str {
         "codex" => "gpt-5.6-terra",
         "xai" => "grok-4.5",
         "kimi" => "kimi-k3",
-        "antigravity" => "gemini-3.7-flash",
+        "antigravity" => "gemini-3.8-flash",
         "zai" => "glm-5.3",
         "deepseek" => "deepseek-chat",
         // Routers/custom: the live catalog validates and refines the actual
@@ -285,7 +290,7 @@ pub(crate) fn context_budget_for_request(provider: &str, request: &Value) -> Opt
 /// Anthropic alias and the front proxy maps the alias back to the real
 /// upstream model (see gateway.rs `client_model_choice`). Aliases are unique
 /// within a provider so Claude's picker can distinguish entries. The pool below
-/// covers the largest provider (xai, 9 models).
+/// covers the largest supported picker plus its selected-model thinking variants.
 const ANTHROPIC_ALIAS_POOL: [&str; 17] = [
     "claude-sonnet-4-5",
     "claude-opus-4-5",

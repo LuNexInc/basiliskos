@@ -75,8 +75,8 @@ or evade provider limits.
 
 ## Build and test
 
-Requirements: Node.js 18+, pnpm, Rust, and Visual Studio Build Tools 2022 with
-Desktop development with C++.
+Requirements: Node.js 18+, pnpm, Rust, Go 1.26.4, and Visual Studio Build Tools
+2022 with Desktop development with C++.
 
 ```powershell
 pnpm install
@@ -84,9 +84,10 @@ pnpm test:all
 pnpm bundle
 ```
 
-`prepare-gateway.ps1` downloads CLIProxyAPI v7.2.139 at build time and verifies
-both the release archive and executable SHA-256 before bundling it. The binary
-is not committed to Git. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+`prepare-gateway.ps1` downloads the pinned CLIProxyAPI source commit, verifies
+the source archive SHA-256, builds it with fixed metadata and Go 1.26.4, and
+verifies the executable SHA-256 before bundling it. The binary is not committed
+to Git. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 The canonical per-machine NSIS installer is written to
 `src-tauri/target/release/bundle/nsis/`. Authenticode signing is optional:

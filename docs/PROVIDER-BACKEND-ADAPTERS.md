@@ -22,7 +22,7 @@ Every account is identified by two orthogonal axes:
 ## Backend enum
 
 `crate::catalog` reserves a `Backend` notion: the default is `cliproxy` (the
-pinned CLIProxyAPI 7.2.139 runtime), with a reserved `custom(path)` variant for
+pinned CLIProxyAPI runtime), with a reserved `custom(path)` variant for
 an alternate gateway binary. Nothing currently constructs `custom`; it is
 documented so the design does not paint the product into a corner.
 
@@ -54,7 +54,7 @@ compatibility endpoint that:
 
 - **CLIProxyAPI config emission** for an API-key provider now uses the verified
   `openai-compatibility:` list shape (`name` / `base-url` /
-  `api-key-entries` as an object list / `models`), matching the pinned 7.2.139
+  `api-key-entries` as an object list / `models`), matching the pinned
   `config.example.yaml`. Confirmed end-to-end against the pinned binary in
   `scripts/test-cliproxy-api-key.ps1` (2 models registered + routed to a
   loopback upstream). The schema is protected in CI by

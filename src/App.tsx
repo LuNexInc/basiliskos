@@ -246,7 +246,7 @@ type PreparedBasiliskosUpdate = {
 type AppView = "console" | "changes";
 type ProviderFilter = "all" | Provider;
 
-export const APP_VERSION = "3.1.0";
+export const APP_VERSION = "3.2.0";
 
 const PROVIDERS: Array<{ id: Provider; label: string; detail: string; group: "oauth" | "api-key" }> = [
   { id: "claude", label: "Claude", detail: "Claude OAuth", group: "oauth" },

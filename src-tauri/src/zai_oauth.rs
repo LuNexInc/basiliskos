@@ -1,6 +1,6 @@
 //! Official Z.AI / ZCode GLM coding-plan OAuth.
 //!
-//! CLIProxyAPI 7.2.139 has no `-zai-login`. Basiliskos owns the same ZCode CLI
+//! The pinned CLIProxyAPI build has no `-zai-login`. Basiliskos owns the same ZCode CLI
 //! poll flow the official client uses, then mints a coding-plan API key through
 //! the documented Z.AI business API. Inference is served on the OpenAI-compatible
 //! coding endpoint because the pinned runtime has no native `zai` provider.

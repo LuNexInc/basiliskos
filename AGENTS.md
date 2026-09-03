@@ -110,7 +110,7 @@ Every catalog provider is reached one of two ways via two orthogonal axes:
 - **OAuth providers** (browser login, refreshable token): Claude, Codex, Grok
   (`xai`), Antigravity, Kimi Code, and Z.AI GLM. Claude / Codex / Grok / Kimi /
   Antigravity use CLIProxyAPI's `-<provider>-login`. Z.AI uses the official
-  ZCode CLI poll flow because the pinned CLIProxyAPI 7.2.139 has no `-zai-login`.
+  ZCode CLI poll flow because the pinned CLIProxyAPI build has no `-zai-login`.
 - **API-key providers** (paste a key + optional endpoint, OpenAI/Anthropic-
   compatible): DeepSeek, Kimi (Moonshot key), OpenCode Go, OpenRouter, LiteLLM,
   and custom endpoints. Any OAuth provider can also be reached with a key.

@@ -58,7 +58,7 @@ try {
         # for pre-release suffixes.
         $isNewer = $false
         try {
-            $cur = [version]$runtimeVersion
+            $cur = [version](($runtimeVersion -split '-')[0])
             $cand = [version]($latest -split '-')[0]
             $isNewer = $cand -gt $cur
         } catch {
